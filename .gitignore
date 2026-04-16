@@ -1,0 +1,42 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Runtime output — never commit scan results
+/scans/
+*.jsonl
+scan_summary.json
+targets.txt
+nuclei_targets.txt
+httpx_results.txt
+nuclei_results.txt
+open_ports.jsonl
+
+# Local config (only .env.example is tracked)
+.env
+*.env
+!.env.example
+
+# Editors / assistants
+.idea/
+.vscode/
+.claude/
+.aider*
+.cursor/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+*.bak
+*_backup*
+*.key
+*.pem
+*.crt
+__pycache__/
+node_modules/
