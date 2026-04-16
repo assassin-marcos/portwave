@@ -45,6 +45,33 @@ find_bin() {
   echo ""
 }
 
+# Build a wide list of plausible places httpx / nuclei might live on Linux and macOS.
+tool_candidates() {
+  local name="$1"
+  local -a dirs=(
+    "$HOME/go/bin"
+    "$HOME/.local/bin"
+    "/opt/homebrew/bin"
+    "/usr/local/bin"
+    "/usr/local/go/bin"
+    "/opt/local/bin"               # MacPorts
+    "/home/go/bin"                 # user-specified non-standard path
+    "${GOBIN:-}"
+    "${GOPATH:-}/bin"
+  )
+  # Also scan any /home/<user>/go/bin for multi-user boxes.
+  if [[ -d /home ]]; then
+    for d in /home/*/go/bin; do
+      [[ -d "$d" ]] && dirs+=("$d")
+    done
+  fi
+  local -a out=()
+  for d in "${dirs[@]}"; do
+    [[ -n "$d" ]] && out+=("$d/$name")
+  done
+  printf '%s\n' "${out[@]}"
+}
+
 # ── 0. OS detection ──
 OS="$(uname -s)"
 case "$OS" in
@@ -72,17 +99,19 @@ say "cargo: $(cargo --version)"
 # ── 2. Default path discovery ──
 DEFAULT_OUTPUT="${HOME}/scans"
 
-# Install prefix: pick the first writable dir from a platform-appropriate list.
-PREFIX_CANDIDATES=("${HOME}/.local/bin")
+# Install prefix: prefer locations that are **already on $PATH** so the user
+# doesn't get "command not found" after install.
+#
+# macOS default $PATH includes /usr/local/bin and (on Apple Silicon with Homebrew)
+# /opt/homebrew/bin, but NOT ~/.local/bin. On Linux distros vary.
 if [[ "$PLATFORM" == "macos" ]]; then
-  # Apple Silicon Homebrew lives in /opt/homebrew, Intel Homebrew in /usr/local.
-  PREFIX_CANDIDATES+=("/opt/homebrew/bin" "/usr/local/bin")
+  PREFIX_CANDIDATES=("/opt/homebrew/bin" "/usr/local/bin" "${HOME}/.local/bin")
 else
-  PREFIX_CANDIDATES+=("/usr/local/bin")
+  PREFIX_CANDIDATES=("${HOME}/.local/bin" "/usr/local/bin")
 fi
 DEFAULT_PREFIX=""
 for p in "${PREFIX_CANDIDATES[@]}"; do
-  if [[ -w "$p" ]] || { [[ ! -e "$p" ]] && mkdir -p "$p" 2>/dev/null; }; then
+  if [[ -w "$p" ]] || { [[ ! -e "$p" ]] && mkdir -p "$p" 2>/dev/null && [[ -w "$p" ]]; }; then
     DEFAULT_PREFIX="$p"; break
   fi
 done
@@ -90,9 +119,12 @@ done
 
 BUNDLED_PORTS="$REPO_ROOT/ports/portwave-top-ports.txt"
 
-# Smart auto-detect httpx / nuclei (PATH, ~/go/bin, homebrew paths, ~/.local/bin)
-DEFAULT_HTTPX="$(find_bin httpx  "$HOME/go/bin/httpx"  "/opt/homebrew/bin/httpx"  "/usr/local/bin/httpx"  "$HOME/.local/bin/httpx")"
-DEFAULT_NUCLEI="$(find_bin nuclei "$HOME/go/bin/nuclei" "/opt/homebrew/bin/nuclei" "/usr/local/bin/nuclei" "$HOME/.local/bin/nuclei")"
+# Smart auto-detect httpx / nuclei across a wide set of plausible locations.
+# shellcheck disable=SC2207
+HTTPX_CANDIDATES=($(tool_candidates httpx))
+NUCLEI_CANDIDATES=($(tool_candidates nuclei))
+DEFAULT_HTTPX="$(find_bin httpx  "${HTTPX_CANDIDATES[@]}")"
+DEFAULT_NUCLEI="$(find_bin nuclei "${NUCLEI_CANDIDATES[@]}")"
 
 printf "\nConfigure paths (press Enter to accept defaults):\n"
 OUTPUT_DIR="$(ask "Scan output directory" "$DEFAULT_OUTPUT")"
@@ -131,11 +163,60 @@ chmod 644 "$SHARE_DIR/ports/portwave-top-ports.txt"
 chmod 600 "$CONFIG_FILE"
 say "Wrote config: $CONFIG_FILE"
 
-# ── 6. PATH hint ──
+# ── 6. PATH handling — auto-append to the right shell rc when missing ──
+on_path=0
 case ":$PATH:" in
-  *":$INSTALL_PREFIX:"*) ;;
-  *) warn "$INSTALL_PREFIX is not on your \$PATH. Add:  export PATH=\"$INSTALL_PREFIX:\$PATH\"  to your shell rc (~/.bashrc, ~/.zshrc)." ;;
+  *":$INSTALL_PREFIX:"*) on_path=1 ;;
 esac
+
+if [[ "$on_path" -eq 0 ]]; then
+  # Pick the user's likely shell rc based on $SHELL, falling back to what exists.
+  rc=""
+  case "${SHELL:-}" in
+    */zsh)
+      rc="${HOME}/.zshrc"
+      ;;
+    */bash)
+      if [[ "$PLATFORM" == "macos" && -f "${HOME}/.bash_profile" ]]; then
+        rc="${HOME}/.bash_profile"
+      elif [[ -f "${HOME}/.bashrc" ]]; then
+        rc="${HOME}/.bashrc"
+      elif [[ "$PLATFORM" == "macos" ]]; then
+        rc="${HOME}/.bash_profile"
+      else
+        rc="${HOME}/.bashrc"
+      fi
+      ;;
+    *)
+      [[ -f "${HOME}/.zshrc" ]]        && rc="${HOME}/.zshrc"
+      [[ -z "$rc" && -f "${HOME}/.bashrc" ]]        && rc="${HOME}/.bashrc"
+      [[ -z "$rc" && -f "${HOME}/.bash_profile" ]]  && rc="${HOME}/.bash_profile"
+      [[ -z "$rc" ]] && rc="${HOME}/.profile"
+      ;;
+  esac
+
+  # Is a PATH line for this prefix already present?
+  already=0
+  if [[ -f "$rc" ]] && grep -Fq "$INSTALL_PREFIX" "$rc" 2>/dev/null; then
+    already=1
+  fi
+
+  if [[ "$already" -eq 1 ]]; then
+    warn "PATH line for $INSTALL_PREFIX already in $rc. Open a new terminal (or: source $rc)."
+  else
+    ans="$(ask "Append 'export PATH=\"$INSTALL_PREFIX:\$PATH\"' to $rc now?" "yes")"
+    if [[ "$ans" =~ ^[Yy] ]]; then
+      {
+        printf '\n# Added by portwave installer on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'export PATH="%s:$PATH"\n' "$INSTALL_PREFIX"
+      } >> "$rc"
+      say "Updated $rc"
+      warn "Open a new terminal, OR run:  source $rc   (so portwave is on PATH)"
+    else
+      warn "$INSTALL_PREFIX is not on \$PATH. Add manually:  export PATH=\"$INSTALL_PREFIX:\$PATH\""
+    fi
+  fi
+fi
 
 # ── 7. Sanity ──
 if "$INSTALL_PREFIX/portwave" --version >/dev/null 2>&1; then
