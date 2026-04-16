@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
 [![Made for bug bounty](https://img.shields.io/badge/built%20for-bug%20bounty-red.svg)]()
 
 > portwave sweeps a CIDR (v4 or v6), finds open TCP ports in a fast first pass, enriches the hits with banner grabs and TLS sniffing, then hands the targets to **httpx** and **nuclei** — all in a single binary. Think of it as a `masscan + rustscan + naabu` replacement with a proper recon pipeline bolted on.
@@ -47,7 +47,9 @@
 
 ## Install
 
-### One-command (recommended)
+portwave runs on **Linux, macOS, and Windows**. Pick the installer for your OS.
+
+### Linux / macOS — one-command
 
 ```bash
 git clone https://github.com/assassin-marcos/portwave
@@ -57,29 +59,82 @@ bash install.sh
 
 The installer will:
 1. Detect / offer to install Rust via `rustup`.
-2. Prompt for: scan output directory, ports file path, httpx/nuclei paths, install prefix.
-3. Build the release binary.
-4. Copy it to `~/.local/bin/portwave` (or `/usr/local/bin/portwave` if writable).
-5. Write `~/.config/portwave/config.env` with your choices.
-6. Run `portwave --version` as a sanity check.
+2. Auto-detect `httpx` / `nuclei` on `$PATH`, `~/go/bin`, Homebrew paths (`/opt/homebrew/bin` on Apple Silicon, `/usr/local/bin` on Intel), and `~/.local/bin`.
+3. Prompt for: scan output directory, ports file, httpx/nuclei paths, install prefix. Press Enter to accept every default.
+4. Build the release binary.
+5. Copy it to the first writable prefix from: `~/.local/bin`, `/opt/homebrew/bin` (macOS, Apple Silicon), `/usr/local/bin`.
+6. Write `~/.config/portwave/config.env` with your choices.
+7. Run `portwave --version` as a sanity check.
 
-### Manual (no prompts)
-
+Non-interactive mode (accept every default silently):
 ```bash
+NONINTERACTIVE=1 bash install.sh
+```
+
+### Windows — one-command (PowerShell)
+
+From an **elevated** PowerShell window (or regular user PowerShell if you want per-user install):
+
+```powershell
 git clone https://github.com/assassin-marcos/portwave
 cd portwave
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The PowerShell installer will:
+1. Detect / offer to download `rustup-init.exe` and install Rust.
+2. Auto-detect `httpx.exe` / `nuclei.exe` on `$PATH`, `%USERPROFILE%\go\bin`, `%USERPROFILE%\.local\bin`, and `%ProgramFiles%\{tool}`.
+3. Prompt for: scan output dir (default `%USERPROFILE%\scans`), ports file, httpx/nuclei paths, install prefix (default `%USERPROFILE%\.local\bin`).
+4. Build with `cargo build --release`.
+5. Copy `portwave.exe` to the install prefix.
+6. Write `%APPDATA%\portwave\config.env`.
+7. Offer to add the install prefix to your user `PATH`.
+
+Non-interactive:
+```powershell
+$env:NONINTERACTIVE = '1'
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+### Manual (no installer, any OS)
+
+```bash
+# build
 cargo build --release
-install -m 0755 target/release/portwave ~/.local/bin/
-cp -r ports ~/.local/share/portwave/   # so portwave finds the default port list
+
+# Linux / macOS
+install -m 0755 target/release/portwave ~/.local/bin/   # or /usr/local/bin
+mkdir -p ~/.local/share/portwave/ports
+cp ports/portwave-top-ports.txt ~/.local/share/portwave/ports/
+mkdir -p ~/.config/portwave
 cp .env.example ~/.config/portwave/config.env
-$EDITOR ~/.config/portwave/config.env  # fill in paths
+$EDITOR ~/.config/portwave/config.env
+
+# Windows (PowerShell)
+Copy-Item target\release\portwave.exe $env:USERPROFILE\.local\bin\
+New-Item -ItemType Directory -Force $env:LOCALAPPDATA\portwave\ports | Out-Null
+Copy-Item ports\portwave-top-ports.txt $env:LOCALAPPDATA\portwave\ports\
+New-Item -ItemType Directory -Force $env:APPDATA\portwave | Out-Null
+Copy-Item .env.example $env:APPDATA\portwave\config.env
+notepad $env:APPDATA\portwave\config.env
 ```
 
 ### Uninstall
 
 ```bash
-bash uninstall.sh
+bash uninstall.sh                                        # Linux / macOS
+powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 # Windows
 ```
+
+### Platform notes
+
+| Platform | FD-limit tuning | Config file location |
+|---|---|---|
+| Linux   | `setrlimit(RLIMIT_NOFILE, 50000)` on start | `~/.config/portwave/config.env` |
+| macOS   | `setrlimit(RLIMIT_NOFILE, 50000)` on start | `~/.config/portwave/config.env` |
+| Windows | no-op (Windows doesn't bound sockets by FD limit) | `%APPDATA%\portwave\config.env` |
+
+On Linux, you may also need `ulimit -n 50000` at the shell level if your distro's user limits are below that (check `/etc/security/limits.conf`).
 
 ### Dependencies (optional, for the full pipeline)
 

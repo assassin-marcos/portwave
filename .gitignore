@@ -1,6 +1,9 @@
 # Rust
 /target/
+/target-win/
 **/*.rs.bk
+*.exe
+*.pdb
 
 # Runtime output — never commit scan results
 /scans/

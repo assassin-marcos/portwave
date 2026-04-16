@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# portwave — interactive installer
-# Prompts for paths, writes ~/.config/portwave/config.env, builds release binary,
-# installs it to the chosen prefix, bundles the top-ports list under
-# <prefix>/../share/portwave/ports/ so the binary finds it automatically.
+# portwave — interactive installer for Linux and macOS
+# Prompts for paths, writes ~/.config/portwave/config.env, builds the release
+# binary, installs it to the chosen prefix, and bundles the top-ports list
+# under <prefix>/../share/portwave/ports/ so the binary finds it automatically.
+#
+# Non-interactive mode: set NONINTERACTIVE=1 to accept every default silently.
 
 set -euo pipefail
 
@@ -14,9 +16,14 @@ say()  { printf "${C_GREEN}==>${C_RESET} %s\n" "$*"; }
 warn() { printf "${C_YELLOW}[!]${C_RESET} %s\n" "$*"; }
 die()  { printf "${C_RED}[x]${C_RESET} %s\n" "$*" >&2; exit 1; }
 
+NONINTERACTIVE="${NONINTERACTIVE:-0}"
+
 ask() {
   # ask "Prompt" "default"  -> echoes answer
   local prompt="$1"; local default="${2:-}"; local reply
+  if [[ "$NONINTERACTIVE" == "1" ]]; then
+    echo "$default"; return
+  fi
   if [[ -n "$default" ]]; then
     read -r -p "$(printf "${C_BOLD}?${C_RESET} %s [%s]: " "$prompt" "$default")" reply
     echo "${reply:-$default}"
@@ -26,9 +33,28 @@ ask() {
   fi
 }
 
-detect() { command -v "$1" 2>/dev/null || true; }
+# Return the first existing binary from a list of candidates.
+find_bin() {
+  local name="$1"; shift
+  local p
+  p="$(command -v "$name" 2>/dev/null || true)"
+  if [[ -n "$p" ]]; then echo "$p"; return; fi
+  for candidate in "$@"; do
+    if [[ -x "$candidate" ]]; then echo "$candidate"; return; fi
+  done
+  echo ""
+}
 
-printf "\n${C_BOLD}portwave installer${C_RESET}\n\n"
+# ── 0. OS detection ──
+OS="$(uname -s)"
+case "$OS" in
+  Linux)   PLATFORM="linux"   ;;
+  Darwin)  PLATFORM="macos"   ;;
+  MINGW*|MSYS*|CYGWIN*) die "Detected Windows shell. Use install.ps1 from PowerShell instead." ;;
+  *) warn "Unrecognised OS '$OS'. Proceeding as generic Unix." ; PLATFORM="unix" ;;
+esac
+
+printf "\n${C_BOLD}portwave installer${C_RESET} — platform: ${PLATFORM}\n\n"
 
 # ── 1. Rust toolchain ──
 if ! command -v cargo >/dev/null 2>&1; then
@@ -43,18 +69,36 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 say "cargo: $(cargo --version)"
 
-# ── 2. Prompts ──
+# ── 2. Default path discovery ──
 DEFAULT_OUTPUT="${HOME}/scans"
-DEFAULT_PREFIX="${HOME}/.local/bin"
-if [[ -w "/usr/local/bin" ]]; then DEFAULT_PREFIX="/usr/local/bin"; fi
+
+# Install prefix: pick the first writable dir from a platform-appropriate list.
+PREFIX_CANDIDATES=("${HOME}/.local/bin")
+if [[ "$PLATFORM" == "macos" ]]; then
+  # Apple Silicon Homebrew lives in /opt/homebrew, Intel Homebrew in /usr/local.
+  PREFIX_CANDIDATES+=("/opt/homebrew/bin" "/usr/local/bin")
+else
+  PREFIX_CANDIDATES+=("/usr/local/bin")
+fi
+DEFAULT_PREFIX=""
+for p in "${PREFIX_CANDIDATES[@]}"; do
+  if [[ -w "$p" ]] || { [[ ! -e "$p" ]] && mkdir -p "$p" 2>/dev/null; }; then
+    DEFAULT_PREFIX="$p"; break
+  fi
+done
+[[ -n "$DEFAULT_PREFIX" ]] || DEFAULT_PREFIX="${HOME}/.local/bin"
 
 BUNDLED_PORTS="$REPO_ROOT/ports/portwave-top-ports.txt"
+
+# Smart auto-detect httpx / nuclei (PATH, ~/go/bin, homebrew paths, ~/.local/bin)
+DEFAULT_HTTPX="$(find_bin httpx  "$HOME/go/bin/httpx"  "/opt/homebrew/bin/httpx"  "/usr/local/bin/httpx"  "$HOME/.local/bin/httpx")"
+DEFAULT_NUCLEI="$(find_bin nuclei "$HOME/go/bin/nuclei" "/opt/homebrew/bin/nuclei" "/usr/local/bin/nuclei" "$HOME/.local/bin/nuclei")"
 
 printf "\nConfigure paths (press Enter to accept defaults):\n"
 OUTPUT_DIR="$(ask "Scan output directory" "$DEFAULT_OUTPUT")"
 PORTS_FILE="$(ask "Ports file (leave default to use bundled 427-port list)" "$BUNDLED_PORTS")"
-HTTPX_BIN="$(ask  "Path to httpx  binary (optional)" "$(detect httpx)")"
-NUCLEI_BIN="$(ask "Path to nuclei binary (optional)" "$(detect nuclei)")"
+HTTPX_BIN="$(ask  "Path to httpx  binary (blank to skip)" "$DEFAULT_HTTPX")"
+NUCLEI_BIN="$(ask "Path to nuclei binary (blank to skip)" "$DEFAULT_NUCLEI")"
 INSTALL_PREFIX="$(ask "Install binary to" "$DEFAULT_PREFIX")"
 
 SHARE_DIR="$(dirname "$INSTALL_PREFIX")/share/portwave"
@@ -70,9 +114,11 @@ cargo build --release
 BIN_SRC="$REPO_ROOT/target/release/portwave"
 [[ -x "$BIN_SRC" ]] || die "Build succeeded but binary not found at $BIN_SRC"
 
-# ── 4. Install artefacts ──
-install -m 0755 "$BIN_SRC" "$INSTALL_PREFIX/portwave"
-install -m 0644 "$BUNDLED_PORTS" "$SHARE_DIR/ports/portwave-top-ports.txt"
+# ── 4. Install artefacts (portable cp + chmod, no GNU-isms) ──
+cp "$BIN_SRC" "$INSTALL_PREFIX/portwave"
+chmod 755 "$INSTALL_PREFIX/portwave"
+cp "$BUNDLED_PORTS" "$SHARE_DIR/ports/portwave-top-ports.txt"
+chmod 644 "$SHARE_DIR/ports/portwave-top-ports.txt"
 
 # ── 5. Write config ──
 {
@@ -82,13 +128,13 @@ install -m 0644 "$BUNDLED_PORTS" "$SHARE_DIR/ports/portwave-top-ports.txt"
   [[ -n "$HTTPX_BIN"  ]] && echo "PORTWAVE_HTTPX_BIN=$HTTPX_BIN"
   [[ -n "$NUCLEI_BIN" ]] && echo "PORTWAVE_NUCLEI_BIN=$NUCLEI_BIN"
 } > "$CONFIG_FILE"
-chmod 0600 "$CONFIG_FILE"
+chmod 600 "$CONFIG_FILE"
 say "Wrote config: $CONFIG_FILE"
 
 # ── 6. PATH hint ──
 case ":$PATH:" in
   *":$INSTALL_PREFIX:"*) ;;
-  *) warn "$INSTALL_PREFIX is not on your \$PATH. Add:  export PATH=\"$INSTALL_PREFIX:\$PATH\"  to your shell rc." ;;
+  *) warn "$INSTALL_PREFIX is not on your \$PATH. Add:  export PATH=\"$INSTALL_PREFIX:\$PATH\"  to your shell rc (~/.bashrc, ~/.zshrc)." ;;
 esac
 
 # ── 7. Sanity ──

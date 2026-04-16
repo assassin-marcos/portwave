@@ -133,15 +133,38 @@ struct Stats {
 
 // ────────────────────────── Helpers ──────────────────────────
 
-// Load ~/.config/portwave/config.env (or $PORTWAVE_CONFIG) — simple KEY=VALUE lines.
-fn load_config() -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    let path = std::env::var("PORTWAVE_CONFIG").ok().map(PathBuf::from).or_else(|| {
+// Platform-aware config file location:
+//   $PORTWAVE_CONFIG override on all platforms
+//   Unix:    $HOME/.config/portwave/config.env
+//   Windows: %APPDATA%\portwave\config.env
+fn default_config_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("PORTWAVE_CONFIG") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(a) = std::env::var("APPDATA") {
+            return Some(PathBuf::from(a).join("portwave").join("config.env"));
+        }
+        if let Ok(h) = std::env::var("USERPROFILE") {
+            return Some(PathBuf::from(h).join(".config").join("portwave").join("config.env"));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
         std::env::var("HOME")
             .ok()
             .map(|h| PathBuf::from(h).join(".config/portwave/config.env"))
-    });
-    let Some(path) = path else { return out };
+    }
+}
+
+// Load the config file — simple KEY=VALUE lines, comments start with #.
+fn load_config() -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(path) = default_config_path() else { return out };
     let Ok(txt) = fs::read_to_string(&path) else { return out };
     for line in txt.lines() {
         let line = line.trim();
@@ -180,14 +203,32 @@ fn resolve_path(
     fallback.to_string()
 }
 
-// Find the bundled ports file relative to either $PORTWAVE_HOME or the binary location.
+// Find the bundled ports file. Checks, in order:
+//   $PORTWAVE_HOME/ports/portwave-top-ports.txt
+//   <exe>/../share/portwave/ports/portwave-top-ports.txt   (Unix install layout)
+//   <exe>/../ports/portwave-top-ports.txt                  (Windows install layout)
+//   %LOCALAPPDATA%\portwave\ports\portwave-top-ports.txt   (Windows per-user install)
+//   ./ports/portwave-top-ports.txt                         (running from repo root)
 fn find_bundled_ports() -> Option<String> {
-    let candidates = [
-        std::env::var("PORTWAVE_HOME").ok().map(|h| PathBuf::from(h).join("ports/portwave-top-ports.txt")),
-        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).map(|d| d.join("../share/portwave/ports/portwave-top-ports.txt")),
-        Some(PathBuf::from("ports/portwave-top-ports.txt")),
-    ];
-    for c in candidates.into_iter().flatten() {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(h) = std::env::var("PORTWAVE_HOME") {
+        candidates.push(PathBuf::from(h).join("ports/portwave-top-ports.txt"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("../share/portwave/ports/portwave-top-ports.txt"));
+            candidates.push(dir.join("../ports/portwave-top-ports.txt"));
+            candidates.push(dir.join("ports/portwave-top-ports.txt"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(a) = std::env::var("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(a).join("portwave/ports/portwave-top-ports.txt"));
+        }
+    }
+    candidates.push(PathBuf::from("ports/portwave-top-ports.txt"));
+    for c in candidates {
         if c.is_file() {
             return c.to_str().map(|s| s.to_string());
         }
@@ -195,6 +236,9 @@ fn find_bundled_ports() -> Option<String> {
     None
 }
 
+// Raise the file-descriptor soft limit so thousands of concurrent sockets work.
+// On Windows this is a no-op: socket handles aren't bounded by RLIMIT_NOFILE.
+#[cfg(unix)]
 fn raise_fd_limit() {
     unsafe {
         let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -209,6 +253,9 @@ fn raise_fd_limit() {
     }
 }
 
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
+
 fn load_ports(path: &str) -> Vec<u16> {
     match fs::read_to_string(path) {
         Ok(content) => {
@@ -216,7 +263,7 @@ fn load_ports(path: &str) -> Vec<u16> {
                 .split(|c: char| c == ',' || c.is_whitespace())
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-                .filter_map(|p| p.parse().ok())
+                .filter_map(|p| p.parse::<u16>().ok())
                 .collect();
             ports.sort_unstable();
             ports.dedup();

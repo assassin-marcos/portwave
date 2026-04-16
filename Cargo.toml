@@ -20,11 +20,14 @@ clap = { version = "4.4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 ipnetwork = "0.20"
 anyhow = "1.0"
-libc = "0.2"
 indicatif = "0.17"
 flume = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Unix-only: setrlimit(RLIMIT_NOFILE) to raise the FD soft limit for large scans.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = "thin"
