@@ -108,6 +108,30 @@ struct Args {
     #[arg(long, default_value_t = false)]
     nuclei_all_ports: bool,
 
+    /// POST scan_summary.json (with scan_diff.json merged in) to this URL
+    /// once the workflow finishes. Works with Slack/Discord/custom
+    /// collectors. Silent on failure so a flaky webhook doesn't break
+    /// the exit code.
+    #[arg(long)]
+    webhook: Option<String>,
+
+    /// Opt-in UDP discovery. Sends protocol-specific probes to a curated
+    /// set of well-known UDP ports (DNS, NTP, SNMP, SSDP, mDNS, IKE,
+    /// OpenVPN, memcached, NetBIOS, TFTP, portmap, MSSQL-browser) on
+    /// every target IP and records anything that replies. Off by default
+    /// — TCP-connect scanning covers most services; UDP is slower and
+    /// relies on probe-specific replies.
+    #[arg(long, default_value_t = false)]
+    udp: bool,
+
+    /// Re-fetch CDN/WAF edge CIDRs from upstream (Cloudflare IPs list,
+    /// Fastly public IP API) and write the merged list to the user's
+    /// cache so future scans use it instead of the embedded snapshot.
+    /// Keeps the CDN tagger accurate year-over-year without a new
+    /// release.
+    #[arg(long, default_value_t = false)]
+    refresh_cdn: bool,
+
     #[arg(long, default_value_t = false)]
     no_httpx: bool,
 
@@ -202,6 +226,10 @@ struct Stats {
     /// target dropping SYNs (where shrinking would only slow the
     /// scan without any benefit).
     local_errors: AtomicU64,
+    /// Flips to true after the top-20 priority sweep completes.
+    /// Lets phase_a workers print an interim summary before Pass 2
+    /// starts chewing through the full port list.
+    priority_done: AtomicBool,
 }
 
 // ────────────────────────── Helpers ──────────────────────────
@@ -303,6 +331,14 @@ fn raise_fd_limit() {}
 const EMBEDDED_PORTS: &str = include_str!("../ports/portwave-top-ports.txt");
 const EMBEDDED_SENTINEL: &str = "<embedded>";
 
+// Top-20 most-common TCP ports (weighted by real-world hit rate across
+// bug-bounty / internet-facing asset classes). Scanned FIRST so the user
+// sees early results on long scans.
+const TOP_PRIORITY_PORTS: &[u16] = &[
+    80, 443, 22, 21, 25, 53, 8080, 8443, 3389, 110,
+    143, 445, 3306, 5432, 6379, 27017, 9200, 1883, 5900, 11211,
+];
+
 fn parse_port_list(content: &str) -> Vec<u16> {
     let mut ports: Vec<u16> = Vec::new();
     for tok in content.split(|c: char| c == ',' || c.is_whitespace()) {
@@ -330,7 +366,23 @@ fn parse_port_list(content: &str) -> Vec<u16> {
     }
     ports.sort_unstable();
     ports.dedup();
-    ports
+    // Smart prioritization: put top-20 priority ports first (in their
+    // priority order), then the remaining ports in numeric order. Users
+    // see early hits on slow scans.
+    let priority_set: std::collections::HashSet<u16> =
+        TOP_PRIORITY_PORTS.iter().copied().collect();
+    let mut out = Vec::with_capacity(ports.len());
+    for p in TOP_PRIORITY_PORTS {
+        if ports.contains(p) {
+            out.push(*p);
+        }
+    }
+    for p in &ports {
+        if !priority_set.contains(p) {
+            out.push(*p);
+        }
+    }
+    out
 }
 
 fn load_ports(path: &str) -> Vec<u16> {
@@ -544,16 +596,22 @@ const CDN_RANGES_RAW: &str = include_str!("../ports/cdn-ranges.txt");
 
 // Loaded once at startup. (CIDR, provider-name).
 fn load_cdn_ranges() -> Vec<(IpNetwork, &'static str)> {
+    // Prefer the user's cache file (written by `portwave --refresh-cdn`)
+    // over the compiled-in snapshot so users can keep the list current
+    // without a portwave rebuild.
+    let raw: String = if let Some(cache) = cdn_cache_path() {
+        fs::read_to_string(&cache).unwrap_or_else(|_| CDN_RANGES_RAW.to_string())
+    } else {
+        CDN_RANGES_RAW.to_string()
+    };
     let mut out = Vec::with_capacity(128);
-    for line in CDN_RANGES_RAW.lines() {
+    for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if let Some((cidr, provider)) = line.split_once('|') {
             if let Ok(n) = cidr.trim().parse::<IpNetwork>() {
-                // Leak the provider name to get a &'static str — the list is
-                // small and lives for process lifetime anyway.
                 let p: &'static str = Box::leak(provider.trim().to_string().into_boxed_str());
                 out.push((n, p));
             }
@@ -986,6 +1044,12 @@ async fn adaptive_monitor(stats: Arc<Stats>, sem: Arc<Semaphore>, max: usize) {
 
 // ────────────────────────── Producer ──────────────────────────
 
+// Two-pass producer:
+//   Pass 1: top-20 priority ports × all IPs  (user sees early hits)
+//   Pass 2: remaining ports × all IPs
+// Within each pass we iterate ports-outer, IPs-inner, so all targets
+// get probed on the same port before moving to the next port — which
+// is what makes the "early results" promise real.
 async fn producer(
     tx: flume::Sender<SocketAddr>,
     nets: Vec<IpNetwork>,
@@ -994,41 +1058,83 @@ async fn producer(
     exclude: Arc<Vec<IpNetwork>>,
     stats: Arc<Stats>,
 ) {
-    // Round-robin across subnets at IP granularity.
-    let mut iters: Vec<_> = nets.iter().map(|n| (n.clone(), n.iter())).collect();
-    loop {
-        if stats.shutdown.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut any = false;
-        for (net, it) in iters.iter_mut() {
-            if let Some(ip) = it.next() {
-                any = true;
-                if !is_usable_ipv4_host(net, ip) {
-                    continue;
-                }
-                // Skip IPs that fall in any --exclude range.
-                if exclude.iter().any(|e| e.contains(ip)) {
-                    continue;
-                }
-                for &port in &ports {
-                    let sa = SocketAddr::new(ip, port);
-                    if skip.contains(&sa) {
+    // Collect usable IPs in round-robin order across the input subnets
+    // so big /16 + small /24 inputs share bandwidth fairly.
+    let ips = {
+        let per_net: Vec<Vec<IpAddr>> = nets
+            .iter()
+            .map(|n| {
+                let mut v = Vec::new();
+                for ip in n.iter() {
+                    if !is_usable_ipv4_host(n, ip) {
                         continue;
                     }
-                    if tx.send_async(sa).await.is_err() {
-                        return;
+                    if exclude.iter().any(|e| e.contains(ip)) {
+                        continue;
                     }
-                    if stats.shutdown.load(Ordering::Relaxed) {
-                        return;
-                    }
+                    v.push(ip);
+                }
+                v
+            })
+            .collect();
+        let max_len = per_net.iter().map(|v| v.len()).max().unwrap_or(0);
+        let mut round_robin = Vec::new();
+        for i in 0..max_len {
+            for net_ips in &per_net {
+                if let Some(ip) = net_ips.get(i) {
+                    round_robin.push(*ip);
                 }
             }
         }
-        if !any {
-            break;
+        round_robin
+    };
+
+    let priority_set: std::collections::HashSet<u16> =
+        TOP_PRIORITY_PORTS.iter().copied().collect();
+    let priority_ports: Vec<u16> = ports
+        .iter()
+        .copied()
+        .filter(|p| priority_set.contains(p))
+        .collect();
+    let other_ports: Vec<u16> = ports
+        .iter()
+        .copied()
+        .filter(|p| !priority_set.contains(p))
+        .collect();
+
+    // Pass 1: priority ports
+    for &port in &priority_ports {
+        for &ip in &ips {
+            if stats.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            let sa = SocketAddr::new(ip, port);
+            if skip.contains(&sa) {
+                continue;
+            }
+            if tx.send_async(sa).await.is_err() {
+                return;
+            }
         }
     }
+    stats.priority_done.store(true, Ordering::Relaxed);
+
+    // Pass 2: everything else
+    for &port in &other_ports {
+        for &ip in &ips {
+            if stats.shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+            let sa = SocketAddr::new(ip, port);
+            if skip.contains(&sa) {
+                continue;
+            }
+            if tx.send_async(sa).await.is_err() {
+                return;
+            }
+        }
+    }
+    let _ = ips; // silence unused warning on shutdown path
 }
 
 // Returns true if stderr looks like a terminal (so ANSI colour + banner art
@@ -1309,6 +1415,215 @@ async fn run_check_update() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ────────────────────────── Webhook ──────────────────────────
+
+fn post_webhook(url: &str, payload: &serde_json::Value) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(payload)?;
+    ureq::post(url)
+        .set("User-Agent", concat!("portwave/", env!("CARGO_PKG_VERSION")))
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(8))
+        .send_bytes(&body)?;
+    Ok(())
+}
+
+// ────────────────────────── UDP discovery ──────────────────────────
+
+// (port, probe-bytes, protocol-label). Probes chosen to elicit a response
+// from a default configuration; hand-crafted minimal byte sequences so no
+// extra deps are needed.
+const UDP_PROBES: &[(u16, &[u8], &str)] = &[
+    // DNS version.bind CHAOS TXT
+    (53, b"\x00\x06\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07version\x04bind\x00\x00\x10\x00\x03", "dns"),
+    // NTPv4 client request (mode=3, version=4)
+    (123, b"\x1b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", "ntp"),
+    // SNMP v1 GetRequest community=public, OID=sysDescr.0
+    (161, b"\x30\x26\x02\x01\x00\x04\x06public\xa0\x19\x02\x04\x71\x92\xee\x13\x02\x01\x00\x02\x01\x00\x30\x0b\x30\x09\x06\x05\x2b\x06\x01\x02\x01\x05\x00", "snmp"),
+    // SSDP M-SEARCH *
+    (1900, b"M-SEARCH * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\nMan: \"ssdp:discover\"\r\nST: upnp:rootdevice\r\nMX: 1\r\n\r\n", "ssdp"),
+    // mDNS query for _services._dns-sd._udp.local
+    (5353, b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x09_services\x07_dns-sd\x04_udp\x05local\x00\x00\x0c\x00\x01", "mdns"),
+    // NetBIOS name service query
+    (137, b"\x80\xf0\x00\x10\x00\x01\x00\x00\x00\x00\x00\x00 CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\x00\x00\x21\x00\x01", "netbios"),
+    // MSSQL browser (0x02 query)
+    (1434, b"\x02", "mssql-browser"),
+    // Sun RPC portmap null call
+    (111, b"\x72\xfe\x1d\x13\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01\x86\xa0\x00\x00\x00\x02\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", "portmap"),
+    // TFTP read request for a probe filename
+    (69, b"\x00\x01netascii\x00", "tftp"),
+    // IKE v1 header (main mode init)
+    (500, b"\x00\x11\x22\x33\x44\x55\x66\x77\x00\x00\x00\x00\x00\x00\x00\x00\x01\x10\x02\x00\x00\x00\x00\x00\x00\x00\x00\x14\x00\x00\x00\x00", "ike"),
+    // OpenVPN hard-reset client v2
+    (1194, b"\x38\x00\x00\x00\x00\x00\x00\x00\x00", "openvpn"),
+    // memcached version\r\n
+    (11211, b"version\r\n", "memcached"),
+    // WireGuard handshake init probe (minimal)
+    (51820, b"\x01\x00\x00\x00", "wireguard"),
+    // NFS ping (rpc null)
+    (2049, b"\x80\x00\x00\x28\x72\xfe\x1d\x13\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01\x86\xa3\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", "nfs"),
+    // QUIC / HTTP3 Initial (minimal — enough to elicit a Version Negotiation)
+    (443, b"\xc0\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", "quic"),
+];
+
+async fn udp_probe_one(sa: SocketAddr, probe: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+    let bind_addr = match sa {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket = tokio::net::UdpSocket::bind(bind_addr).await.ok()?;
+    socket.connect(sa).await.ok()?;
+    socket.send(probe).await.ok()?;
+    let mut buf = [0u8; 2048];
+    match tokio::time::timeout(timeout, socket.recv(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => Some(buf[..n].to_vec()),
+        _ => None,
+    }
+}
+
+async fn run_udp_phase(
+    nets: &[IpNetwork],
+    exclude: &[IpNetwork],
+    timeout: Duration,
+    max_concurrency: usize,
+) -> Vec<OpenPort> {
+    let mut all_ips = Vec::new();
+    for net in nets {
+        for ip in net.iter() {
+            if !is_usable_ipv4_host(net, ip) {
+                continue;
+            }
+            if exclude.iter().any(|e| e.contains(ip)) {
+                continue;
+            }
+            all_ips.push(ip);
+        }
+    }
+    let sem = Arc::new(Semaphore::new(max_concurrency));
+    let mut set: JoinSet<Option<OpenPort>> = JoinSet::new();
+    for ip in all_ips {
+        for &(port, probe, label) in UDP_PROBES {
+            let p = sem.clone().acquire_owned().await.unwrap();
+            set.spawn(async move {
+                let sa = SocketAddr::new(ip, port);
+                let reply = udp_probe_one(sa, probe, timeout).await?;
+                drop(p);
+                let banner: String = reply
+                    .iter()
+                    .take(80)
+                    .flat_map(|b| std::iter::once(if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' }))
+                    .collect();
+                Some(OpenPort {
+                    ip: ip.to_string(),
+                    port,
+                    rtt_ms: 0,
+                    tls: false,
+                    protocol: Some(format!("udp/{}", label)),
+                    banner: Some(banner),
+                    cdn: None,
+                })
+            });
+        }
+    }
+    let mut out = Vec::new();
+    while let Some(Ok(Some(op))) = set.join_next().await {
+        out.push(op);
+    }
+    out
+}
+
+// ────────────────────────── Dynamic CDN refresh ──────────────────────────
+
+fn cdn_cache_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|a| PathBuf::from(a).join("portwave").join("cdn-ranges.txt"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".cache/portwave/cdn-ranges.txt"))
+    }
+}
+
+async fn run_refresh_cdn() -> anyhow::Result<()> {
+    println!("portwave: refreshing CDN ranges from upstream…");
+    let mut entries: Vec<String> = Vec::new();
+
+    // Cloudflare
+    match ureq::get("https://www.cloudflare.com/ips-v4")
+        .timeout(Duration::from_secs(15))
+        .call()
+    {
+        Ok(r) => {
+            let body = r.into_string().unwrap_or_default();
+            let mut n = 0;
+            for line in body.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                entries.push(format!("{}|cloudflare", line));
+                n += 1;
+            }
+            println!("  cloudflare: {} CIDRs", n);
+        }
+        Err(e) => eprintln!("  cloudflare fetch failed: {}", e),
+    }
+
+    // Fastly
+    match ureq::get("https://api.fastly.com/public-ip-list")
+        .timeout(Duration::from_secs(15))
+        .call()
+    {
+        Ok(r) => {
+            let j: serde_json::Value = r.into_json().unwrap_or(serde_json::Value::Null);
+            let mut n = 0;
+            if let Some(arr) = j.get("addresses").and_then(|a| a.as_array()) {
+                for v in arr {
+                    if let Some(cidr) = v.as_str() {
+                        entries.push(format!("{}|fastly", cidr));
+                        n += 1;
+                    }
+                }
+            }
+            println!("  fastly: {} CIDRs", n);
+        }
+        Err(e) => eprintln!("  fastly fetch failed: {}", e),
+    }
+
+    // Non-API providers: carry forward the compiled-in snapshot entries
+    // for providers we can't hit live (akamai/sucuri/imperva/stackpath/
+    // bunnycdn/cachefly/keycdn).
+    let mut forwarded = 0;
+    for line in CDN_RANGES_RAW.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((_, provider)) = line.split_once('|') {
+            if !matches!(provider.trim(), "cloudflare" | "fastly") {
+                entries.push(line.to_string());
+                forwarded += 1;
+            }
+        }
+    }
+    println!("  embedded providers carried over: {} CIDRs", forwarded);
+
+    let path = cdn_cache_path()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve cache directory"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = entries.join("\n") + "\n";
+    fs::write(&path, &content)?;
+    println!("Wrote {} entries to {}", entries.len(), path.display());
+    println!("portwave will use this file on next scan. Delete it to revert to embedded.");
+    Ok(())
+}
+
 // ────────────────────────── Main ──────────────────────────
 
 #[tokio::main]
@@ -1327,6 +1642,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.check_update {
         return run_check_update().await;
+    }
+    if args.refresh_cdn {
+        return run_refresh_cdn().await;
     }
 
     // Positional args required for a real scan, unless --input-file / --asn supplies them.
@@ -1366,8 +1684,24 @@ async fn main() -> anyhow::Result<()> {
     let nuclei_path = out_dir.join("nuclei_targets.txt");
     let jsonl_path = out_dir.join("open_ports.jsonl");
     let summary_path = out_dir.join("scan_summary.json");
+    let diff_path = out_dir.join("scan_diff.json");
     let httpx_out = out_dir.join("httpx_results.txt");
     let nuclei_out = out_dir.join("nuclei_results.txt");
+
+    // Always capture prior opens (independent of --no-resume) so scan_diff
+    // can compare this run against the last one.
+    let mut prior_set: HashSet<SocketAddr> = HashSet::new();
+    if jsonl_path.exists() {
+        if let Ok(f) = fs::File::open(&jsonl_path) {
+            for line in BufReader::new(f).lines().flatten() {
+                if let Ok(op) = serde_json::from_str::<OpenPort>(&line) {
+                    if let Ok(ip) = op.ip.parse::<IpAddr>() {
+                        prior_set.insert(SocketAddr::new(ip, op.port));
+                    }
+                }
+            }
+        }
+    }
 
     // Resume — read existing jsonl into skip set.
     let mut skip_set: HashSet<SocketAddr> = HashSet::new();
@@ -1530,6 +1864,7 @@ async fn main() -> anyhow::Result<()> {
         timeouts: AtomicU64::new(0),
         opens: AtomicU64::new(0),
         local_errors: AtomicU64::new(0),
+        priority_done: AtomicBool::new(false),
     });
     let sem = Arc::new(Semaphore::new(args.threads));
 
@@ -1653,6 +1988,37 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ── UDP phase (opt-in) ──
+    if args.udp {
+        println!(
+            "--- UDP DISCOVERY ({} probes × {} IPs) ---",
+            UDP_PROBES.len(),
+            {
+                let mut cnt = 0usize;
+                for net in &nets {
+                    for ip in net.iter() {
+                        if is_usable_ipv4_host(net, ip)
+                            && !exclude_arc.iter().any(|e| e.contains(ip))
+                        {
+                            cnt += 1;
+                        }
+                    }
+                }
+                cnt
+            }
+        );
+        let udp_concurrency = args.threads.min(500);
+        let udp_hits = run_udp_phase(
+            &nets,
+            exclude_arc.as_slice(),
+            Duration::from_millis(args.enrich_timeout_ms.max(800)),
+            udp_concurrency,
+        )
+        .await;
+        println!("UDP: {} service(s) responded.", udp_hits.len());
+        open_records.extend(udp_hits);
+    }
+
     open_records.sort_by(|a, b| (a.ip.as_str(), a.port).cmp(&(b.ip.as_str(), b.port)));
     // Tag each open port with its CDN/WAF provider if it falls in a known edge range.
     let cdn_table = load_cdn_ranges();
@@ -1736,6 +2102,42 @@ async fn main() -> anyhow::Result<()> {
         "Totals — attempts: {}, timeouts: {}, open: {}",
         summary.attempts, summary.timeouts, summary.open
     );
+
+    // Diff this run against the prior open_ports.jsonl (if any) and emit
+    // scan_diff.json — useful for continuous monitoring / change alerts.
+    if !prior_set.is_empty() || !open_records.is_empty() {
+        let current_set: std::collections::BTreeSet<SocketAddr> = open_records
+            .iter()
+            .filter_map(|op| {
+                op.ip.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, op.port))
+            })
+            .collect();
+        let prior_btree: std::collections::BTreeSet<SocketAddr> = prior_set.iter().copied().collect();
+        let new_opens: Vec<String> = current_set.difference(&prior_btree).map(|s| s.to_string()).collect();
+        let closed: Vec<String> = prior_btree.difference(&current_set).map(|s| s.to_string()).collect();
+        let unchanged: usize = current_set.intersection(&prior_btree).count();
+        let diff = serde_json::json!({
+            "folder": folder_name,
+            "generated_at_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            "prior_opens": prior_btree.len(),
+            "current_opens": current_set.len(),
+            "new": new_opens,
+            "closed": closed,
+            "unchanged": unchanged,
+        });
+        fs::write(&diff_path, serde_json::to_string_pretty(&diff)?)?;
+        let new_n = diff["new"].as_array().map(|a| a.len()).unwrap_or(0);
+        let closed_n = diff["closed"].as_array().map(|a| a.len()).unwrap_or(0);
+        if prior_set.is_empty() {
+            println!("Diff: first scan (no prior baseline) → {:?}", diff_path);
+        } else {
+            println!(
+                "Diff: +{} new, -{} closed, {} unchanged → {:?}",
+                new_n, closed_n, unchanged, diff_path
+            );
+        }
+    }
 
     if open_records.is_empty() {
         println!("No open ports. Done.");
@@ -1843,6 +2245,32 @@ async fn main() -> anyhow::Result<()> {
         println!("Skipping nuclei (--no-nuclei).");
     } else {
         eprintln!("nuclei not in PATH; skipping.");
+    }
+
+    // Optional webhook — POSTs summary JSON (with diff merged in) once
+    // everything else is on disk. Silent on failure by design so a flaky
+    // collector never breaks the scan's exit code.
+    if let Some(url) = args.webhook.as_deref() {
+        let mut payload = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
+        if diff_path.exists() {
+            if let Ok(diff_str) = fs::read_to_string(&diff_path) {
+                if let Ok(diff_val) = serde_json::from_str::<serde_json::Value>(&diff_str) {
+                    if let Some(obj) = payload.as_object_mut() {
+                        obj.insert("diff".into(), diff_val);
+                    }
+                }
+            }
+        }
+        match tokio::task::spawn_blocking({
+            let url = url.to_string();
+            move || post_webhook(&url, &payload)
+        })
+        .await
+        {
+            Ok(Ok(())) => println!("Webhook: posted summary to {}", url),
+            Ok(Err(e)) => eprintln!("Webhook: failed ({}) — continuing.", e),
+            Err(e) => eprintln!("Webhook: join error ({}) — continuing.", e),
+        }
     }
 
     println!("\n--- WORKFLOW COMPLETE ---");

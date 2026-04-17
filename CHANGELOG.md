@@ -6,6 +6,98 @@ Versions follow semantic versioning (Major.Minor.Patch).
 
 ---
 
+## [0.7.0] — 2026-04-17
+
+### Added
+- **Smart port prioritization.** The producer now runs a **two-pass sweep**:
+  pass 1 scans a curated top-20 priority list (`80, 443, 22, 21, 25, 53,
+  8080, 8443, 3389, 110, 143, 445, 3306, 5432, 6379, 27017, 9200, 1883,
+  5900, 11211`) across every IP, pass 2 does the remainder. On long scans
+  users see HTTP/SSH/DB hits in the first few seconds instead of waiting
+  for the full port sweep to finish. Priority order is stable regardless
+  of input source (`--ports`, `--port-file`, embedded).
+- **`scan_diff.json`.** Every scan reads the prior `open_ports.jsonl` before
+  overwriting it and writes a diff to `scan_diff.json`:
+  `{prior_opens, current_opens, new:[…], closed:[…], unchanged:N}`.
+  Independent of `--no-resume` — diff always runs when a prior file exists.
+  Perfect for continuous-monitoring cron + webhook workflows.
+- **`--webhook <URL>`.** POSTs `scan_summary.json` (with `scan_diff.json`
+  merged under a `diff` key) to the URL when the workflow finishes. Silent
+  on failure so a flaky collector never breaks the exit code. Works with
+  Slack/Discord/custom endpoints.
+- **`--udp` opt-in UDP discovery phase.** Curated set of protocol-specific
+  probes against ~15 well-known UDP services: DNS 53, NTP 123, SNMP 161,
+  SSDP 1900, mDNS 5353, NetBIOS 137, MSSQL-browser 1434, portmap 111,
+  TFTP 69, IKE 500, OpenVPN 1194, memcached 11211, WireGuard 51820,
+  NFS 2049, QUIC 443. Responses appear in `open_ports.jsonl` with
+  `protocol: "udp/<label>"` and a best-effort ASCII-cleaned banner.
+  Off by default because UDP without ICMP port-unreachable reads (which
+  would require root) only catches services that actively reply to our
+  specific probe.
+- **`--refresh-cdn`.** Re-fetches live edge ranges from Cloudflare
+  (`https://www.cloudflare.com/ips-v4`) + Fastly (`https://api.fastly.com/
+  public-ip-list`), merges with the embedded snapshot's non-API providers
+  (akamai/sucuri/imperva/stackpath/bunnycdn/cachefly/keycdn), writes to
+  `~/.cache/portwave/cdn-ranges.txt` (Unix) or
+  `%LOCALAPPDATA%\portwave\cdn-ranges.txt` (Windows). `load_cdn_ranges()`
+  prefers this cache file over the compiled-in snapshot at runtime, so
+  users can keep CDN coverage current between portwave releases.
+
+## [0.6.6] — 2026-04-17
+
+### Changed
+- Narrowed the nuclei non-HTTP port filter from ~70 ports down to 18.
+  The v0.6.4 blocklist excluded SSH/22, Redis/6379, MongoDB/27017,
+  VNC/5900, MQTT/1883, MySQL/3306, etc. — all ports where nuclei has
+  working templates (`ssh-auth-methods`, `redis-default-login`,
+  `mongodb-unauth`, `vnc-without-pass`, `mqtt-*`, `mysql-weak-auth`).
+  Filter was silently dropping real findings. Now blocks only ports with
+  essentially zero nuclei coverage: 7/9/13/17/19/37 (toy services), 53
+  (DNS-TCP), 67/68 (DHCP), 69 (TFTP), 109 (POP2), 111 (portmap), 123
+  (NTP), 137/138 (NetBIOS name/dgram), 161/162 (SNMP), 179 (BGP), 514
+  (syslog), 543/544 (klogin/kshell), 4789 (VXLAN).
+- Removed the banner-protocol short-circuit in `is_http_candidate` —
+  the banner classifier correctly tags SSH/SMTP/FTP/POP3/IMAP, which
+  are all protocols nuclei explicitly supports.
+
+## [0.6.5] — 2026-04-17
+
+### Changed
+- `--nuclei-concurrency` default lowered 50 → 25 to match
+  `--nuclei-max-host-error`. Silences nuclei's "concurrency value is
+  higher than max-host-error" warning and removes the silent cap nuclei
+  was applying. Users who want higher concurrency can pass both flags.
+
+## [0.6.4] — 2026-04-17
+
+### Added
+- `--nuclei-max-host-error` (default `25`) — passes `-mhe 25` to nuclei
+  so doomed hosts fail fast.
+- Non-HTTP port filter on `nuclei_targets.txt` (can be disabled with
+  `--nuclei-all-ports`). Aggressive in this version — narrowed in 0.6.6.
+
+## [0.6.3] — 2026-04-17
+
+### Changed
+- Replaced the block-font ASCII banner (which piled up backslashes in
+  the `W`+`A` glyphs and rendered chaotically on narrow terminals) with
+  the standard figlet mixed-case font for "portwave".
+
+## [0.6.2] — 2026-04-17
+
+### Fixed
+- **Adaptive controller mistook firewalled targets for local saturation.**
+  Previous versions shrank the worker pool when `timeouts / attempts`
+  exceeded 30 %. But 100 % timeouts has two totally different causes:
+  (a) local resource exhaustion (correct response: shrink), or
+  (b) the target is firewalled (correct response: do nothing). The
+  heuristic couldn't tell them apart and always assumed (a). On a /24
+  with 99 %+ dead IPs — including localhost `127.0.0.0/24` — it would
+  shrink from 1500 to 64 workers, turning a 3-minute scan into 30 min.
+  Rewrote the controller to watch actual local-resource errors only
+  (`AddrNotAvailable`, `EMFILE`, `ENFILE`, `ENOBUFS`, `EAGAIN` via
+  `raw_os_error`). Timeouts are now purely informational.
+
 ## [0.6.1] — 2026-04-17
 
 ### Fixed
