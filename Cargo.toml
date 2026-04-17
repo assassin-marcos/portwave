@@ -1,6 +1,6 @@
 [package]
 name = "portwave"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 description = "Ultra-fast hybrid IPv4/IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, and httpx/nuclei pipeline."
 license = "MIT"
@@ -27,6 +27,9 @@ serde_json = "1"
 # Self-update: downloads prebuilt binaries from GitHub Releases for the host
 # platform (Linux x86_64, macOS x86_64/aarch64, Windows x86_64).
 self_update = { version = "0.41", default-features = false, features = ["rustls", "archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate"] }
+# Tiny blocking HTTP client for the GitHub tags API peek — catches the
+# "tag pushed, release not yet built" race in `--check-update`.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 
 # Unix-only: setrlimit(RLIMIT_NOFILE) to raise the FD soft limit for large scans.
 [target.'cfg(unix)'.dependencies]

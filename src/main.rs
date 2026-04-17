@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
@@ -35,20 +35,24 @@ struct Args {
     #[arg(long)]
     port_file: Option<String>,
 
-    /// Max concurrent probes (adaptive controller may shrink this)
-    #[arg(short, long, default_value_t = 4000)]
+    /// Max concurrent probes (adaptive controller may shrink this).
+    /// 1500 is a sweet spot on most systems — higher values cause
+    /// ephemeral-port exhaustion on long scans.
+    #[arg(short, long, default_value_t = 1500)]
     threads: usize,
 
-    /// Phase-A connect timeout (ms) — discovery
-    #[arg(long, default_value_t = 600)]
+    /// Phase-A connect timeout (ms) — discovery. 800 ms catches slow
+    /// firewalled hosts without bloating total runtime on cold targets.
+    #[arg(long, default_value_t = 800)]
     timeout_ms: u64,
 
     /// Phase-B connect timeout (ms) — enrichment/banner
     #[arg(long, default_value_t = 1500)]
     enrich_timeout_ms: u64,
 
-    /// Retry count for Phase-A timeouts only
-    #[arg(long, default_value_t = 0)]
+    /// Retry count for Phase-A timeouts only. 1 catches transient SYN
+    /// drops without doubling scan time (only timeouts retry, not RSTs).
+    #[arg(long, default_value_t = 1)]
     retries: u8,
 
     /// Base output directory. Falls back to $PORTWAVE_OUTPUT_DIR, config file, then ./scans.
@@ -269,10 +273,13 @@ fn load_ports(path: &str) -> Vec<u16> {
 }
 
 // Refresh on-disk ports files (for users whose config or workflow points at
-// share/<...>/portwave-top-ports.txt) so they pick up the same list that's
-// embedded in the freshly-installed binary.
+// share/<...>/portwave-top-ports.txt — OR at a repo clone path left behind
+// by an earlier install.sh) so they pick up the same list that's embedded
+// in the freshly-installed binary.
 fn refresh_bundled_ports_files() {
     let mut paths: Vec<PathBuf> = Vec::new();
+
+    // Install-layout candidates relative to the running binary.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             paths.push(dir.join("../share/portwave/ports/portwave-top-ports.txt"));
@@ -288,8 +295,31 @@ fn refresh_bundled_ports_files() {
             paths.push(PathBuf::from(a).join("portwave/ports/portwave-top-ports.txt"));
         }
     }
+
+    // Whatever PORTWAVE_PORTS resolves to (env or config). Critical for
+    // configs that point at a repo-clone path outside the install prefix —
+    // older install.sh versions wrote this. Without this step, --update
+    // would silently leave users on the stale list.
+    let cfg = load_config();
+    if let Ok(p) = std::env::var("PORTWAVE_PORTS") {
+        if !p.is_empty() {
+            paths.push(PathBuf::from(p));
+        }
+    }
+    if let Some(p) = cfg.get("PORTWAVE_PORTS") {
+        if !p.is_empty() {
+            paths.push(PathBuf::from(p));
+        }
+    }
+
+    // De-duplicate so we don't log the same path twice.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut refreshed = 0usize;
     for p in &paths {
+        let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+        if !seen.insert(canon) {
+            continue;
+        }
         if !p.is_file() {
             continue; // only refresh files that already existed
         }
@@ -398,6 +428,31 @@ fn classify(data: &[u8]) -> Option<String> {
     None
 }
 
+// TCP connect with our tuned socket options:
+//   * SO_LINGER = 0  → close() returns the ephemeral port to the OS
+//                      immediately instead of leaving it in TIME_WAIT for 60 s.
+//                      Critical for long scans that would otherwise exhaust
+//                      the ephemeral port range at ~4 K concurrent probes.
+//   * TCP_NODELAY    → disable Nagle. We close right after connect, so the
+//                      default 40 ms ACK coalescing is pure latency.
+async fn tcp_probe(sa: SocketAddr) -> std::io::Result<TcpStream> {
+    let socket = match sa {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    // Tokio blanket-deprecates set_linger because SO_LINGER with a *non-zero*
+    // timeout can block the runtime on close. We explicitly use Duration::ZERO,
+    // which sends a RST and returns immediately — exactly what we want to
+    // avoid TIME_WAIT ephemeral-port exhaustion on long scans.
+    #[allow(deprecated)]
+    {
+        let _ = socket.set_linger(Some(Duration::ZERO));
+    }
+    let stream = socket.connect(sa).await?;
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
+}
+
 // ────────────────────────── Phase A (discovery) ──────────────────────────
 
 async fn phase_a(
@@ -418,7 +473,7 @@ async fn phase_a(
         };
         let mut opened = false;
         for attempt in 0..=retries {
-            match tokio::time::timeout(timeout, TcpStream::connect(&sa)).await {
+            match tokio::time::timeout(timeout, tcp_probe(sa)).await {
                 Ok(Ok(_)) => {
                     opened = true;
                     break;
@@ -456,7 +511,7 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
     };
 
     let start = Instant::now();
-    let mut stream = match tokio::time::timeout(timeout, TcpStream::connect(&sa)).await {
+    let mut stream = match tokio::time::timeout(timeout, tcp_probe(sa)).await {
         Ok(Ok(s)) => s,
         _ => return out,
     };
@@ -515,7 +570,7 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
     // TLS sniff — fresh socket, send ClientHello.
     if tls_sniff && sa.port() != 443 {
         if let Ok(Ok(mut s2)) =
-            tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(&sa)).await
+            tokio::time::timeout(Duration::from_millis(500), tcp_probe(sa)).await
         {
             if s2.write_all(&client_hello()).await.is_ok() {
                 if let Ok(Ok(n)) =
@@ -637,7 +692,9 @@ fn update_cache_path() -> Option<PathBuf> {
     }
 }
 
-// Sync helper — runs in spawn_blocking. Returns the latest release tag (without leading 'v').
+// Sync helper — runs in spawn_blocking. Returns the latest release version
+// (without leading 'v'). A "release" only exists once CI has uploaded at
+// least one asset, so this lags tag creation by a few minutes.
 fn fetch_latest_version() -> anyhow::Result<Option<String>> {
     let releases = self_update::backends::github::ReleaseList::configure()
         .repo_owner(REPO_OWNER)
@@ -645,6 +702,43 @@ fn fetch_latest_version() -> anyhow::Result<Option<String>> {
         .build()?
         .fetch()?;
     Ok(releases.first().map(|r| r.version.clone()))
+}
+
+// GitHub tags API peek — tags appear immediately on `git push --tags`, before
+// CI has built release binaries. Used by --check-update to distinguish
+// "you're up to date" from "a newer version is tagged but binaries are
+// still being built".
+fn fetch_latest_tag() -> anyhow::Result<Option<String>> {
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/tags?per_page=20",
+        REPO_OWNER, REPO_NAME
+    );
+    let resp = ureq::get(&url)
+        .set("User-Agent", concat!("portwave/", env!("CARGO_PKG_VERSION")))
+        .set("Accept", "application/vnd.github+json")
+        .timeout(std::time::Duration::from_secs(4))
+        .call()?;
+    let tags: serde_json::Value = resp.into_json()?;
+    let mut best: Option<(Vec<u32>, String)> = None;
+    if let Some(arr) = tags.as_array() {
+        for t in arr {
+            if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
+                let stripped = name.trim_start_matches('v').to_string();
+                let parts: Vec<u32> = stripped
+                    .split('.')
+                    .map(|p| p.split('-').next().unwrap_or(""))
+                    .filter_map(|p| p.parse::<u32>().ok())
+                    .collect();
+                if parts.is_empty() {
+                    continue;
+                }
+                if best.as_ref().map_or(true, |(b, _)| parts > *b) {
+                    best = Some((parts, stripped));
+                }
+            }
+        }
+    }
+    Ok(best.map(|(_, s)| s))
 }
 
 fn version_is_newer(latest: &str, current: &str) -> bool {
@@ -762,13 +856,59 @@ async fn run_update() -> anyhow::Result<()> {
 
 async fn run_check_update() -> anyhow::Result<()> {
     let current = env!("CARGO_PKG_VERSION");
-    let latest = tokio::task::spawn_blocking(fetch_latest_version).await??;
-    match latest {
+    // Fetch release + tag concurrently (both are sync; each runs in its own
+    // blocking task). Tags appear immediately on `git push --tags`; releases
+    // only after CI uploads assets, so they can disagree for a few minutes.
+    let (release, tag) = tokio::join!(
+        tokio::task::spawn_blocking(fetch_latest_version),
+        tokio::task::spawn_blocking(fetch_latest_tag),
+    );
+    let release = release.ok().and_then(|r| r.ok()).flatten();
+    let tag = tag.ok().and_then(|r| r.ok()).flatten();
+
+    let newest = match (&release, &tag) {
+        (Some(r), Some(t)) => {
+            if version_is_newer(t, r) {
+                Some(t.clone())
+            } else {
+                Some(r.clone())
+            }
+        }
+        (Some(v), None) | (None, Some(v)) => Some(v.clone()),
+        (None, None) => None,
+    };
+
+    match newest {
         Some(v) if version_is_newer(&v, current) => {
             println!("Update available: {} → {}", current, v);
-            println!("Run: portwave --update");
+            // If the newest is only available as a tag (release not yet
+            // built), tell the user exactly what's going on.
+            let release_ok = release
+                .as_ref()
+                .map(|r| !version_is_newer(&v, r))
+                .unwrap_or(false);
+            if release_ok {
+                println!("Run: portwave --update");
+            } else {
+                println!(
+                    "(tag v{} is pushed but CI is still building release binaries;",
+                    v
+                );
+                println!(" re-run `portwave --update` in a few minutes.)");
+            }
         }
-        Some(v) => println!("Up to date (current: {}, latest release: {}).", current, v),
+        Some(v) => {
+            println!("Up to date (current: {}, latest: {}).", current, v);
+            // Extra diagnostic if release < tag but tag == current.
+            if let (Some(r), Some(t)) = (&release, &tag) {
+                if r != t {
+                    println!(
+                        "(note: latest tag is {}, latest release is {} — CI lag between them is normal)",
+                        t, r
+                    );
+                }
+            }
+        }
         None => println!("No releases found yet (current: {}).", current),
     }
     Ok(())
