@@ -556,10 +556,14 @@ async fn producer(
         let mut any = false;
         for (net, it) in iters.iter_mut() {
             if let Some(ip) = it.next() {
+                // Mark "still alive" as soon as the iterator yields *anything*.
+                // (Bug fix: previously `any = true` was below the usability
+                // check, so a /24 starting with .0 the network address would
+                // make us bail out after consuming a single IP.)
+                any = true;
                 if !is_usable_ipv4_host(net, ip) {
                     continue;
                 }
-                any = true;
                 for &port in &ports {
                     let sa = SocketAddr::new(ip, port);
                     if skip.contains(&sa) {
