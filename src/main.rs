@@ -179,6 +179,13 @@ struct Stats {
     attempts: AtomicU64,
     timeouts: AtomicU64,
     opens: AtomicU64,
+    /// Local resource exhaustion errors (ephemeral-port exhaustion /
+    /// FD limit hit / kernel buffer full). These are the ONLY signal
+    /// the adaptive controller uses to shrink — timeouts alone don't
+    /// indicate local saturation, they often indicate a firewalled
+    /// target dropping SYNs (where shrinking would only slow the
+    /// scan without any benefit).
+    local_errors: AtomicU64,
 }
 
 // ────────────────────────── Helpers ──────────────────────────
@@ -644,6 +651,37 @@ fn classify(data: &[u8]) -> Option<String> {
 //                      the ephemeral port range at ~4 K concurrent probes.
 //   * TCP_NODELAY    → disable Nagle. We close right after connect, so the
 //                      default 40 ms ACK coalescing is pure latency.
+// Classify a connect() error: is this *our* OS / stack pushing back (shrink
+// the worker pool), or a remote-side response (just a normal scan outcome)?
+//
+// Local-pressure signals:
+//   - AddrNotAvailable     → ephemeral port pool exhausted
+//   - raw errno 24 (EMFILE)            → FD limit hit
+//   - raw errno 23 (ENFILE)            → system-wide FD limit hit
+//   - raw errno 105 (ENOBUFS)          → kernel ran out of socket buffers
+//   - raw errno 11  (EAGAIN on connect) → nonblocking queue full
+//
+// ConnectionRefused / NetworkUnreachable / HostUnreachable are *remote* —
+// they tell us "this port is closed / no route to host". Treating those as
+// saturation would shrink the pool against any heavily-firewalled /24 or
+// any target range with mostly-dead hosts (including 127.0.0.0/24 on
+// localhost, where 255 of 256 IPs are unbound).
+fn is_local_resource_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        AddrNotAvailable => return true,
+        _ => {}
+    }
+    if let Some(code) = e.raw_os_error() {
+        // Linux errno. BSD codes differ but the practical names we care
+        // about (EMFILE, ENFILE, ENOBUFS, EAGAIN) are the same low numbers
+        // on macOS. Windows errors don't go through this path typically.
+        matches!(code, 11 | 23 | 24 | 105)
+    } else {
+        false
+    }
+}
+
 async fn tcp_probe(sa: SocketAddr) -> std::io::Result<TcpStream> {
     let socket = match sa {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
@@ -688,12 +726,20 @@ async fn phase_a(
                     opened = true;
                     break;
                 }
-                Ok(Err(_)) => break, // refused / unreachable
+                Ok(Err(e)) => {
+                    // Distinguish local resource pressure (ephemeral ports
+                    // exhausted / FD limit hit / kernel buffer full) from a
+                    // remote "connection refused" which is just an RST.
+                    // Only local-resource errors should nudge the adaptive
+                    // controller to shrink — RSTs are a successful signal
+                    // ("port is closed"), not a reason to back off.
+                    if is_local_resource_error(&e) {
+                        stats.local_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                    break;
+                }
                 Err(_) => {
                     if attempt == retries {
-                        // Only count the last (final) timeout per probe, not
-                        // every retry — otherwise the adaptive controller's
-                        // ratio exceeds 100 % and shrinks too aggressively.
                         final_timeout = true;
                         break;
                     }
@@ -807,11 +853,32 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
 
 // ────────────────────────── Adaptive controller ──────────────────────────
 
+// Adaptive concurrency controller.
+//
+// DESIGN:
+//   Timeouts alone are a poor saturation signal — a firewalled target drops
+//   every SYN and produces 100 % timeouts while our local kernel / uplink are
+//   fine. Previous versions shrunk the worker pool on high timeout ratios and
+//   crippled the scan. (See CHANGELOG v0.6.2.)
+//
+//   The only signal that actually means "MY host is running out of resources"
+//   is a local-resource error from connect() — AddrNotAvailable (ephemeral
+//   port exhaustion), EMFILE (FD limit), ENOBUFS (kernel buffer full),
+//   EAGAIN (socket queue full). These are the signals we now watch.
+//
+// BEHAVIOUR:
+//   - Shrink when local_error_ratio (local_errors / attempts) > 5 % in the
+//     last 2-second window.
+//   - Grow back toward `max` when there have been zero local errors for the
+//     last two windows.
+//   - No action when timeouts are high but local errors are zero — that's a
+//     dead / firewalled target and shrinking wouldn't help anyway.
 async fn adaptive_monitor(stats: Arc<Stats>, sem: Arc<Semaphore>, max: usize) {
-    let mut prev_a = 0u64;
-    let mut prev_t = 0u64;
+    let mut prev_a: u64 = 0;
+    let mut prev_l: u64 = 0;
     let mut current = max;
     let min = (max / 16).max(64);
+    let mut clean_windows: u32 = 0;
 
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -819,26 +886,43 @@ async fn adaptive_monitor(stats: Arc<Stats>, sem: Arc<Semaphore>, max: usize) {
             break;
         }
         let a = stats.attempts.load(Ordering::Relaxed);
-        let t = stats.timeouts.load(Ordering::Relaxed);
+        let l = stats.local_errors.load(Ordering::Relaxed);
         let da = a.saturating_sub(prev_a);
-        let dt = t.saturating_sub(prev_t);
+        let dl = l.saturating_sub(prev_l);
         prev_a = a;
-        prev_t = t;
+        prev_l = l;
+
         if da < 200 {
-            continue;
+            continue; // too little traffic to make a decision on
         }
-        let ratio = dt as f64 / da as f64;
-        if ratio > 0.30 && current > min {
+
+        let local_ratio = dl as f64 / da as f64;
+
+        if local_ratio > 0.05 && current > min {
+            // Real local pressure. Shrink.
             let shrink = (current / 4).max(1).min(current - min);
             if let Ok(p) = sem.clone().acquire_many_owned(shrink as u32).await {
                 p.forget();
                 current -= shrink;
-                eprintln!("[adaptive] timeout ratio {:.0}% — shrinking to {}", ratio * 100.0, current);
+                eprintln!(
+                    "[adaptive] local-resource errors {:.1}% ({} of {} probes) — shrinking to {}",
+                    local_ratio * 100.0,
+                    dl,
+                    da,
+                    current
+                );
             }
-        } else if ratio < 0.05 && current < max {
-            let grow = ((max - current) / 4).max(1);
-            sem.add_permits(grow);
-            current += grow;
+            clean_windows = 0;
+        } else if dl == 0 {
+            // No local pressure. Grow back toward max after 2 clean windows.
+            clean_windows += 1;
+            if clean_windows >= 2 && current < max {
+                let grow = ((max - current) / 4).max(1);
+                sem.add_permits(grow);
+                current += grow;
+            }
+        } else {
+            clean_windows = 0;
         }
     }
 }
@@ -1385,6 +1469,7 @@ async fn main() -> anyhow::Result<()> {
         attempts: AtomicU64::new(0),
         timeouts: AtomicU64::new(0),
         opens: AtomicU64::new(0),
+        local_errors: AtomicU64::new(0),
     });
     let sem = Arc::new(Semaphore::new(args.threads));
 
