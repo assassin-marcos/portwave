@@ -28,8 +28,26 @@ struct Args {
     #[arg(index = 1)]
     folder_name: Option<String>,
 
+    /// Comma-separated CIDRs, IPs, or IP ranges (e.g. "203.0.113.0/24,1.2.3.4,5.6.7.10-5.6.7.20")
     #[arg(index = 2)]
     cidr_input: Option<String>,
+
+    /// File with one target per line (CIDR, single IP, or IP range). Merged with <CIDR_INPUT>.
+    #[arg(long)]
+    input_file: Option<String>,
+
+    /// Comma-separated ASNs (e.g. "AS13335,AS15169"). Expanded to CIDRs via RIPE stat.
+    #[arg(long)]
+    asn: Option<String>,
+
+    /// Comma-separated CIDRs / IPs / IP ranges to SKIP (scope exclusions).
+    #[arg(long)]
+    exclude: Option<String>,
+
+    /// Comma-separated ports and port ranges (e.g. "22,80,443,8000-9000").
+    /// Takes precedence over --port-file and the embedded list.
+    #[arg(long)]
+    ports: Option<String>,
 
     /// Path to comma-separated port list. Falls back to $PORTWAVE_PORTS, config file, then bundled list.
     #[arg(long)]
@@ -112,6 +130,14 @@ struct Args {
     /// Suppress the startup "update available" banner.
     #[arg(long, default_value_t = false)]
     no_update_check: bool,
+
+    /// Suppress the startup ASCII banner art.
+    #[arg(long, default_value_t = false)]
+    no_art: bool,
+
+    /// Suppress both the banner and the update notice (equivalent to --no-art --no-update-check).
+    #[arg(short, long, default_value_t = false)]
+    quiet: bool,
 }
 
 // ────────────────────────── Types ──────────────────────────
@@ -124,6 +150,11 @@ struct OpenPort {
     tls: bool,
     protocol: Option<String>,
     banner: Option<String>,
+    /// CDN/WAF provider name if the IP matches a known edge network
+    /// (cloudflare / fastly / akamai / imperva / sucuri / stackpath / …).
+    /// None = presumed origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cdn: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -139,6 +170,8 @@ struct ScanSummary {
     open: u64,
     by_port: std::collections::BTreeMap<u16, u64>,
     by_protocol: std::collections::BTreeMap<String, u64>,
+    by_cdn: std::collections::BTreeMap<String, u64>,
+    cdn_count: u64,
 }
 
 struct Stats {
@@ -248,12 +281,30 @@ const EMBEDDED_PORTS: &str = include_str!("../ports/portwave-top-ports.txt");
 const EMBEDDED_SENTINEL: &str = "<embedded>";
 
 fn parse_port_list(content: &str) -> Vec<u16> {
-    let mut ports: Vec<u16> = content
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .filter_map(|p| p.parse::<u16>().ok())
-        .collect();
+    let mut ports: Vec<u16> = Vec::new();
+    for tok in content.split(|c: char| c == ',' || c.is_whitespace()) {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        // Range form: "8000-9000"
+        if let Some((lo, hi)) = tok.split_once('-') {
+            let lo: u32 = match lo.trim().parse() { Ok(n) => n, Err(_) => continue };
+            let hi: u32 = match hi.trim().parse() { Ok(n) => n, Err(_) => continue };
+            if lo > hi || lo == 0 || hi > 65535 {
+                continue;
+            }
+            for p in lo..=hi {
+                ports.push(p as u16);
+            }
+            continue;
+        }
+        if let Ok(p) = tok.parse::<u16>() {
+            if p != 0 {
+                ports.push(p);
+            }
+        }
+    }
     ports.sort_unstable();
     ports.dedup();
     ports
@@ -337,6 +388,164 @@ fn refresh_bundled_ports_files() {
     if refreshed == 0 {
         println!("(no on-disk ports files to refresh; embedded list is in the binary)");
     }
+}
+
+// Parse a single input token into one or more IpNetworks. Accepts:
+//   - single IP: "1.2.3.4"                    → 1.2.3.4/32
+//   - CIDR:      "1.2.3.0/24"                 → 1.2.3.0/24
+//   - IP range:  "1.2.3.10-1.2.3.20"          → minimal covering CIDR set
+fn parse_target_token(tok: &str) -> Vec<IpNetwork> {
+    let tok = tok.trim();
+    if tok.is_empty() {
+        return Vec::new();
+    }
+    // CIDR direct
+    if tok.contains('/') {
+        if let Ok(n) = tok.parse::<IpNetwork>() {
+            return vec![n];
+        }
+    }
+    // Range form "A-B"
+    if let Some((a, b)) = tok.split_once('-') {
+        let a = a.trim();
+        let b = b.trim();
+        if let (Ok(IpAddr::V4(a4)), Ok(IpAddr::V4(b4))) = (a.parse::<IpAddr>(), b.parse::<IpAddr>()) {
+            let lo = u32::from(a4);
+            let hi = u32::from(b4);
+            if lo <= hi {
+                return ipv4_range_to_cidrs(lo, hi);
+            }
+        }
+    }
+    // Plain IP → /32 or /128
+    if let Ok(ip) = tok.parse::<IpAddr>() {
+        let prefix = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if let Ok(n) = IpNetwork::new(ip, prefix) {
+            return vec![n];
+        }
+    }
+    Vec::new()
+}
+
+// Classic "range to CIDR blocks" algorithm — RFC3514 style greedy split.
+fn ipv4_range_to_cidrs(mut lo: u32, hi: u32) -> Vec<IpNetwork> {
+    let mut out = Vec::new();
+    while lo <= hi {
+        // Max prefix that doesn't extend past hi AND is aligned to lo.
+        let align = if lo == 0 { 32 } else { lo.trailing_zeros().min(32) };
+        let max_span_from_hi = (hi - lo + 1).checked_next_power_of_two().map(|n| n.trailing_zeros()).unwrap_or(32);
+        // We want 2^k = smallest of (1<<align, (hi-lo+1) rounded down to power of two).
+        let mut k = align.min(32);
+        while k > 0 && (1u64 << k) > (hi as u64 - lo as u64 + 1) {
+            k -= 1;
+        }
+        let prefix = 32 - k;
+        let net = IpNetwork::new(IpAddr::V4(std::net::Ipv4Addr::from(lo)), prefix as u8).unwrap();
+        out.push(net);
+        let span = 1u64 << k;
+        if lo as u64 + span > u32::MAX as u64 {
+            break;
+        }
+        lo = lo.wrapping_add(span as u32);
+        let _ = max_span_from_hi; // shut up unused warning on debug builds
+    }
+    out
+}
+
+// Expand a comma/whitespace-separated string of targets into IpNetworks.
+fn expand_targets(input: &str) -> Vec<IpNetwork> {
+    let mut out = Vec::new();
+    for tok in input.split(|c: char| c == ',' || c.is_whitespace()) {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let parsed = parse_target_token(t);
+        if parsed.is_empty() {
+            eprintln!("Skipping invalid target: {}", t);
+        }
+        out.extend(parsed);
+    }
+    out
+}
+
+// Read --input-file: one target per line, comments (#) + blanks ignored.
+fn read_input_file(path: &str) -> anyhow::Result<Vec<IpNetwork>> {
+    let content = fs::read_to_string(path)?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // A single line may itself contain comma-separated entries.
+        out.extend(expand_targets(line));
+    }
+    Ok(out)
+}
+
+// ────────────────────────── ASN expansion ──────────────────────────
+
+// Call RIPE stat's announced-prefixes endpoint. No API key; public data.
+// Returns the list of IpNetworks currently advertised by this ASN.
+fn fetch_asn_prefixes(asn: &str) -> anyhow::Result<Vec<IpNetwork>> {
+    let asn_num = asn.trim_start_matches(|c: char| c == 'A' || c == 'S' || c == 'a' || c == 's');
+    let url = format!(
+        "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{}",
+        asn_num
+    );
+    let resp = ureq::get(&url)
+        .set("User-Agent", concat!("portwave/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(15))
+        .call()?;
+    let j: serde_json::Value = resp.into_json()?;
+    let mut out = Vec::new();
+    if let Some(arr) = j.get("data").and_then(|d| d.get("prefixes")).and_then(|p| p.as_array()) {
+        for p in arr {
+            if let Some(pfx) = p.get("prefix").and_then(|s| s.as_str()) {
+                if let Ok(n) = pfx.parse::<IpNetwork>() {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ────────────────────────── CDN / WAF tagging ──────────────────────────
+
+const CDN_RANGES_RAW: &str = include_str!("../ports/cdn-ranges.txt");
+
+// Loaded once at startup. (CIDR, provider-name).
+fn load_cdn_ranges() -> Vec<(IpNetwork, &'static str)> {
+    let mut out = Vec::with_capacity(128);
+    for line in CDN_RANGES_RAW.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((cidr, provider)) = line.split_once('|') {
+            if let Ok(n) = cidr.trim().parse::<IpNetwork>() {
+                // Leak the provider name to get a &'static str — the list is
+                // small and lives for process lifetime anyway.
+                let p: &'static str = Box::leak(provider.trim().to_string().into_boxed_str());
+                out.push((n, p));
+            }
+        }
+    }
+    out
+}
+
+fn cdn_tag_for(ip: IpAddr, table: &[(IpNetwork, &'static str)]) -> Option<&'static str> {
+    for (net, name) in table {
+        if net.contains(ip) {
+            return Some(*name);
+        }
+    }
+    None
 }
 
 fn is_usable_ipv4_host(net: &IpNetwork, ip: IpAddr) -> bool {
@@ -508,6 +717,7 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
         tls: sa.port() == 443,
         protocol: None,
         banner: None,
+        cdn: None,
     };
 
     let start = Instant::now();
@@ -633,6 +843,7 @@ async fn producer(
     nets: Vec<IpNetwork>,
     ports: Vec<u16>,
     skip: Arc<HashSet<SocketAddr>>,
+    exclude: Arc<Vec<IpNetwork>>,
     stats: Arc<Stats>,
 ) {
     // Round-robin across subnets at IP granularity.
@@ -644,12 +855,12 @@ async fn producer(
         let mut any = false;
         for (net, it) in iters.iter_mut() {
             if let Some(ip) = it.next() {
-                // Mark "still alive" as soon as the iterator yields *anything*.
-                // (Bug fix: previously `any = true` was below the usability
-                // check, so a /24 starting with .0 the network address would
-                // make us bail out after consuming a single IP.)
                 any = true;
                 if !is_usable_ipv4_host(net, ip) {
+                    continue;
+                }
+                // Skip IPs that fall in any --exclude range.
+                if exclude.iter().any(|e| e.contains(ip)) {
                     continue;
                 }
                 for &port in &ports {
@@ -670,6 +881,39 @@ async fn producer(
             break;
         }
     }
+}
+
+// Returns true if stderr looks like a terminal (so ANSI colour + banner art
+// are safe). On non-TTY (piped / redirected / CI) we stay plain.
+fn atty_like_stderr() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::isatty(libc::STDERR_FILENO) != 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        // Conservative default on non-Unix — always show the banner.
+        true
+    }
+}
+
+// ────────────────────────── Startup banner ──────────────────────────
+
+const BANNER_ART: &str = r"
+ ____   ___  ____ _______        ___   __     ___________
+|  _ \ / _ \|  _ \_   _\ \      / / \ \ \ \   / / ____ __|
+| |_) | | | | |_) || |  \ \ /\ / / _ \ \ \ \ / / |__|  _|
+|  __/| |_| |  _ < | |   \ V  V / / \ \ \ \ V /|  __||
+|_|    \___/|_| \_\|_|    \_/\_/_/   \_\ \_\_/ |_____|";
+
+fn print_banner() {
+    // ANSI cyan for the art, bold for the byline.
+    eprintln!("\x1b[36m{}\x1b[0m", BANNER_ART);
+    eprintln!(
+        "        \x1b[1mportwave {}\x1b[0m  \x1b[2m·\x1b[0m  \x1b[2mby assassin_marcos\x1b[0m  \x1b[2m·\x1b[0m  \x1b[2mgithub.com/assassin-marcos/portwave\x1b[0m",
+        env!("CARGO_PKG_VERSION")
+    );
+    eprintln!();
 }
 
 // ────────────────────────── Self-update ──────────────────────────
@@ -920,6 +1164,12 @@ async fn run_check_update() -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Banner art — first thing on screen (but skip when piped or quieted).
+    let show_art = !args.quiet && !args.no_art && atty_like_stderr();
+    if show_art {
+        print_banner();
+    }
+
     // Update flows short-circuit early — they don't need positional args.
     if args.update {
         return run_update().await;
@@ -928,21 +1178,15 @@ async fn main() -> anyhow::Result<()> {
         return run_check_update().await;
     }
 
-    // Positional args required for a real scan.
+    // Positional args required for a real scan, unless --input-file / --asn supplies them.
     let folder_name = match &args.folder_name {
         Some(f) => f.clone(),
         None => {
             eprintln!("error: <FOLDER_NAME> is required for a scan.");
             eprintln!("usage: portwave <FOLDER_NAME> <CIDR_INPUT> [OPTIONS]");
-            eprintln!("       portwave --update");
-            eprintln!("       portwave --check-update");
-            std::process::exit(2);
-        }
-    };
-    let cidr_input = match &args.cidr_input {
-        Some(c) => c.clone(),
-        None => {
-            eprintln!("error: <CIDR_INPUT> is required for a scan.");
+            eprintln!("       portwave <FOLDER_NAME> --input-file targets.txt");
+            eprintln!("       portwave <FOLDER_NAME> --asn AS13335");
+            eprintln!("       portwave --update | --check-update");
             std::process::exit(2);
         }
     };
@@ -951,7 +1195,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = load_config();
 
     // Non-blocking startup update check (cached 24 h, 3 s timeout).
-    maybe_show_update_banner(args.no_update_check).await;
+    maybe_show_update_banner(args.no_update_check || args.quiet).await;
 
     let output_root = resolve_path(
         args.output_dir.as_deref(),
@@ -1004,35 +1248,83 @@ async fn main() -> anyhow::Result<()> {
     // The on-disk find_bundled_ports() lookup is no longer the default —
     // it's only meaningful when the user explicitly sets PORTWAVE_PORTS to
     // such a path. This ensures `--update` ships the latest list automatically.
-    let default_ports = String::from(EMBEDDED_SENTINEL);
-    let port_path = resolve_path(
-        args.port_file.as_deref(),
-        "PORTWAVE_PORTS",
-        &cfg,
-        "PORTWAVE_PORTS",
-        &default_ports,
-    );
-    println!("Loading ports from: {}", port_path);
-    let ports = load_ports(&port_path);
+    // Port source precedence:
+    //   1. --ports "22,80,443,8000-9000"   (inline range syntax)
+    //   2. --port-file / $PORTWAVE_PORTS / config PORTWAVE_PORTS
+    //   3. Embedded 1400+ port list baked into the binary
+    let ports = if let Some(spec) = &args.ports {
+        println!("Loading ports from: --ports {}", spec);
+        parse_port_list(spec)
+    } else {
+        let default_ports = String::from(EMBEDDED_SENTINEL);
+        let port_path = resolve_path(
+            args.port_file.as_deref(),
+            "PORTWAVE_PORTS",
+            &cfg,
+            "PORTWAVE_PORTS",
+            &default_ports,
+        );
+        println!("Loading ports from: {}", port_path);
+        load_ports(&port_path)
+    };
     if ports.is_empty() {
         eprintln!("Error: port list empty.");
         return Ok(());
     }
 
-    let nets: Vec<IpNetwork> = cidr_input
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| match s.parse::<IpNetwork>() {
-            Ok(n) => Some(n),
-            Err(_) => {
-                eprintln!("Skipping invalid CIDR: {}", s);
-                None
+    // Merge targets from positional <CIDR_INPUT>, --input-file, and --asn.
+    let mut nets: Vec<IpNetwork> = Vec::new();
+    if let Some(raw) = &args.cidr_input {
+        nets.extend(expand_targets(raw));
+    }
+    if let Some(path) = &args.input_file {
+        match read_input_file(path) {
+            Ok(v) => {
+                println!("Loaded {} entries from {}", v.len(), path);
+                nets.extend(v);
             }
-        })
-        .collect();
+            Err(e) => eprintln!("Failed to read --input-file {}: {}", path, e),
+        }
+    }
+    if let Some(list) = &args.asn {
+        for a in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            print!("Looking up {} prefixes via RIPE stat… ", a);
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            match tokio::task::spawn_blocking({
+                let a = a.to_string();
+                move || fetch_asn_prefixes(&a)
+            })
+            .await
+            {
+                Ok(Ok(v)) => {
+                    println!("{} prefixes.", v.len());
+                    nets.extend(v);
+                }
+                Ok(Err(e)) => println!("failed: {}", e),
+                Err(e) => println!("join error: {}", e),
+            }
+        }
+    }
+
+    // Dedupe / skip duplicates by string form.
+    {
+        let mut seen = std::collections::HashSet::new();
+        nets.retain(|n| seen.insert(n.to_string()));
+    }
+
+    // Build the exclude list.
+    let exclude_nets: Vec<IpNetwork> = args
+        .exclude
+        .as_deref()
+        .map(expand_targets)
+        .unwrap_or_default();
+    if !exclude_nets.is_empty() {
+        println!("Excluding {} range(s) from scan scope.", exclude_nets.len());
+    }
+
     if nets.is_empty() {
-        eprintln!("No valid CIDRs.");
+        eprintln!("No valid targets. Provide <CIDR_INPUT>, --input-file, or --asn.");
         return Ok(());
     }
 
@@ -1139,12 +1431,14 @@ async fn main() -> anyhow::Result<()> {
     drop(hit_tx);
 
     // Producer.
+    let exclude_arc = Arc::new(exclude_nets);
     let prod = {
         let st = stats.clone();
         let skip = Arc::new(skip_set);
         let nets = nets.clone();
         let ports = ports.clone();
-        tokio::spawn(async move { producer(work_tx, nets, ports, skip, st).await })
+        let exclude = exclude_arc.clone();
+        tokio::spawn(async move { producer(work_tx, nets, ports, skip, exclude, st).await })
     };
 
     let started = Instant::now();
@@ -1202,11 +1496,24 @@ async fn main() -> anyhow::Result<()> {
                 tls: sa.port() == 443,
                 protocol: None,
                 banner: None,
+                cdn: None,
             });
         }
     }
 
     open_records.sort_by(|a, b| (a.ip.as_str(), a.port).cmp(&(b.ip.as_str(), b.port)));
+    // Tag each open port with its CDN/WAF provider if it falls in a known edge range.
+    let cdn_table = load_cdn_ranges();
+    for op in &mut open_records {
+        if op.cdn.is_some() {
+            continue;
+        }
+        if let Ok(ip) = op.ip.parse::<IpAddr>() {
+            if let Some(tag) = cdn_tag_for(ip, &cdn_table) {
+                op.cdn = Some(tag.to_string());
+            }
+        }
+    }
     open_records.dedup_by(|a, b| a.ip == b.ip && a.port == b.port);
 
     // ── Write artifacts ──
@@ -1221,6 +1528,7 @@ async fn main() -> anyhow::Result<()> {
     let mut nuc = BufWriter::new(fs::File::create(&nuclei_path)?);
     let mut by_port: std::collections::BTreeMap<u16, u64> = Default::default();
     let mut by_proto: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut by_cdn: std::collections::BTreeMap<String, u64> = Default::default();
 
     for op in &open_records {
         writeln!(jsonl, "{}", serde_json::to_string(op)?)?;
@@ -1232,7 +1540,11 @@ async fn main() -> anyhow::Result<()> {
         *by_proto
             .entry(op.protocol.clone().unwrap_or_else(|| "unknown".into()))
             .or_insert(0) += 1;
+        if let Some(c) = &op.cdn {
+            *by_cdn.entry(c.clone()).or_insert(0) += 1;
+        }
     }
+    let cdn_count_total: u64 = by_cdn.values().sum();
     jsonl.flush()?;
     raw.flush()?;
     nuc.flush()?;
@@ -1249,6 +1561,8 @@ async fn main() -> anyhow::Result<()> {
         open: open_records.len() as u64,
         by_port,
         by_protocol: by_proto.clone(),
+        by_cdn,
+        cdn_count: cdn_count_total,
     };
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
     println!("Summary: {:?}", summary_path);
@@ -1266,7 +1580,16 @@ async fn main() -> anyhow::Result<()> {
     // can see exactly what's being fed to httpx/nuclei and understand why
     // httpx might report fewer hits (non-HTTP services like SSH show up here
     // but don't produce httpx output).
-    println!("\n--- OPEN PORTS ({}) ---", open_records.len());
+    let cdn_count = open_records.iter().filter(|o| o.cdn.is_some()).count();
+    println!(
+        "\n--- OPEN PORTS ({} total{}) ---",
+        open_records.len(),
+        if cdn_count > 0 {
+            format!(", {} on CDN edge", cdn_count)
+        } else {
+            String::new()
+        }
+    );
     for op in &open_records {
         let host = match op.ip.parse::<IpAddr>() {
             Ok(IpAddr::V6(v)) => format!("[{}]", v),
@@ -1274,13 +1597,17 @@ async fn main() -> anyhow::Result<()> {
         };
         let proto = op.protocol.as_deref().unwrap_or("unknown");
         let tls_tag = if op.tls { ", tls" } else { "" };
+        let cdn_tag = match &op.cdn {
+            Some(c) => format!(", cdn:{}", c),
+            None => String::new(),
+        };
         let banner = op.banner.as_deref().unwrap_or("");
         if banner.is_empty() {
-            println!("  {}:{}  [{}{}]", host, op.port, proto, tls_tag);
+            println!("  {}:{}  [{}{}{}]", host, op.port, proto, tls_tag, cdn_tag);
         } else {
             // Trim banner to one line, max 120 cols for terminal sanity.
             let b: String = banner.chars().take(120).collect();
-            println!("  {}:{}  [{}{}]  {}", host, op.port, proto, tls_tag, b);
+            println!("  {}:{}  [{}{}{}]  {}", host, op.port, proto, tls_tag, cdn_tag, b);
         }
     }
 
