@@ -990,12 +990,15 @@ fn atty_like_stderr() -> bool {
 
 // ────────────────────────── Startup banner ──────────────────────────
 
+// Standard figlet "portwave" — renders cleanly on every terminal width,
+// no double-backslash pile-up, readable mixed-case output.
 const BANNER_ART: &str = r"
- ____   ___  ____ _______        ___   __     ___________
-|  _ \ / _ \|  _ \_   _\ \      / / \ \ \ \   / / ____ __|
-| |_) | | | | |_) || |  \ \ /\ / / _ \ \ \ \ / / |__|  _|
-|  __/| |_| |  _ < | |   \ V  V / / \ \ \ \ V /|  __||
-|_|    \___/|_| \_\|_|    \_/\_/_/   \_\ \_\_/ |_____|";
+                 _
+  _ __   ___  _ __| |___      ____ __   _____
+ | '_ \ / _ \| '__| __\ \ /\ / / _` |\ / / _ \
+ | |_) | (_) | |  | |_ \ V  V / (_| | V /  __/
+ | .__/ \___/|_|   \__| \_/\_/ \__,_|\_/ \___|
+ |_|                                             ";
 
 fn print_banner() {
     // ANSI cyan for the art, bold for the byline.
