@@ -86,7 +86,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     httpx_follow_redirects: bool,
 
-    #[arg(long, default_value_t = 50)]
+    /// nuclei -c. Matched to --nuclei-max-host-error by default so nuclei
+    /// doesn't emit "concurrency is higher than max-host-error" warnings.
+    #[arg(long, default_value_t = 25)]
     nuclei_concurrency: usize,
 
     #[arg(long, default_value_t = 200)]
