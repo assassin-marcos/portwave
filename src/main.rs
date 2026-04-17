@@ -1262,6 +1262,28 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Print every open port with its detected protocol + banner so the user
+    // can see exactly what's being fed to httpx/nuclei and understand why
+    // httpx might report fewer hits (non-HTTP services like SSH show up here
+    // but don't produce httpx output).
+    println!("\n--- OPEN PORTS ({}) ---", open_records.len());
+    for op in &open_records {
+        let host = match op.ip.parse::<IpAddr>() {
+            Ok(IpAddr::V6(v)) => format!("[{}]", v),
+            _ => op.ip.clone(),
+        };
+        let proto = op.protocol.as_deref().unwrap_or("unknown");
+        let tls_tag = if op.tls { ", tls" } else { "" };
+        let banner = op.banner.as_deref().unwrap_or("");
+        if banner.is_empty() {
+            println!("  {}:{}  [{}{}]", host, op.port, proto, tls_tag);
+        } else {
+            // Trim banner to one line, max 120 cols for terminal sanity.
+            let b: String = banner.chars().take(120).collect();
+            println!("  {}:{}  [{}{}]  {}", host, op.port, proto, tls_tag, b);
+        }
+    }
+
     // ── httpx ──
     if !args.no_httpx && which("httpx") {
         println!("\n--- httpx ---");
