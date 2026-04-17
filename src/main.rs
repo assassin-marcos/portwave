@@ -26,10 +26,10 @@ use tokio::task::JoinSet;
 )]
 struct Args {
     #[arg(index = 1)]
-    folder_name: String,
+    folder_name: Option<String>,
 
     #[arg(index = 2)]
-    cidr_input: String,
+    cidr_input: Option<String>,
 
     /// Path to comma-separated port list. Falls back to $PORTWAVE_PORTS, config file, then bundled list.
     #[arg(long)]
@@ -95,6 +95,19 @@ struct Args {
     /// Pass nuclei -tags based on detected protocols
     #[arg(long, default_value_t = false)]
     tags_from_banner: bool,
+
+    /// Download the latest portwave release for this OS+arch and replace the
+    /// running binary in place (no rebuild needed). Requires no positional args.
+    #[arg(long, short = 'u', default_value_t = false)]
+    update: bool,
+
+    /// Just check if a newer version is available, then exit.
+    #[arg(long, default_value_t = false)]
+    check_update: bool,
+
+    /// Suppress the startup "update available" banner.
+    #[arg(long, default_value_t = false)]
+    no_update_check: bool,
 }
 
 // ────────────────────────── Types ──────────────────────────
@@ -584,13 +597,197 @@ async fn producer(
     }
 }
 
+// ────────────────────────── Self-update ──────────────────────────
+
+const REPO_OWNER: &str = "assassin-marcos";
+const REPO_NAME: &str = "portwave";
+
+fn update_cache_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|a| PathBuf::from(a).join("portwave").join("last_check"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join(".cache/portwave/last_check"))
+    }
+}
+
+// Sync helper — runs in spawn_blocking. Returns the latest release tag (without leading 'v').
+fn fetch_latest_version() -> anyhow::Result<Option<String>> {
+    let releases = self_update::backends::github::ReleaseList::configure()
+        .repo_owner(REPO_OWNER)
+        .repo_name(REPO_NAME)
+        .build()?
+        .fetch()?;
+    Ok(releases.first().map(|r| r.version.clone()))
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    fn parse(s: &str) -> Vec<u32> {
+        s.trim_start_matches('v')
+            .split('.')
+            .map(|p| p.split('-').next().unwrap_or(""))
+            .filter_map(|p| p.parse::<u32>().ok())
+            .collect()
+    }
+    let l = parse(latest);
+    let c = parse(current);
+    for i in 0..l.len().max(c.len()) {
+        let a = *l.get(i).unwrap_or(&0);
+        let b = *c.get(i).unwrap_or(&0);
+        if a != b {
+            return a > b;
+        }
+    }
+    false
+}
+
+fn print_update_banner(latest: &str) {
+    eprintln!();
+    eprintln!(
+        "\x1b[33m[!] portwave update available: {} → {}.\x1b[0m",
+        env!("CARGO_PKG_VERSION"),
+        latest
+    );
+    eprintln!("\x1b[33m    Run `portwave --update` to install (no rebuild needed).\x1b[0m");
+    eprintln!();
+}
+
+// Fast, cached startup check. Skipped if disabled or in CI/test environments.
+async fn maybe_show_update_banner(disabled: bool) {
+    if disabled || std::env::var("PORTWAVE_NO_UPDATE_CHECK").is_ok() {
+        return;
+    }
+    let cache_path = update_cache_path();
+
+    // Try cached value first (24 h TTL).
+    if let Some(p) = &cache_path {
+        if let Ok(meta) = fs::metadata(p) {
+            if let Ok(age) = meta.modified().ok().and_then(|t| t.elapsed().ok()).ok_or(()) {
+                if age < Duration::from_secs(86_400) {
+                    if let Ok(latest) = fs::read_to_string(p) {
+                        let latest = latest.trim().to_string();
+                        if !latest.is_empty()
+                            && version_is_newer(&latest, env!("CARGO_PKG_VERSION"))
+                        {
+                            print_update_banner(&latest);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // No fresh cache — fetch with a short timeout so a slow network never
+    // blocks the actual scan.
+    let res = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::task::spawn_blocking(fetch_latest_version),
+    )
+    .await;
+
+    if let Ok(Ok(Ok(Some(latest)))) = res {
+        if let Some(p) = cache_path {
+            if let Some(parent) = p.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(&p, &latest);
+        }
+        if version_is_newer(&latest, env!("CARGO_PKG_VERSION")) {
+            print_update_banner(&latest);
+        }
+    }
+}
+
+async fn run_update() -> anyhow::Result<()> {
+    println!("portwave: checking GitHub releases for assassin-marcos/portwave…");
+    let result = tokio::task::spawn_blocking(|| {
+        self_update::backends::github::Update::configure()
+            .repo_owner(REPO_OWNER)
+            .repo_name(REPO_NAME)
+            .bin_name("portwave")
+            .show_download_progress(true)
+            .show_output(true)
+            .current_version(env!("CARGO_PKG_VERSION"))
+            .build()?
+            .update()
+    })
+    .await??;
+
+    match result {
+        self_update::Status::UpToDate(v) => println!("Already up to date: {}", v),
+        self_update::Status::Updated(v) => {
+            println!("Updated to: {}", v);
+            // Refresh the cache so the next startup banner doesn't re-prompt.
+            if let Some(p) = update_cache_path() {
+                if let Some(parent) = p.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&p, &v);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_check_update() -> anyhow::Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let latest = tokio::task::spawn_blocking(fetch_latest_version).await??;
+    match latest {
+        Some(v) if version_is_newer(&v, current) => {
+            println!("Update available: {} → {}", current, v);
+            println!("Run: portwave --update");
+        }
+        Some(v) => println!("Up to date (current: {}, latest release: {}).", current, v),
+        None => println!("No releases found yet (current: {}).", current),
+    }
+    Ok(())
+}
+
 // ────────────────────────── Main ──────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // Update flows short-circuit early — they don't need positional args.
+    if args.update {
+        return run_update().await;
+    }
+    if args.check_update {
+        return run_check_update().await;
+    }
+
+    // Positional args required for a real scan.
+    let folder_name = match &args.folder_name {
+        Some(f) => f.clone(),
+        None => {
+            eprintln!("error: <FOLDER_NAME> is required for a scan.");
+            eprintln!("usage: portwave <FOLDER_NAME> <CIDR_INPUT> [OPTIONS]");
+            eprintln!("       portwave --update");
+            eprintln!("       portwave --check-update");
+            std::process::exit(2);
+        }
+    };
+    let cidr_input = match &args.cidr_input {
+        Some(c) => c.clone(),
+        None => {
+            eprintln!("error: <CIDR_INPUT> is required for a scan.");
+            std::process::exit(2);
+        }
+    };
+
     raise_fd_limit();
     let cfg = load_config();
+
+    // Non-blocking startup update check (cached 24 h, 3 s timeout).
+    maybe_show_update_banner(args.no_update_check).await;
 
     let output_root = resolve_path(
         args.output_dir.as_deref(),
@@ -600,7 +797,7 @@ async fn main() -> anyhow::Result<()> {
         "./scans",
     );
     let base = PathBuf::from(&output_root);
-    let out_dir = base.join(&args.folder_name);
+    let out_dir = base.join(&folder_name);
     if let Err(e) = fs::create_dir_all(&out_dir) {
         eprintln!("CRITICAL: cannot create {:?}: {}", out_dir, e);
         return Ok(());
@@ -651,8 +848,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let nets: Vec<IpNetwork> = args
-        .cidr_input
+    let nets: Vec<IpNetwork> = cidr_input
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -871,7 +1067,7 @@ async fn main() -> anyhow::Result<()> {
     nuc.flush()?;
 
     let summary = ScanSummary {
-        folder: args.folder_name.clone(),
+        folder: folder_name.clone(),
         started_at_unix: started_unix,
         duration_ms: started.elapsed().as_millis(),
         ranges: nets.iter().map(|n| n.to_string()).collect(),

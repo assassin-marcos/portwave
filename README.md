@@ -126,6 +126,36 @@ bash uninstall.sh                                        # Linux / macOS
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 # Windows
 ```
 
+### Updating to the latest version
+
+Once you have **v0.5.1 or newer** installed, update is a single command on every OS — no source clone, no rebuild, no Rust toolchain needed:
+
+```bash
+portwave --update          # download + replace the running binary
+portwave --check-update    # just print whether a newer release exists
+```
+
+How it works: pulls the prebuilt binary for your OS+arch from the [GitHub Releases](https://github.com/assassin-marcos/portwave/releases) page (built by CI on every tag) and atomically replaces the running executable.
+
+A startup banner reminds you when an update is available — checked at most once every 24 hours, with a 3-second timeout so a slow network never blocks a scan. Disable the banner per run with `--no-update-check`, or globally:
+
+```bash
+export PORTWAVE_NO_UPDATE_CHECK=1
+```
+
+**First-time upgrade from v0.5.0** (which doesn't have `--update` yet) — one-time manual step:
+```bash
+cd /path/to/portwave-clone
+git pull
+bash install.sh   # or .\install.ps1 on Windows
+```
+After that single rebuild, all future updates use `portwave --update`.
+
+**macOS Gatekeeper note:** binaries downloaded by `--update` aren't notarised. If macOS refuses to launch the new binary, run:
+```bash
+xattr -d com.apple.quarantine "$(command -v portwave)"
+```
+
 ### Platform notes
 
 | Platform | FD-limit tuning | Config file location |
