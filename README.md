@@ -1,55 +1,59 @@
 # portwave
 
-**Ultra-fast hybrid IPv4 / IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, and a built-in httpx + nuclei recon pipeline — written in async Rust.**
+**Ultra-fast hybrid IPv4 / IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, self-update, and a built-in httpx + nuclei recon pipeline — written in async Rust.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey.svg)]()
-[![Made for bug bounty](https://img.shields.io/badge/built%20for-bug%20bounty-red.svg)]()
+[![Built for bug bounty](https://img.shields.io/badge/built%20for-bug%20bounty-red.svg)]()
 
-> portwave sweeps a CIDR (v4 or v6), finds open TCP ports in a fast first pass, enriches the hits with banner grabs and TLS sniffing, then hands the targets to **httpx** and **nuclei** — all in a single binary. Think of it as a `masscan + rustscan + naabu` replacement with a proper recon pipeline bolted on.
+> portwave sweeps a CIDR (v4 or v6), finds open TCP ports in a fast first pass, enriches the hits with banner grabs and TLS sniffing, then feeds the targets to **httpx** and **nuclei** — all in a single binary. Think of it as a `masscan + rustscan + naabu` replacement with a proper recon pipeline bolted on, plus one-command self-update across Linux/macOS/Windows.
 
 ---
 
-## Why portwave?
+## Why portwave
 
-| | masscan | rustscan | naabu | **portwave** |
-|---|---|---|---|---|
-| IPv4 scan | ✅ | ✅ | ✅ | ✅ |
-| IPv6 scan | ⚠️ | ⚠️ | ✅ | ✅ |
-| Adaptive concurrency | ❌ | ❌ | ❌ | ✅ |
-| Banner grab + protocol classify | ❌ | ❌ | partial | ✅ |
-| TLS sniff on non-443 | ❌ | ❌ | ❌ | ✅ |
-| Resume after crash / Ctrl+C | ❌ | ❌ | ❌ | ✅ |
-| Built-in httpx + nuclei chain | ❌ | via plugin | via chain | ✅ |
-| Per-protocol nuclei tagging | ❌ | ❌ | ❌ | ✅ |
-| Structured `scan_summary.json` | ❌ | ❌ | partial | ✅ |
-| Single static binary | ✅ | ✅ | ✅ | ✅ |
+|                                | masscan | rustscan | naabu | **portwave** |
+|--------------------------------|---------|----------|-------|--------------|
+| IPv4 scan                      | ✅      | ✅       | ✅    | ✅           |
+| IPv6 scan                      | ⚠️      | ⚠️       | ✅    | ✅           |
+| Adaptive concurrency           | ❌      | ❌       | ❌    | ✅           |
+| Banner grab + protocol classify| ❌      | ❌       | partial | ✅         |
+| TLS sniff on non-443           | ❌      | ❌       | ❌    | ✅           |
+| Resume after crash / Ctrl+C    | ❌      | ❌       | ❌    | ✅           |
+| Built-in httpx + nuclei chain  | ❌      | via plugin | via chain | ✅      |
+| Per-protocol nuclei tagging    | ❌      | ❌       | ❌    | ✅           |
+| Structured `scan_summary.json` | ❌      | ❌       | partial | ✅         |
+| **Self-update** (`--update`)   | ❌      | ❌       | ❌    | ✅           |
+| Single static binary           | ✅      | ✅       | ✅    | ✅           |
 
 ---
 
 ## Features
 
 - **Two-phase scan** — fast TCP discovery (default 600 ms timeout), then per-hit enrichment with passive read + HTTP probe + optional TLS ClientHello.
-- **Adaptive concurrency controller** — watches timeout ratio every 2 s and shrinks/grows the worker pool. No manual thread tuning.
-- **MPMC work queue via `flume`** — fixed worker pool (memory is `O(threads)`, not `O(IPs × ports)`).
+- **Adaptive concurrency controller** — watches the timeout ratio every 2 s and shrinks/grows the worker pool. No manual thread tuning.
+- **MPMC work queue via `flume`** — fixed worker pool, memory is `O(threads)` not `O(IPs × ports)`.
 - **Banner-based protocol classifier** — SSH, SMTP, FTP, POP3, IMAP, HTTP, TLS.
 - **TLS sniff on any port** — detects TLS on 8443 / 9443 / any custom port and emits `https://` for nuclei.
 - **Resume** — append-only `open_ports.jsonl` means re-runs skip already-known open ports.
 - **Graceful `Ctrl+C`** — drains workers and flushes outputs before exit.
+- **Self-update via `--update`** — downloads the prebuilt binary for your OS+arch from the latest GitHub Release and replaces the running executable atomically. Also refreshes any on-disk ports file.
+- **Embedded port list** — 1405 curated TCP ports baked into the binary (nmap-top-1000 ∪ bug-bounty/modern-app additions). Override per scan with `--port-file` or globally via `PORTWAVE_PORTS`.
+- **Cross-platform** — Linux, macOS (Apple Silicon + Intel), Windows. One binary per platform built by CI.
 - **Progress bar + ETA** via `indicatif`; spinner mode auto-engages above 10 M probes.
-- **Round-robin across subnets** — interleaves IP iteration across input CIDRs so you don't hammer one /24.
+- **Round-robin across subnets** — interleaves IP iteration across input CIDRs so you don't hammer a single /24.
 - **Skips broadcast / network addresses** for IPv4 CIDRs.
-- **httpx + nuclei integration** — opt-in per-protocol `-tags` for nuclei, configurable concurrency and rate limits, optional path probing.
-- **Structured output** — `open_ports.jsonl`, `scan_summary.json`, plus the usual `targets.txt` / `nuclei_targets.txt`.
+- **httpx + nuclei integration** — opt-in per-protocol `-tags` for nuclei; configurable concurrency and rate limits; optional path probing.
+- **Structured output** — `targets.txt`, `nuclei_targets.txt`, `open_ports.jsonl`, `scan_summary.json`, plus the standard `httpx_results.txt` and `nuclei_results.txt`.
 
 ---
 
 ## Install
 
-portwave runs on **Linux, macOS, and Windows**. Pick the installer for your OS.
+portwave runs on Linux, macOS, and Windows. Pick the installer for your OS.
 
-### Linux / macOS — one-command
+### Linux / macOS
 
 ```bash
 git clone https://github.com/assassin-marcos/portwave
@@ -57,23 +61,23 @@ cd portwave
 bash install.sh
 ```
 
-The installer will:
-1. Detect / offer to install Rust via `rustup`.
-2. Auto-detect `httpx` / `nuclei` on `$PATH`, `~/go/bin`, Homebrew paths (`/opt/homebrew/bin` on Apple Silicon, `/usr/local/bin` on Intel), and `~/.local/bin`.
-3. Prompt for: scan output directory, ports file, httpx/nuclei paths, install prefix. Press Enter to accept every default.
-4. Build the release binary.
-5. Copy it to the first writable prefix from: `~/.local/bin`, `/opt/homebrew/bin` (macOS, Apple Silicon), `/usr/local/bin`.
-6. Write `~/.config/portwave/config.env` with your choices.
-7. Run `portwave --version` as a sanity check.
+The installer:
+1. Detects / offers to install Rust via `rustup`.
+2. Auto-detects `httpx` / `nuclei` across `$PATH`, `$HOME/go/bin`, `$HOME/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/local/go/bin`, `/opt/local/bin`, `$GOBIN`, `$GOPATH/bin`, `$HOME/.pdtm/go/bin`, and any `/home/*/go/bin`.
+3. Picks an install prefix that is **already on `$PATH`** so the binary is callable immediately:
+   - macOS: `/opt/homebrew/bin` (Apple Silicon) → `/usr/local/bin` (Intel) → `~/.local/bin`
+   - Linux: `~/.local/bin` → `/usr/local/bin`
+4. If the chosen prefix isn't on `$PATH`, asks before appending the right `export PATH` line to `~/.zshrc` (zsh), `~/.bash_profile` (bash on macOS), or `~/.bashrc` (bash on Linux). Idempotent — skips if already present.
+5. Builds the release binary and copies it to the prefix.
+6. Writes `~/.config/portwave/config.env`.
+7. Runs `portwave --version` as a sanity check.
 
-Non-interactive mode (accept every default silently):
+Non-interactive (accept every default silently):
 ```bash
 NONINTERACTIVE=1 bash install.sh
 ```
 
-### Windows — one-command (PowerShell)
-
-From an **elevated** PowerShell window (or regular user PowerShell if you want per-user install):
+### Windows (PowerShell)
 
 ```powershell
 git clone https://github.com/assassin-marcos/portwave
@@ -81,43 +85,38 @@ cd portwave
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The PowerShell installer will:
-1. Detect / offer to download `rustup-init.exe` and install Rust.
-2. Auto-detect `httpx.exe` / `nuclei.exe` on `$PATH`, `%USERPROFILE%\go\bin`, `%USERPROFILE%\.local\bin`, and `%ProgramFiles%\{tool}`.
-3. Prompt for: scan output dir (default `%USERPROFILE%\scans`), ports file, httpx/nuclei paths, install prefix (default `%USERPROFILE%\.local\bin`).
-4. Build with `cargo build --release`.
-5. Copy `portwave.exe` to the install prefix.
-6. Write `%APPDATA%\portwave\config.env`.
-7. Offer to add the install prefix to your user `PATH`.
+The PowerShell installer:
+1. Detects / offers to download `rustup-init.exe` and install Rust.
+2. Auto-detects `httpx.exe` / `nuclei.exe` across `$PATH`, `%USERPROFILE%\go\bin`, `%USERPROFILE%\.local\bin`, `%ProgramFiles%\{tool}\`.
+3. Prompts for: scan output dir (default `%USERPROFILE%\scans`), ports file, httpx/nuclei paths, install prefix (default `%USERPROFILE%\.local\bin`).
+4. Builds with `cargo build --release` and copies `portwave.exe` to the prefix.
+5. Writes `%APPDATA%\portwave\config.env`.
+6. Offers to add the install prefix to your user `PATH`.
 
 Non-interactive:
 ```powershell
-$env:NONINTERACTIVE = '1'
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+$env:NONINTERACTIVE = '1'; powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-### Manual (no installer, any OS)
+### Manual install (any OS, no installer)
 
 ```bash
-# build
 cargo build --release
 
-# Linux / macOS
-install -m 0755 target/release/portwave ~/.local/bin/   # or /usr/local/bin
-mkdir -p ~/.local/share/portwave/ports
-cp ports/portwave-top-ports.txt ~/.local/share/portwave/ports/
+# Linux / macOS — pick a directory that's on your $PATH:
+cp target/release/portwave /usr/local/bin/        # or ~/.local/bin
 mkdir -p ~/.config/portwave
 cp .env.example ~/.config/portwave/config.env
 $EDITOR ~/.config/portwave/config.env
 
-# Windows (PowerShell)
+# Windows (PowerShell):
 Copy-Item target\release\portwave.exe $env:USERPROFILE\.local\bin\
-New-Item -ItemType Directory -Force $env:LOCALAPPDATA\portwave\ports | Out-Null
-Copy-Item ports\portwave-top-ports.txt $env:LOCALAPPDATA\portwave\ports\
 New-Item -ItemType Directory -Force $env:APPDATA\portwave | Out-Null
 Copy-Item .env.example $env:APPDATA\portwave\config.env
 notepad $env:APPDATA\portwave\config.env
 ```
+
+The default 1405-port list is **embedded in the binary** — no separate file is required for scans.
 
 ### Uninstall
 
@@ -126,68 +125,54 @@ bash uninstall.sh                                        # Linux / macOS
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 # Windows
 ```
 
-### Updating to the latest version
+---
 
-Once you have **v0.5.1 or newer** installed, update is a single command on every OS — no source clone, no rebuild, no Rust toolchain needed:
+## Updating
+
+After v0.5.1 is installed, every future update is one command on every OS — no source clone, no rebuild, no Rust toolchain needed:
 
 ```bash
-portwave --update          # download + replace the running binary
+portwave --update          # download + replace the running binary, then refresh
+                           # any on-disk ports file the install left behind
 portwave --check-update    # just print whether a newer release exists
 ```
 
-How it works: pulls the prebuilt binary for your OS+arch from the [GitHub Releases](https://github.com/assassin-marcos/portwave/releases) page (built by CI on every tag) and atomically replaces the running executable.
+How it works: pulls the prebuilt binary for your OS+arch from the [GitHub Releases](https://github.com/assassin-marcos/portwave/releases) page (built by CI on every tag) and atomically replaces the running executable. Also rewrites every on-disk copy of `portwave-top-ports.txt` it finds under the install share dir so config-driven setups stay current.
 
-A startup banner reminds you when an update is available — checked at most once every 24 hours, with a 3-second timeout so a slow network never blocks a scan. Disable the banner per run with `--no-update-check`, or globally:
+A startup banner reminds you when an update is available — checked at most once every 24 hours, with a 3-second timeout so a slow network never blocks a scan. Disable per-run with `--no-update-check` or globally:
 
 ```bash
 export PORTWAVE_NO_UPDATE_CHECK=1
 ```
 
-**First-time upgrade from v0.5.0** (which doesn't have `--update` yet) — one-time manual step:
+**First-time upgrade from v0.5.0** (which doesn't have `--update` yet) — one-time manual step, then `--update` works forever after:
 ```bash
 cd /path/to/portwave-clone
 git pull
-bash install.sh   # or .\install.ps1 on Windows
+bash install.sh         # Linux / macOS
+# powershell -ExecutionPolicy Bypass -File .\install.ps1   # Windows
 ```
-After that single rebuild, all future updates use `portwave --update`.
 
-**macOS Gatekeeper note:** binaries downloaded by `--update` aren't notarised. If macOS refuses to launch the new binary, run:
+**macOS Gatekeeper note** — binaries downloaded by `--update` aren't notarised. If macOS refuses to launch the new binary:
 ```bash
 xattr -d com.apple.quarantine "$(command -v portwave)"
 ```
-
-### Platform notes
-
-| Platform | FD-limit tuning | Config file location |
-|---|---|---|
-| Linux   | `setrlimit(RLIMIT_NOFILE, 50000)` on start | `~/.config/portwave/config.env` |
-| macOS   | `setrlimit(RLIMIT_NOFILE, 50000)` on start | `~/.config/portwave/config.env` |
-| Windows | no-op (Windows doesn't bound sockets by FD limit) | `%APPDATA%\portwave\config.env` |
-
-On Linux, you may also need `ulimit -n 50000` at the shell level if your distro's user limits are below that (check `/etc/security/limits.conf`).
-
-### Dependencies (optional, for the full pipeline)
-
-- [`httpx`](https://github.com/projectdiscovery/httpx) (ProjectDiscovery) — HTTP fingerprinting
-- [`nuclei`](https://github.com/projectdiscovery/nuclei) — vulnerability scanning
-
-portwave still runs without them (pass `--no-httpx --no-nuclei`); it just won't do the post-scan enrichment.
 
 ---
 
 ## Quickstart
 
 ```bash
-# Scan a single /24 and run the full pipeline
+# Single /24 with the full pipeline
 portwave acme_corp 203.0.113.0/24
 
-# Multiple CIDRs (mixed v4 / v6)
+# Multiple CIDRs, mixed v4 / v6
 portwave acme_corp "203.0.113.0/22,198.51.100.0/24,2001:db8::/120"
 
 # Just port discovery, skip httpx + nuclei
 portwave acme_corp 203.0.113.0/24 --no-httpx --no-nuclei
 
-# Custom port list
+# Custom port list (overrides the embedded 1405)
 portwave acme_corp 203.0.113.0/24 --port-file /path/to/ports.txt
 
 # Localhost smoke test
@@ -200,6 +185,7 @@ portwave demo 127.0.0.1/32 --no-httpx --no-nuclei
 
 ```text
 portwave [OPTIONS] <FOLDER_NAME> <CIDR_INPUT>
+portwave --update | --check-update
 ```
 
 | Argument | Description |
@@ -209,12 +195,12 @@ portwave [OPTIONS] <FOLDER_NAME> <CIDR_INPUT>
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--port-file <FILE>` | bundled 427 ports | Comma / whitespace-separated port list |
+| `--port-file <FILE>` | embedded 1405 ports | Comma / whitespace-separated port list |
 | `-t, --threads <N>` | `4000` | Max concurrent probes (adaptive controller may shrink) |
 | `--timeout-ms <N>` | `600` | Phase-A (discovery) connect timeout |
 | `--enrich-timeout-ms <N>` | `1500` | Phase-B (banner / TLS) connect timeout |
 | `--retries <N>` | `0` | Retry count for Phase-A timeouts only |
-| `--output-dir <PATH>` | from config | Base output directory |
+| `--output-dir <PATH>` | from config / env / `./scans` | Base output directory |
 | `--httpx-threads <N>` | `150` | httpx concurrency |
 | `--httpx-paths <LIST>` | *(unset)* | Extra paths for httpx to probe (e.g. `/actuator,/.git/HEAD`) |
 | `--httpx-follow-redirects` | off | Follow redirects in httpx |
@@ -227,6 +213,9 @@ portwave [OPTIONS] <FOLDER_NAME> <CIDR_INPUT>
 | `--no-tls-sniff` | off | Skip TLS sniff on non-443 ports |
 | `--no-adaptive` | off | Disable adaptive concurrency controller |
 | `--no-resume` | off | Don't load `open_ports.jsonl` as skip-set |
+| `-u, --update` | — | Download latest binary, replace in place, refresh ports file |
+| `--check-update` | — | Print whether a newer release exists, then exit |
+| `--no-update-check` | off | Suppress the startup "update available" banner |
 
 ---
 
@@ -251,7 +240,7 @@ portwave vip "1.2.3.0/28" \
     --enrich-timeout-ms 3000
 ```
 
-### Huge IPv6 range — spinner mode
+### Huge IPv6 range — spinner mode auto-engages
 ```bash
 portwave v6_probe "2001:db8::/96" \
     --threads 6000 --timeout-ms 500 --retries 0
@@ -261,7 +250,8 @@ portwave v6_probe "2001:db8::/96" \
 ```bash
 # Just re-run with the same folder name — open_ports.jsonl is replayed.
 portwave acme_corp 203.0.113.0/24
-# To force a fresh scan:
+
+# Force a fresh scan:
 portwave acme_corp 203.0.113.0/24 --no-resume
 ```
 
@@ -271,7 +261,7 @@ portwave acme_corp 203.0.113.0/24 \
     --httpx-paths "/actuator,/.git/HEAD,/server-status,/.env,/admin,/api/v1"
 ```
 
-### Only discovery, no enrichment, no pipeline
+### Discovery only, no enrichment, no pipeline
 ```bash
 portwave acme_corp 203.0.113.0/24 --no-httpx --no-nuclei --no-banner
 ```
@@ -284,12 +274,12 @@ Every scan writes to `<OUTPUT_DIR>/<FOLDER_NAME>/`:
 
 | File | Format | Purpose |
 |---|---|---|
-| `targets.txt` | `ip:port` per line | Raw open endpoints for tooling that wants `IP:PORT` |
-| `nuclei_targets.txt` | URLs + `ip:port` | `http://`, `https://`, or `ip:port` — ready for nuclei |
-| `open_ports.jsonl` | one JSON per line | Structured: `{ip, port, rtt_ms, tls, protocol, banner}` |
-| `scan_summary.json` | single JSON | `{folder, duration_ms, attempts, timeouts, open, by_port, by_protocol, ranges, ports}` |
-| `httpx_results.txt` | httpx default | Status, length, redirect, title |
-| `nuclei_results.txt` | nuclei default | Vulnerability findings |
+| `targets.txt`         | `ip:port` per line       | Raw open endpoints for tooling that wants `IP:PORT` |
+| `nuclei_targets.txt`  | URLs + `ip:port`         | `http://`, `https://`, or `ip:port` — ready for nuclei |
+| `open_ports.jsonl`    | one JSON per line        | `{ip, port, rtt_ms, tls, protocol, banner}` |
+| `scan_summary.json`   | single JSON              | `{folder, duration_ms, attempts, timeouts, open, by_port, by_protocol, ranges, ports}` |
+| `httpx_results.txt`   | httpx default format     | Status, length, redirect, title |
+| `nuclei_results.txt`  | nuclei default format    | Vulnerability findings |
 
 Example `open_ports.jsonl`:
 ```json
@@ -308,7 +298,7 @@ Example `scan_summary.json`:
   "by_port": { "80": 22, "443": 19, "22": 14, "8080": 11, "8443": 9 },
   "by_protocol": { "http": 41, "ssh": 14, "tls": 18, "unknown": 14 },
   "ranges": ["203.0.113.0/24"],
-  "ports": 427
+  "ports": 1405
 }
 ```
 
@@ -320,14 +310,14 @@ portwave looks up paths in this order of precedence:
 
 1. CLI flag (`--output-dir`, `--port-file`, …)
 2. Environment variable (`PORTWAVE_OUTPUT_DIR`, `PORTWAVE_PORTS`)
-3. `~/.config/portwave/config.env` (created by `install.sh`)
-4. Built-in fallback (`./scans` for output, bundled port list for `PORTWAVE_PORTS`)
+3. `~/.config/portwave/config.env` (Unix) or `%APPDATA%\portwave\config.env` (Windows) — created by `install.sh` / `install.ps1`
+4. Built-in defaults (embedded ports list; `./scans` for output)
 
-`~/.config/portwave/config.env` uses simple `KEY=VALUE` lines. See `.env.example`.
+`config.env` uses simple `KEY=VALUE` lines. See `.env.example`:
 
 ```env
 PORTWAVE_OUTPUT_DIR=/home/user/scans
-PORTWAVE_PORTS=/home/user/.local/share/portwave/ports/portwave-top-ports.txt
+PORTWAVE_PORTS=                          # blank → use embedded 1405-port list
 PORTWAVE_HTTPX_BIN=/home/user/go/bin/httpx
 PORTWAVE_NUCLEI_BIN=/home/user/go/bin/nuclei
 ```
@@ -336,15 +326,15 @@ PORTWAVE_NUCLEI_BIN=/home/user/go/bin/nuclei
 
 ## Performance tips
 
-- **Raise the FD limit** — portwave calls `setrlimit(RLIMIT_NOFILE, 50000)` on start, but your shell may also need `ulimit -n 50000`.
+- **FD limit** — portwave calls `setrlimit(RLIMIT_NOFILE, 50000)` on Unix. Your shell may also need `ulimit -n 50000` if your distro's per-user limit is lower (check `/etc/security/limits.conf`).
 - **Lower `--timeout-ms`** on LAN / local targets: `200`–`400` ms is plenty.
-- **Raise `--threads`** only if you have the uplink — the adaptive controller will throttle back if you saturate.
-- **Use `--retries 0`** on first sweep, then re-run with `--retries 2` on the same folder to re-check timeouts (resume will skip the confirmed-open).
-- **`--tags-from-banner`** can cut nuclei runtime 30–60% on mixed port scans.
+- **Raise `--threads`** only if you have the uplink — the adaptive controller throttles back automatically when timeouts spike past 30 %.
+- **Use `--retries 0`** on first sweep, then re-run with `--retries 2` on the same folder to re-check timeouts (resume skips confirmed-open).
+- **`--tags-from-banner`** can cut nuclei runtime 30–60 % on mixed-port scans.
 
 ---
 
-## How it works (brief)
+## How it works
 
 ```
              ┌────────────────────────────┐
@@ -379,28 +369,52 @@ CIDR + ports │ Producer: round-robin IPs  │
 
 ---
 
+## Platform notes
+
+| Platform | FD-limit tuning | Config file |
+|---|---|---|
+| Linux   | `setrlimit(RLIMIT_NOFILE, 50000)` on start | `~/.config/portwave/config.env` |
+| macOS   | `setrlimit(RLIMIT_NOFILE, 50000)` on start | `~/.config/portwave/config.env` |
+| Windows | no-op (Windows doesn't bound sockets by FD limit) | `%APPDATA%\portwave\config.env` |
+
+---
+
 ## FAQ
 
 **Does portwave do SYN scanning?**
-Not yet — portwave uses full TCP connects. SYN scanning requires raw sockets (root / capabilities). For stateless discovery of /16+ ranges, combine portwave with [`masscan`](https://github.com/robertdavidgraham/masscan) and feed its hits into portwave for enrichment.
+Not yet — portwave uses full TCP connects (no root required, fully portable). SYN scanning needs raw sockets and root/`CAP_NET_RAW`. For stateless discovery of `/16+` ranges, combine portwave with [`masscan`](https://github.com/robertdavidgraham/masscan) and feed its hits into portwave for enrichment.
 
 **Why is port 22 detected but the banner is null?**
-SSH sends its banner immediately, so you should see `SSH-2.0-...`. If not, the server had TCP-wrappers / was slow; increase `--enrich-timeout-ms`.
+SSH sends its banner immediately, so you should see `SSH-2.0-…`. If not, the server uses TCP wrappers or is slow — bump `--enrich-timeout-ms`.
+
+**My VPS scan only finds a couple of ports — bug?**
+Almost always one of: (a) services bound to `127.0.0.1` only, not `0.0.0.0`; (b) provider firewall (AWS Security Groups / Hetzner / DO Cloud Firewalls) blocking inbound; (c) host firewall (`ufw`, `firewalld`, `iptables`). Run `ss -tlnp` on the VPS to see what's actually listening externally.
 
 **Is portwave safe to run on my own network?**
-Yes — that's what localhost smoke tests are for. Against third-party infrastructure, **only scan with authorization** (bug bounty scope, engagement contract, your own assets). The authors accept no liability for misuse.
+Yes. Against third-party infrastructure, **only scan with authorisation** (bug-bounty scope, engagement contract, your own assets). The author accepts no liability for misuse.
 
 **Can I use it from Python / Go?**
 Parse `scan_summary.json` and `open_ports.jsonl` — both are stable structured formats.
 
-**Does it work on macOS / Windows?**
-Linux is the primary target. The code is mostly portable; `raise_fd_limit()` uses libc `setrlimit` which won't work on Windows. PRs welcome.
+**Does it work on Docker / a CI runner?**
+Yes — single static binary, no system services. `RLIMIT_NOFILE` may be capped low in containers; bump it with `--ulimit nofile=65535` on `docker run`.
 
 ---
 
-## Search terms (for folks looking for this kind of tool)
+## Searchable terms
 
-port scanner, port scanning, fast port scanner, rust port scanner, async port scanner, ipv6 port scanner, network scanner, pentest, pentesting, bug bounty, bug bounty tool, recon, reconnaissance, recon pipeline, offensive security, red team, red teaming, nuclei integration, httpx integration, masscan alternative, rustscan alternative, naabu alternative, banner grabber, tls sniffer, cidr scanner, tcp scanner, service detection.
+port scanner, port scanning, fast port scanner, rust port scanner, async port scanner, ipv6 port scanner, network scanner, pentest, pentesting, bug bounty, bug bounty tool, recon, reconnaissance, recon pipeline, offensive security, red team, red teaming, nuclei integration, httpx integration, masscan alternative, rustscan alternative, naabu alternative, banner grabber, tls sniffer, cidr scanner, tcp scanner, service detection, self-update, cross-platform.
+
+---
+
+## Author / contact
+
+Developed by **assassin-marcos**.
+
+Found a bug, have an idea, want to suggest a feature, or just want to say hi?
+**Reach out on Twitter / X: [@assassin_marcos](https://twitter.com/assassin_marcos)** — I'm always open to improvisations and suggestions.
+
+Pull requests welcome. Open issues at [github.com/assassin-marcos/portwave/issues](https://github.com/assassin-marcos/portwave/issues).
 
 ---
 
@@ -412,4 +426,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Disclaimer
 
-portwave is a security-research tool. **Only use it on systems you own or have written permission to test.** Unauthorized scanning may be illegal in your jurisdiction. The authors disclaim any liability for misuse.
+portwave is a security-research tool. **Only use it on systems you own or have written permission to test.** Unauthorised scanning may be illegal in your jurisdiction. The author disclaims any liability for misuse.

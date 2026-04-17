@@ -1,6 +1,13 @@
 # Build cross-platform release binaries on every `vX.Y.Z` tag push and attach
 # them to the matching GitHub Release. The portwave `--update` flag relies on
 # this — it pulls the asset whose name matches the host's target triple.
+#
+# Note on macOS Intel: GitHub-hosted macos-13 (Intel) runners have very
+# limited capacity and routinely sit in the queue for 30+ minutes. We build
+# both Mac architectures from a single macos-14 (Apple Silicon) runner via
+# Apple's bundled cross-toolchain. macos-14 always picks up immediately and
+# can produce both aarch64-apple-darwin and x86_64-apple-darwin binaries in
+# one job.
 name: release
 
 on:
@@ -12,57 +19,70 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: build (${{ matrix.target }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive: tar.gz
-          - os: macos-13
-            target: x86_64-apple-darwin
-            archive: tar.gz
-          - os: macos-14
-            target: aarch64-apple-darwin
-            archive: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
-    runs-on: ${{ matrix.os }}
+  linux:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust (with target)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Package (Unix tar.gz)
-        if: matrix.archive == 'tar.gz'
-        shell: bash
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with: { key: linux-x86_64 }
+      - run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Package
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../portwave-${{ matrix.target }}.tar.gz portwave
+          cd target/x86_64-unknown-linux-gnu/release
+          tar czf ../../../portwave-x86_64-unknown-linux-gnu.tar.gz portwave
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: portwave-x86_64-unknown-linux-gnu.tar.gz
+          generate_release_notes: true
 
-      - name: Package (Windows zip)
-        if: matrix.archive == 'zip'
+  macos:
+    # macos-14 = Apple Silicon. Builds aarch64 natively + x86_64 via cross.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with: { key: macos-multi }
+
+      - name: Build aarch64
+        run: cargo build --release --target aarch64-apple-darwin
+      - name: Build x86_64 (cross from ARM)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Package both
+        run: |
+          cd target/aarch64-apple-darwin/release && tar czf ../../../portwave-aarch64-apple-darwin.tar.gz portwave && cd -
+          cd target/x86_64-apple-darwin/release  && tar czf ../../../portwave-x86_64-apple-darwin.tar.gz  portwave && cd -
+          ls -la portwave-*.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            portwave-aarch64-apple-darwin.tar.gz
+            portwave-x86_64-apple-darwin.tar.gz
+          generate_release_notes: true
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with: { key: windows-x86_64 }
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Package
         shell: pwsh
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/portwave.exe `
-                           -DestinationPath portwave-${{ matrix.target }}.zip
-
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+          Compress-Archive -Path target/x86_64-pc-windows-msvc/release/portwave.exe `
+                           -DestinationPath portwave-x86_64-pc-windows-msvc.zip
+      - uses: softprops/action-gh-release@v2
         with:
-          files: portwave-${{ matrix.target }}.${{ matrix.archive }}
+          files: portwave-x86_64-pc-windows-msvc.zip
           generate_release_notes: true
