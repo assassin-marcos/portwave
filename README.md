@@ -314,6 +314,12 @@ Yes. `open_ports.jsonl` and `scan_summary.json` are stable structured formats.
 
 ---
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full history of features, fixes, and breaking changes across every version.
+
+---
+
 ## Author / contact
 
 Developed by **assassin-marcos**.

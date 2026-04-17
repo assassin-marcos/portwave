@@ -681,6 +681,7 @@ async fn phase_a(
             break;
         };
         let mut opened = false;
+        let mut final_timeout = false;
         for attempt in 0..=retries {
             match tokio::time::timeout(timeout, tcp_probe(sa)).await {
                 Ok(Ok(_)) => {
@@ -689,8 +690,11 @@ async fn phase_a(
                 }
                 Ok(Err(_)) => break, // refused / unreachable
                 Err(_) => {
-                    stats.timeouts.fetch_add(1, Ordering::Relaxed);
                     if attempt == retries {
+                        // Only count the last (final) timeout per probe, not
+                        // every retry — otherwise the adaptive controller's
+                        // ratio exceeds 100 % and shrinks too aggressively.
+                        final_timeout = true;
                         break;
                     }
                 }
@@ -698,6 +702,9 @@ async fn phase_a(
         }
         drop(permit);
         stats.attempts.fetch_add(1, Ordering::Relaxed);
+        if final_timeout {
+            stats.timeouts.fetch_add(1, Ordering::Relaxed);
+        }
         if opened {
             stats.opens.fetch_add(1, Ordering::Relaxed);
             let _ = hit_tx.send(sa);
