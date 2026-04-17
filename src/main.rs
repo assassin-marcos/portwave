@@ -92,6 +92,20 @@ struct Args {
     #[arg(long, default_value_t = 200)]
     nuclei_rate: usize,
 
+    /// nuclei -max-host-error. Fail a host after N errors so doomed targets
+    /// don't bleed scan time. 25 matches the concurrency default; raise for
+    /// flaky networks.
+    #[arg(long, default_value_t = 25)]
+    nuclei_max_host_error: usize,
+
+    /// Don't filter non-HTTP ports out of nuclei_targets.txt. Default is to
+    /// drop ports whose Phase-B banner classified as ssh/smtp/ftp/etc. or
+    /// whose port number is in the "definitely not HTTP" blocklist (22,
+    /// 25, 179, 445, 3306, 5432, 6379, 27017, ...). Opt in to this flag if
+    /// you really want nuclei to run against every open port.
+    #[arg(long, default_value_t = false)]
+    nuclei_all_ports: bool,
+
     #[arg(long, default_value_t = false)]
     no_httpx: bool,
 
@@ -565,6 +579,90 @@ fn is_usable_ipv4_host(net: &IpNetwork, ip: IpAddr) -> bool {
         }
         _ => true,
     }
+}
+
+// Ports that are DEFINITELY not HTTP-speaking. Feeding these to nuclei only
+// wastes time — every HTTP template fails the initial request and moves on.
+// Sorted for readability; lookup is linear but the list is small (~40).
+//
+// Deliberately excluded from this list (they often DO speak HTTP on unusual
+// ports): 5984 (CouchDB), 8086 (InfluxDB), 8200 (Vault), 9200 (Elastic),
+// 5601 (Kibana), 15672 (RabbitMQ mgmt), 3000 (Grafana), 8500 (Consul), etc.
+const NON_HTTP_PORTS: &[u16] = &[
+    7,        // echo
+    9,        // discard
+    13,       // daytime
+    19,       // chargen
+    21,       // FTP
+    22,       // SSH
+    23,       // Telnet
+    25,       // SMTP
+    53,       // DNS (TCP fallback)
+    69,       // TFTP
+    109, 110, // POP2, POP3
+    111,      // portmap/RPC
+    119,      // NNTP
+    123,      // NTP
+    143,      // IMAP
+    161, 162, // SNMP / SNMP-trap
+    179,      // BGP
+    389, 636, // LDAP / LDAPS
+    445,      // SMB
+    465, 587, // SMTPS / submission
+    514,      // syslog
+    543, 544, // klogin / kshell
+    548,      // AFP
+    631,      // IPP (mostly not HTTP-speaking despite the name)
+    873,      // rsync
+    989, 990, // FTPS
+    993, 995, // IMAPS / POP3S
+    1194,     // OpenVPN
+    1433, 1434, // MSSQL
+    1521,     // Oracle
+    1883,     // MQTT
+    2049,     // NFS
+    2181,     // ZooKeeper
+    3306,     // MySQL
+    3389,     // RDP
+    3690,     // SVN
+    4369,     // Erlang EPMD
+    4505, 4506, // Salt
+    5060, 5061, // SIP
+    5432, 5433, // PostgreSQL
+    5672,     // AMQP (RabbitMQ wire protocol)
+    5683,     // CoAP
+    5900, 5901, 5902, 5903, // VNC
+    5938,     // TeamViewer
+    6379,     // Redis
+    6667,     // IRC
+    8883,     // MQTT/TLS
+    9042,     // Cassandra
+    9092, 9093, 9094, // Kafka
+    10051,    // Zabbix trapper
+    11211,    // memcached
+    26379,    // Redis Sentinel
+    27017, 27018, 27019, 27020, // MongoDB
+    61613, 61616, // ActiveMQ STOMP / OpenWire
+];
+
+// Should this open port get a URL in nuclei_targets.txt?
+// Returns false if we have strong evidence the port doesn't speak HTTP.
+fn is_http_candidate(port: u16, protocol: Option<&str>, tls: bool) -> bool {
+    // If the banner classified it as non-HTTP, trust that.
+    if let Some(p) = protocol {
+        match p {
+            "http" | "tls" => return true,
+            "ssh" | "smtp" | "smtp_or_ftp" | "ftp" | "pop3" | "imap" => return false,
+            _ => {}
+        }
+    }
+    // TLS on any port is at least worth trying — most nuclei web templates
+    // work on HTTPS, and many custom web apps sit behind TLS on odd ports.
+    if tls {
+        return true;
+    }
+    // Fallback: block well-known non-HTTP ports.
+    !NON_HTTP_PORTS.binary_search(&port).is_ok()
 }
 
 fn format_for_nuclei(ip: &IpAddr, port: u16, tls: bool) -> String {
@@ -1625,12 +1723,20 @@ async fn main() -> anyhow::Result<()> {
     let mut by_proto: std::collections::BTreeMap<String, u64> = Default::default();
     let mut by_cdn: std::collections::BTreeMap<String, u64> = Default::default();
 
+    let mut nuclei_skipped = 0usize;
     for op in &open_records {
         writeln!(jsonl, "{}", serde_json::to_string(op)?)?;
         let ip: IpAddr = op.ip.parse()?;
         let sa = SocketAddr::new(ip, op.port);
         writeln!(raw, "{}", sa)?;
-        writeln!(nuc, "{}", format_for_nuclei(&ip, op.port, op.tls))?;
+        // Filter non-HTTP services out of the nuclei list unless --nuclei-all-ports.
+        let include_in_nuclei = args.nuclei_all_ports
+            || is_http_candidate(op.port, op.protocol.as_deref(), op.tls);
+        if include_in_nuclei {
+            writeln!(nuc, "{}", format_for_nuclei(&ip, op.port, op.tls))?;
+        } else {
+            nuclei_skipped += 1;
+        }
         *by_port.entry(op.port).or_insert(0) += 1;
         *by_proto
             .entry(op.protocol.clone().unwrap_or_else(|| "unknown".into()))
@@ -1638,6 +1744,12 @@ async fn main() -> anyhow::Result<()> {
         if let Some(c) = &op.cdn {
             *by_cdn.entry(c.clone()).or_insert(0) += 1;
         }
+    }
+    if nuclei_skipped > 0 {
+        println!(
+            "Nuclei filter: skipped {} non-HTTP target(s). Override with --nuclei-all-ports.",
+            nuclei_skipped
+        );
     }
     let cdn_count_total: u64 = by_cdn.values().sum();
     jsonl.flush()?;
@@ -1744,6 +1856,7 @@ async fn main() -> anyhow::Result<()> {
         cmd.arg("-l").arg(&nuclei_path)
             .arg("-c").arg(args.nuclei_concurrency.to_string())
             .arg("-rl").arg(args.nuclei_rate.to_string())
+            .arg("-mhe").arg(args.nuclei_max_host_error.to_string())
             .arg("-o").arg(&nuclei_out);
         if args.tags_from_banner && !by_proto.is_empty() {
             let tags: Vec<&str> = by_proto
