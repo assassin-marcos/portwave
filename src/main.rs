@@ -216,39 +216,6 @@ fn resolve_path(
     fallback.to_string()
 }
 
-// Find the bundled ports file. Checks, in order:
-//   $PORTWAVE_HOME/ports/portwave-top-ports.txt
-//   <exe>/../share/portwave/ports/portwave-top-ports.txt   (Unix install layout)
-//   <exe>/../ports/portwave-top-ports.txt                  (Windows install layout)
-//   %LOCALAPPDATA%\portwave\ports\portwave-top-ports.txt   (Windows per-user install)
-//   ./ports/portwave-top-ports.txt                         (running from repo root)
-fn find_bundled_ports() -> Option<String> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(h) = std::env::var("PORTWAVE_HOME") {
-        candidates.push(PathBuf::from(h).join("ports/portwave-top-ports.txt"));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("../share/portwave/ports/portwave-top-ports.txt"));
-            candidates.push(dir.join("../ports/portwave-top-ports.txt"));
-            candidates.push(dir.join("ports/portwave-top-ports.txt"));
-        }
-    }
-    #[cfg(windows)]
-    {
-        if let Ok(a) = std::env::var("LOCALAPPDATA") {
-            candidates.push(PathBuf::from(a).join("portwave/ports/portwave-top-ports.txt"));
-        }
-    }
-    candidates.push(PathBuf::from("ports/portwave-top-ports.txt"));
-    for c in candidates {
-        if c.is_file() {
-            return c.to_str().map(|s| s.to_string());
-        }
-    }
-    None
-}
-
 // Raise the file-descriptor soft limit so thousands of concurrent sockets work.
 // On Windows this is a no-op: socket handles aren't bounded by RLIMIT_NOFILE.
 #[cfg(unix)]
@@ -269,23 +236,76 @@ fn raise_fd_limit() {
 #[cfg(not(unix))]
 fn raise_fd_limit() {}
 
+// The default port list is baked into the binary so `--update` automatically
+// ships the latest list — no separate asset, no path-resolution failure modes.
+// On-disk copies (under <prefix>/share/portwave/ports/) are kept for
+// editability and refreshed by `--update`; see refresh_bundled_ports_files.
+const EMBEDDED_PORTS: &str = include_str!("../ports/portwave-top-ports.txt");
+const EMBEDDED_SENTINEL: &str = "<embedded>";
+
+fn parse_port_list(content: &str) -> Vec<u16> {
+    let mut ports: Vec<u16> = content
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|p| p.parse::<u16>().ok())
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 fn load_ports(path: &str) -> Vec<u16> {
+    if path == EMBEDDED_SENTINEL || path.is_empty() {
+        return parse_port_list(EMBEDDED_PORTS);
+    }
     match fs::read_to_string(path) {
-        Ok(content) => {
-            let mut ports: Vec<u16> = content
-                .split(|c: char| c == ',' || c.is_whitespace())
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .filter_map(|p| p.parse::<u16>().ok())
-                .collect();
-            ports.sort_unstable();
-            ports.dedup();
-            ports
-        }
+        Ok(content) => parse_port_list(&content),
         Err(_) => {
-            eprintln!("!! WARNING: could not read {}. Using fallback top ports.", path);
-            vec![21, 22, 80, 443, 8080, 8443]
+            eprintln!("!! WARNING: could not read {} — falling back to embedded list.", path);
+            parse_port_list(EMBEDDED_PORTS)
         }
+    }
+}
+
+// Refresh on-disk ports files (for users whose config or workflow points at
+// share/<...>/portwave-top-ports.txt) so they pick up the same list that's
+// embedded in the freshly-installed binary.
+fn refresh_bundled_ports_files() {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            paths.push(dir.join("../share/portwave/ports/portwave-top-ports.txt"));
+            paths.push(dir.join("../ports/portwave-top-ports.txt"));
+        }
+    }
+    if let Ok(h) = std::env::var("PORTWAVE_HOME") {
+        paths.push(PathBuf::from(h).join("ports/portwave-top-ports.txt"));
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(a) = std::env::var("LOCALAPPDATA") {
+            paths.push(PathBuf::from(a).join("portwave/ports/portwave-top-ports.txt"));
+        }
+    }
+    let mut refreshed = 0usize;
+    for p in &paths {
+        if !p.is_file() {
+            continue; // only refresh files that already existed
+        }
+        if let Some(parent) = p.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::write(p, EMBEDDED_PORTS) {
+            Ok(_) => {
+                println!("Refreshed bundled ports: {}", p.display());
+                refreshed += 1;
+            }
+            Err(e) => eprintln!("(could not refresh {}: {})", p.display(), e),
+        }
+    }
+    if refreshed == 0 {
+        println!("(no on-disk ports files to refresh; embedded list is in the binary)");
     }
 }
 
@@ -724,7 +744,11 @@ async fn run_update() -> anyhow::Result<()> {
         self_update::Status::UpToDate(v) => println!("Already up to date: {}", v),
         self_update::Status::Updated(v) => {
             println!("Updated to: {}", v);
-            // Refresh the cache so the next startup banner doesn't re-prompt.
+            // Refresh on-disk ports files so users whose config points at a
+            // share/<...>/portwave-top-ports.txt still get the new list.
+            refresh_bundled_ports_files();
+            // Refresh the version-check cache so the next startup banner
+            // doesn't re-prompt about the version we just installed.
             if let Some(p) = update_cache_path() {
                 if let Some(parent) = p.parent() {
                     let _ = fs::create_dir_all(parent);
@@ -832,8 +856,15 @@ async fn main() -> anyhow::Result<()> {
     let _ = fs::remove_file(&raw_path);
     let _ = fs::remove_file(&nuclei_path);
 
-    let bundled = find_bundled_ports().unwrap_or_else(|| String::new());
-    let default_ports = if !bundled.is_empty() { bundled } else { String::from("<builtin-top-6>") };
+    // Default port source priority:
+    //   1. CLI --port-file
+    //   2. $PORTWAVE_PORTS env
+    //   3. PORTWAVE_PORTS in config
+    //   4. EMBEDDED list (compiled into the binary)
+    // The on-disk find_bundled_ports() lookup is no longer the default —
+    // it's only meaningful when the user explicitly sets PORTWAVE_PORTS to
+    // such a path. This ensures `--update` ships the latest list automatically.
+    let default_ports = String::from(EMBEDDED_SENTINEL);
     let port_path = resolve_path(
         args.port_file.as_deref(),
         "PORTWAVE_PORTS",
