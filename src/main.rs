@@ -2492,17 +2492,39 @@ async fn main() -> anyhow::Result<()> {
             .arg("-mhe").arg(args.nuclei_max_host_error.to_string())
             .arg("-o").arg(&nuclei_out);
         if args.tags_from_banner && !by_proto.is_empty() {
-            let tags: Vec<&str> = by_proto
-                .keys()
-                .filter_map(|p| match p.as_str() {
-                    "http" => Some("http"),
-                    "ssh" => Some("ssh"),
-                    "smtp" => Some("smtp"),
-                    "ftp" => Some("ftp"),
-                    "tls" => Some("ssl"),
-                    _ => None,
-                })
-                .collect();
+            // Cover every protocol the banner classifier can emit (see
+            // classify() in src/main.rs). Previously missed pop3 / imap /
+            // smtp_or_ftp / udp/* and silently sent fewer tags than
+            // warranted. Now we map or split each explicit protocol into
+            // one or more nuclei `-tags` values.
+            let mut tag_set: std::collections::BTreeSet<&'static str> =
+                std::collections::BTreeSet::new();
+            for p in by_proto.keys() {
+                match p.as_str() {
+                    "http" => { tag_set.insert("http"); }
+                    "ssh"  => { tag_set.insert("ssh"); }
+                    "smtp" => { tag_set.insert("smtp"); }
+                    "ftp"  => { tag_set.insert("ftp"); }
+                    "pop3" => { tag_set.insert("pop3"); }
+                    "imap" => { tag_set.insert("imap"); }
+                    "smtp_or_ftp" => {
+                        tag_set.insert("smtp");
+                        tag_set.insert("ftp");
+                    }
+                    "tls" => {
+                        tag_set.insert("ssl");
+                        // TLS on an open port very often fronts HTTPS,
+                        // so include http templates too.
+                        tag_set.insert("http");
+                    }
+                    _ => {
+                        // "unknown", "udp/dns", "udp/*" etc. Don't add
+                        // a tag — nuclei will still probe these targets
+                        // but no extra filter from us.
+                    }
+                }
+            }
+            let tags: Vec<&str> = tag_set.into_iter().collect();
             if !tags.is_empty() {
                 cmd.arg("-tags").arg(tags.join(","));
                 println!("Nuclei tags: {}", tags.join(","));
