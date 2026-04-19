@@ -78,14 +78,21 @@ $DefaultNuclei = Find-Bin 'nuclei' @(
 )
 
 Write-Host ''
+# httpx / nuclei path prompts removed in v0.8.3 — portwave now resolves
+# them dynamically at scan time via the PATH scan (equivalent of
+# `where.exe httpx`) then env var then config. No need to bake paths
+# into the config file. Show detected paths purely as info.
+Write-Host 'Auto-detected tools (portwave will resolve these at scan time):'
+Write-Host ('  httpx  : ' + ($(if ($DefaultHttpx)  { $DefaultHttpx  } else { 'not found — will offer to install at scan time' })))
+Write-Host ('  nuclei : ' + ($(if ($DefaultNuclei) { $DefaultNuclei } else { 'not found — will offer to install at scan time' })))
+
+Write-Host ''
 Write-Host 'Configure paths (press Enter to accept defaults):'
 $OutputDir     = Ask 'Scan output directory' $DefaultOutput
 # 1400+ default ports are embedded in the binary since v0.5.3 and are
 # auto-refreshed by `portwave --update`. Leave blank to use the embedded
 # list. Only enter a path if you maintain a CUSTOM port list.
 $PortsFile     = Ask 'Custom ports file (optional, blank = embedded 1400+ ports)' ''
-$HttpxBin      = Ask 'Path to httpx  binary (blank to skip)' $DefaultHttpx
-$NucleiBin     = Ask 'Path to nuclei binary (blank to skip)' $DefaultNuclei
 $InstallPrefix = Ask 'Install binary to' $DefaultPrefix
 
 $ShareDir  = Join-Path (Split-Path -Parent $InstallPrefix) 'share\portwave'
@@ -119,8 +126,9 @@ $cfg = @(
 # Only write PORTWAVE_PORTS if the user supplied a custom path (blank =
 # embedded list, the default, which --update refreshes automatically).
 if ($PortsFile) { $cfg += "PORTWAVE_PORTS=$PortsFile" }
-if ($HttpxBin)  { $cfg += "PORTWAVE_HTTPX_BIN=$HttpxBin" }
-if ($NucleiBin) { $cfg += "PORTWAVE_NUCLEI_BIN=$NucleiBin" }
+# httpx / nuclei paths intentionally NOT written — scanner auto-resolves
+# via PATH at scan time (v0.8.3+). Users can still set PORTWAVE_HTTPX_BIN
+# / PORTWAVE_NUCLEI_BIN here manually for a specific binary.
 $cfg | Set-Content -Encoding UTF8 $ConfigFile
 Say "Wrote config: $ConfigFile"
 

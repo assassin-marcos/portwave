@@ -119,22 +119,32 @@ done
 
 BUNDLED_PORTS="$REPO_ROOT/ports/portwave-top-ports.txt"
 
-# Smart auto-detect httpx / nuclei across a wide set of plausible locations.
+# httpx / nuclei path prompts removed in v0.8.3 — portwave now resolves
+# them dynamically at scan time via the same PATH scan that `which httpx`
+# does, then env var, then config. No need to bake their paths into the
+# config file; the scanner re-resolves each run automatically.
+# Users who maintain a custom install (e.g. two httpx versions side-by-
+# side) can still set PORTWAVE_HTTPX_BIN / PORTWAVE_NUCLEI_BIN in
+# ~/.config/portwave/config.env manually after install.
+
+# Quietly surface the resolved paths so the user sees what portwave will
+# pick up — purely informational, not written to config.
 # shellcheck disable=SC2207
 HTTPX_CANDIDATES=($(tool_candidates httpx))
 NUCLEI_CANDIDATES=($(tool_candidates nuclei))
-DEFAULT_HTTPX="$(find_bin httpx  "${HTTPX_CANDIDATES[@]}")"
-DEFAULT_NUCLEI="$(find_bin nuclei "${NUCLEI_CANDIDATES[@]}")"
+DETECTED_HTTPX="$(find_bin httpx  "${HTTPX_CANDIDATES[@]}")"
+DETECTED_NUCLEI="$(find_bin nuclei "${NUCLEI_CANDIDATES[@]}")"
+printf "\nAuto-detected tools (portwave will resolve these at scan time):\n"
+printf "  httpx  : %s\n"  "${DETECTED_HTTPX:-not found — will offer to install at scan time}"
+printf "  nuclei : %s\n"  "${DETECTED_NUCLEI:-not found — will offer to install at scan time}"
 
 printf "\nConfigure paths (press Enter to accept defaults):\n"
 OUTPUT_DIR="$(ask "Scan output directory" "$DEFAULT_OUTPUT")"
 # The comprehensive default port list (1400+ ports) is embedded in the
-# binary since v0.5.3. Leave this blank to use the embedded list — it's
-# also refreshed automatically by `portwave --update`. Only enter a path
-# if you maintain a CUSTOM list.
+# binary since v0.5.3. Leave blank to use the embedded list — it's also
+# refreshed automatically by `portwave --update`. Only enter a path if
+# you maintain a CUSTOM list.
 PORTS_FILE="$(ask "Custom ports file (optional — leave blank to use embedded 1400+ ports)" "")"
-HTTPX_BIN="$(ask  "Path to httpx  binary (blank to skip)" "$DEFAULT_HTTPX")"
-NUCLEI_BIN="$(ask "Path to nuclei binary (blank to skip)" "$DEFAULT_NUCLEI")"
 INSTALL_PREFIX="$(ask "Install binary to" "$DEFAULT_PREFIX")"
 
 SHARE_DIR="$(dirname "$INSTALL_PREFIX")/share/portwave"
@@ -163,8 +173,9 @@ chmod 644 "$SHARE_DIR/ports/portwave-top-ports.txt"
   # Only write PORTWAVE_PORTS if the user supplied a custom path. Blank =
   # embedded list (the default), which is auto-refreshed by --update.
   [[ -n "$PORTS_FILE" ]] && echo "PORTWAVE_PORTS=$PORTS_FILE"
-  [[ -n "$HTTPX_BIN"  ]] && echo "PORTWAVE_HTTPX_BIN=$HTTPX_BIN"
-  [[ -n "$NUCLEI_BIN" ]] && echo "PORTWAVE_NUCLEI_BIN=$NUCLEI_BIN"
+  # httpx / nuclei paths intentionally NOT written — scanner auto-resolves
+  # via PATH at scan time (v0.8.3+). Users can still set PORTWAVE_HTTPX_BIN
+  # / PORTWAVE_NUCLEI_BIN here manually if they need a specific binary.
 } > "$CONFIG_FILE"
 chmod 600 "$CONFIG_FILE"
 say "Wrote config: $CONFIG_FILE"
