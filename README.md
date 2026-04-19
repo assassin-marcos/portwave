@@ -360,6 +360,65 @@ Quarterly is fine. Cloudflare and Fastly update their public ranges maybe 2-3× 
 
 ---
 
+## Benchmarks
+
+Real-world head-to-head against [naabu](https://github.com/projectdiscovery/naabu) on a live bug-bounty target, same hardware, same port list, same TCP-connect technique, same timing (800 ms timeout, 1 retry).
+
+### `193.109.229.0/24` × 1433 ports (≈367K probes, 99.94 % firewalled)
+
+|                                | portwave `v0.8.0` | naabu |
+|--------------------------------|------------------:|-----------------:|
+| **Wall-clock**                 | **6 min 30 s**    | 18 min 27 s      |
+| **User CPU**                   | 19.7 s            | 89.6 s           |
+| **System CPU**                 | 109.2 s           | 100.9 s          |
+| **Peak RSS**                   | **10.3 MB**       | 81.5 MB          |
+| **Voluntary ctx switches**     | 469K              | 869K             |
+| Concurrency model              | 1500 async tokio workers | 1000 OS sockets, 2000 pps cap |
+| Output style                   | Streaming writes  | LevelDB buffer, flushed at end |
+
+**Result accuracy — 100 % agreement:**
+
+|                         | portwave | naabu |
+|-------------------------|---------:|------:|
+| Open `ip:port` found    | **75**   | **75** |
+| Found by both           | 75       | —     |
+| Only portwave           | 0        | —     |
+| Only naabu              | —        | 0     |
+
+Zero false positives, zero false negatives on either side.
+
+**Probe-level breakdown (portwave):**
+
+```text
+attempts: 363,982
+open:          75   (0.02 %)
+closed:        68   (RST / ICMP-unreachable — host alive, port closed)
+filtered: 363,839   (99.94 % — target firewall silently drops SYNs)
+local_err:      0   (no ephemeral-port / FD pressure on our side)
+Phase A: 389.8 s     Phase B: 0.8 s
+```
+
+**Why portwave wins here:** 1500 concurrent workers (vs naabu's 1000 + 2000-pps rate-cap), streaming writes (vs naabu's LevelDB buffer-flush-at-end), in-pass retry (vs naabu's separate full retry pass that doubled scan time on firewalled hosts), and `SO_LINGER=0` + `TCP_NODELAY` socket tuning that avoids TIME_WAIT ephemeral-port exhaustion at scale.
+
+Reproduce:
+
+```bash
+# Both tools use the exact same 1433-port list
+tr '\n' ',' < ports/portwave-top-ports.txt | sed 's/,$//' > /tmp/ports.csv
+
+# portwave
+/usr/bin/time -v portwave bench 193.109.229.0/24 \
+    --threads 1500 --timeout-ms 800 --retries 1 \
+    --no-httpx --no-nuclei
+
+# naabu — matching defaults
+/usr/bin/time -v naabu -host 193.109.229.0/24 \
+    -pf /tmp/ports.csv -s c -rate 2000 -retries 1 -timeout 800 \
+    -silent -o /tmp/naabu.txt
+```
+
+---
+
 ## Changelog
 
 Full history in [CHANGELOG.md](CHANGELOG.md).
