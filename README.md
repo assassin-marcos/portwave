@@ -335,16 +335,20 @@ Usually (a) service bound to `127.0.0.1` only, (b) provider firewall (AWS SG / H
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 
-## Credits & thanks
+## Acknowledgements
 
-portwave's recon pipeline stands on the shoulders of [ProjectDiscovery](https://projectdiscovery.io/)'s excellent tooling:
+### Integrated tooling
 
-- [**httpx**](https://github.com/projectdiscovery/httpx) — HTTP fingerprinting, status/size/title/location extraction. Resolved dynamically at scan time via `PATH` or `PORTWAVE_HTTPX_BIN` config key.
-- [**nuclei**](https://github.com/projectdiscovery/nuclei) — template-driven vulnerability scanner. Resolved dynamically at scan time via `PATH` or `PORTWAVE_NUCLEI_BIN` config key.
+portwave's recon pipeline integrates two tools maintained by [ProjectDiscovery](https://projectdiscovery.io/), resolved dynamically at scan time via `PATH` or an optional config override:
 
-Thanks to:
+| Tool | Purpose | Config override |
+|---|---|---|
+| [**httpx**](https://github.com/projectdiscovery/httpx) | HTTP fingerprinting — status, content length, title, redirect location | `PORTWAVE_HTTPX_BIN` |
+| [**nuclei**](https://github.com/projectdiscovery/nuclei) | Template-driven vulnerability scanner | `PORTWAVE_NUCLEI_BIN` |
 
-- [**@nittoSec**](https://github.com/nittoSec) — reported the tool-resolution issue that led to v0.8.3 (dynamic `which httpx` / `which nuclei` + interactive install prompt + Windows `where.exe`-style extension resolution).
+### Contributors
+
+- [**@nittoSec**](https://github.com/nittoSec) — reported the tool-resolution issue addressed in v0.8.3 (dynamic `PATH` lookup for `httpx` / `nuclei`, interactive install prompt, and Windows `PATHEXT`-aware resolution).
 
 ---
 
