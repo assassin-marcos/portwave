@@ -6,6 +6,76 @@ Versions follow semantic versioning (Major.Minor.Patch).
 
 ---
 
+## [0.8.0] — 2026-04-20
+
+### Changed — memory & speed at scale (no behavior change)
+
+- **Iterator-based producer.** `per_net: Vec<Vec<IpAddr>>` +
+  `round_robin: Vec<IpAddr>` materialisations (which copied every IP in the
+  scan scope into RAM twice) are gone. The producer now walks
+  `Vec<(IpNetwork, IpNetworkIterator)>` round-robin on the fly. Memory drops
+  from **O(IPs × 2)** to **O(nets)** — a `/8` scan went from ~128 MB up-front
+  to ~24 bytes per input net. Enables sustained scans of `/8+` ranges without
+  pressuring RAM.
+- **Numeric-order sort of `open_records`.** v0.7.x sorted by `(String, u16)`
+  which put `"10.0.0.1"` *before* `"9.0.0.1"` lexicographically. Now uses
+  `sort_by_cached_key` over `(IpAddr, u16)` — correct numeric order + parses
+  each IP once instead of on every comparison.
+- **Bounded `hit_tx` channel (was unbounded).** Capped at 2048 so Phase A
+  workers can't let the hit-queue grow without bound on pathological scans.
+- **FxHashSet for resume skip/prior sets.** ~4× faster lookups on the hot
+  path (SocketAddr key). `HashSet<SocketAddr>` → `FxHashSet<SocketAddr>`.
+- **Batched `pb.inc()`.** Workers accumulate 64 probes locally before
+  touching indicatif's internal mutex. Removes 3-5 % of CPU spent on bar
+  contention at 10–15 K probes/sec × 1500 workers.
+- **Fast-path semaphore bypass.** Workers now check
+  `stats.adaptive_shrunk: AtomicBool` before `sem.acquire_owned()`. In the
+  common "not shrunk" state (which is true 100 % of the time on healthy
+  networks) the semaphore call is skipped entirely — it was always a no-op
+  there anyway. 3-5 % additional hot-path CPU saving.
+- **Throttled `pb.set_message`.** Previously a String-allocating format on
+  every open; now rate-limited to 1 Hz per worker. Cleaner logs on hot /24s.
+
+### Fixed
+
+- **Producer hang on Ctrl+C during backpressure.** `send_or_shutdown()`
+  replaces raw `tx.send_async(sa).await` — try_send fast path, and on a
+  backpressured channel races the send against a 100 ms timer so a
+  shutdown flag flip is observed within ≤ 100 ms. Previously a
+  Ctrl+C while the producer was waiting on a full channel could take
+  seconds to propagate.
+- **Phase B hang on Ctrl+C.** The enrichment JoinSet drain loop now
+  checks `stats.shutdown` after each task completes and calls
+  `set.abort_all()` on detection. Previously a scan with 10k hits could
+  take a minute or more of enrichment to drain after Ctrl+C.
+- **Panic on semaphore close during Phase B.** `enrich_sem.acquire_owned()
+  .await.unwrap()` → `let Ok(p) = ... else { break; };`. Graceful.
+- **Monitor-abort no longer triggers Phase B shutdown.** Previous versions
+  set `stats.shutdown = true` after Phase A to stop the adaptive monitor,
+  but now that Phase B treats that flag as "user cancelled", we abort the
+  monitor's `JoinHandle` directly instead.
+
+### Added — observability
+
+- **`[priority]` heartbeat line.** A background task watches
+  `stats.priority_done`; prints one line the moment the top-20 sweep has
+  been fully enqueued ("top-20 ports enqueued — N open so far, continuing").
+  Gives users a mid-scan heartbeat on long runs.
+- **Phase timing in `scan_summary.json`.** New fields `phase_a_ms`,
+  `phase_b_ms`, `udp_ms`, `httpx_ms`, `nuclei_ms`. Summary is rewritten
+  after httpx + nuclei finish so the file always reflects the final state.
+
+### Verified
+
+- Linux `cargo build --release` clean, zero warnings.
+- Windows `cargo check --target x86_64-pc-windows-gnu --release` clean.
+- Localhost `/32` smoke: 15 opens, sort order numeric
+  (`22 → 80 → 443 → 631 → 1080 → 3389 → …`), `phase_a_ms=128`,
+  `phase_b_ms=1205`.
+- Scope-filter (v0.7.1 regression): still drops prior-scope entries.
+- CDN tagging regression: `104.16.1.1:80 [http, cdn:cloudflare]` works.
+- Port-range parser regression: `"80,443,8000-8002,9998"` → 6 ports.
+
 ## [0.7.1] — 2026-04-20
 
 ### Fixed

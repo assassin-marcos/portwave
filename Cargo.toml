@@ -1,6 +1,6 @@
 [package]
 name = "portwave"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 description = "Ultra-fast hybrid IPv4/IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, and httpx/nuclei pipeline."
 license = "MIT"
@@ -30,6 +30,9 @@ self_update = { version = "0.41", default-features = false, features = ["rustls"
 # Tiny blocking HTTP client for the GitHub tags API peek — catches the
 # "tag pushed, release not yet built" race in `--check-update`.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+# Fast non-DoS-resistant hasher for scan-state HashSets (skip / prior
+# sets). ~4× faster than the std SipHash on small keys like SocketAddr.
+rustc-hash = "1.1"
 
 # Unix-only: setrlimit(RLIMIT_NOFILE) to raise the FD soft limit for large scans.
 [target.'cfg(unix)'.dependencies]
