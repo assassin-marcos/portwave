@@ -212,6 +212,15 @@ struct ScanSummary {
     by_protocol: std::collections::BTreeMap<String, u64>,
     by_cdn: std::collections::BTreeMap<String, u64>,
     cdn_count: u64,
+    /// Probes that got RST / ICMP-unreachable back — i.e. port is closed
+    /// but the host is alive (answering network). Computed as attempts
+    /// minus opens minus timeouts minus local_errors.
+    #[serde(default)]
+    closed: u64,
+    /// Local-resource errors (ephemeral port / FD / kernel buffer full).
+    /// Drives the adaptive-concurrency controller.
+    #[serde(default)]
+    local_errors: u64,
     /// Phase-A (discovery) wall time.
     #[serde(default)]
     phase_a_ms: u128,
@@ -2318,6 +2327,17 @@ async fn main() -> anyhow::Result<()> {
         by_protocol: by_proto.clone(),
         by_cdn,
         cdn_count: cdn_count_total,
+        closed: {
+            let attempts_v = stats.attempts.load(Ordering::Relaxed);
+            let timeouts_v = stats.timeouts.load(Ordering::Relaxed);
+            let local_v = stats.local_errors.load(Ordering::Relaxed);
+            let opens_v = stats.opens.load(Ordering::Relaxed);
+            attempts_v
+                .saturating_sub(timeouts_v)
+                .saturating_sub(local_v)
+                .saturating_sub(opens_v)
+        },
+        local_errors: stats.local_errors.load(Ordering::Relaxed),
         phase_a_ms,
         phase_b_ms,
         udp_ms,
@@ -2330,9 +2350,23 @@ async fn main() -> anyhow::Result<()> {
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
     println!("Summary: {:?}", summary_path);
     println!(
-        "Totals — attempts: {}, timeouts: {}, open: {}",
-        summary.attempts, summary.timeouts, summary.open
+        "Totals — {} probes  ·  open: {}  ·  closed: {}  ·  filtered: {} ({:.1}%)  ·  local_err: {}",
+        summary.attempts,
+        summary.open,
+        summary.closed,
+        summary.timeouts,
+        if summary.attempts > 0 {
+            (summary.timeouts as f64 / summary.attempts as f64) * 100.0
+        } else {
+            0.0
+        },
+        summary.local_errors,
     );
+    // Quick legend for first-time users:
+    //   open     = TCP 3-way handshake completed
+    //   closed   = RST / ICMP-unreachable (port closed but host replied)
+    //   filtered = no reply within timeout (firewall dropped SYN, or host down)
+    //   local_err= our OS pushed back (ephemeral-port / FD / buffer full)
 
     // Diff this run against the prior open_ports.jsonl (if any) and emit
     // scan_diff.json. ALWAYS write — even when both sets are empty —
