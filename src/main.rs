@@ -2145,27 +2145,18 @@ async fn main() -> anyhow::Result<()> {
         scanned_estimate
     );
 
-    // Progress bar — spinner for huge totals, bar otherwise.
-    let pb = if scanned_estimate > 10_000_000 {
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner} [{elapsed_precise}] scanned {pos} open {msg}",
-            )
-            .unwrap(),
-        );
-        pb.enable_steady_tick(Duration::from_millis(200));
-        pb
-    } else {
-        let pb = ProgressBar::new(scanned_estimate.max(1));
-        pb.set_style(
-            ProgressStyle::with_template(
-                "{spinner} [{elapsed_precise}] {bar:40} {pos}/{len} ({percent}%) {msg}",
-            )
-            .unwrap(),
-        );
-        pb
-    };
+    // Always use a real progress bar — indicatif handles arbitrarily large
+    // totals. The old spinner-mode template (engaged above 10M probes) had
+    // a hardcoded "open" token that collided with the {msg} ("open: <sa>")
+    // and rendered as "scanned 0 open open: 1.2.3.4:80". Gone.
+    let pb = ProgressBar::new(scanned_estimate.max(1));
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner} [{elapsed_precise}] {bar:40} {pos}/{len} ({percent}%) {msg}",
+        )
+        .unwrap(),
+    );
+    pb.enable_steady_tick(Duration::from_millis(200));
 
     let stats = Arc::new(Stats {
         shutdown: AtomicBool::new(false),
@@ -2308,6 +2299,13 @@ async fn main() -> anyhow::Result<()> {
     let mut phase_b_ms: u128 = 0;
     if !hits.is_empty() && !args.no_banner {
         println!("--- PHASE B: ENRICHMENT ({} hits) ---", hits.len());
+        // Snapshot the raw Phase A hits BEFORE enrichment runs, so that if
+        // Ctrl+C aborts Phase B mid-way, we can still record the opens we
+        // definitely found (just without banner/TLS detail). Without this,
+        // v0.8.3 silently lost every Phase A hit that wasn't yet enriched
+        // when a scan was cancelled — "Phase A done: 20" then "Totals —
+        // open: 0" afterwards. See issue #16 style failure.
+        let phase_a_hits_snapshot: Vec<SocketAddr> = hits.clone();
         let enrich_sem = Arc::new(Semaphore::new(args.threads.min(1000)));
         let mut set: JoinSet<OpenPort> = JoinSet::new();
         let t_b = Duration::from_millis(args.enrich_timeout_ms);
@@ -2327,11 +2325,13 @@ async fn main() -> anyhow::Result<()> {
         // Shutdown-aware drain. Under Ctrl+C we abort any not-yet-finished
         // enrichment tasks so the scan exits within a second or two
         // instead of blocking on possibly-hanging banner reads.
+        let mut shutdown_hit = false;
         while let Some(res) = set.join_next().await {
             if let Ok(op) = res {
                 open_records.push(op);
             }
             if stats.shutdown.load(Ordering::Relaxed) {
+                shutdown_hit = true;
                 set.abort_all();
                 // Drain whatever aborts resolve immediately, then bail.
                 while let Some(res) = set.join_next().await {
@@ -2340,6 +2340,38 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 break;
+            }
+        }
+        // If Phase B was cut short, back-fill any Phase A hit whose
+        // enrichment task didn't complete with a minimal OpenPort record.
+        // Otherwise we'd show "Phase A done: N" then "Totals — open: 0".
+        if shutdown_hit {
+            let enriched: std::collections::HashSet<SocketAddr> = open_records
+                .iter()
+                .filter_map(|op| {
+                    op.ip.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, op.port))
+                })
+                .collect();
+            let mut backfilled = 0usize;
+            for sa in &phase_a_hits_snapshot {
+                if !enriched.contains(sa) {
+                    open_records.push(OpenPort {
+                        ip: sa.ip().to_string(),
+                        port: sa.port(),
+                        rtt_ms: 0,
+                        tls: sa.port() == 443,
+                        protocol: None,
+                        banner: Some("(Ctrl+C — enrichment skipped)".to_string()),
+                        cdn: None,
+                    });
+                    backfilled += 1;
+                }
+            }
+            if backfilled > 0 {
+                println!(
+                    "Phase B interrupted — kept {} raw Phase A hit(s) without enrichment.",
+                    backfilled
+                );
             }
         }
     } else {
