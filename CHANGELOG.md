@@ -6,6 +6,26 @@ Versions follow semantic versioning (Major.Minor.Patch).
 
 ---
 
+## [0.7.1] — 2026-04-20
+
+### Fixed
+- **Resume + scan_diff leaked IPs from previous-scope scans.** When the same
+  folder name was reused across different target inputs (e.g. one day
+  `portwave local 192.168.1.0/24`, next day `portwave local 185.80.124.0/22`),
+  the prior `open_ports.jsonl` was fully loaded without scope filtering —
+  so the new scan's OPEN PORTS block, output files, and diff baseline all
+  included old 192.168.1.* entries unrelated to the current CIDR. Resume
+  state (`preserved`, `skip_set`) and the diff baseline (`prior_set`) are
+  now scope-filtered against the current `<CIDR_INPUT>` minus `--exclude`
+  before anything downstream reads them. Log lines explain the cull:
+  `Resume: discarded N prior open port(s) outside the current scan scope.`
+- **`scan_diff.json` could go stale across re-runs.** v0.7.0 skipped writing
+  a diff when both current and prior sets were empty, leaving the diff
+  file from a previous (different-scope) run on disk. Diff is now written
+  every single run — empty state reads `{prior_opens:0, current_opens:0,
+  new:[], closed:[], unchanged:0}` plus the log line
+  `Diff: no opens this run (and no prior in scope)`.
+
 ## [0.7.0] — 2026-04-17
 
 ### Added

@@ -1813,6 +1813,41 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Scope-filter the resume + diff state to just IPs that fall inside
+    // the current <CIDR_INPUT> minus --exclude. Without this, an older
+    // scan of a totally different CIDR persisted in the same folder
+    // would leak into OPEN PORTS, the writer output, and scan_diff. Very
+    // real footgun when the same folder name gets reused across targets.
+    let in_scope = |ip: IpAddr| -> bool {
+        nets.iter().any(|n| n.contains(ip))
+            && !exclude_nets.iter().any(|e| e.contains(ip))
+    };
+    let sockaddr_in_scope = |sa: &SocketAddr| in_scope(sa.ip());
+
+    let preserved_before = preserved.len();
+    preserved.retain(|op| {
+        op.ip.parse::<IpAddr>().map(in_scope).unwrap_or(false)
+    });
+    if preserved_before != preserved.len() {
+        println!(
+            "Resume: discarded {} prior open port(s) outside the current scan scope.",
+            preserved_before - preserved.len()
+        );
+    }
+
+    let skip_before = skip_set.len();
+    skip_set.retain(sockaddr_in_scope);
+    if skip_before != skip_set.len() {
+        println!(
+            "Resume: trimmed skip-set from {} → {} (scope-filtered).",
+            skip_before, skip_set.len()
+        );
+    }
+
+    // Also scope-filter the diff baseline, so scan_diff reflects changes
+    // *within the current scope only*.
+    prior_set.retain(sockaddr_in_scope);
+
     let total_estimate: u64 = nets
         .iter()
         .map(|n| {
@@ -2104,8 +2139,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Diff this run against the prior open_ports.jsonl (if any) and emit
-    // scan_diff.json — useful for continuous monitoring / change alerts.
-    if !prior_set.is_empty() || !open_records.is_empty() {
+    // scan_diff.json. ALWAYS write — even when both sets are empty —
+    // so a stale diff from a different-scope previous run isn't left
+    // on disk to mislead the next reader.
+    {
         let current_set: std::collections::BTreeSet<SocketAddr> = open_records
             .iter()
             .filter_map(|op| {
@@ -2129,7 +2166,9 @@ async fn main() -> anyhow::Result<()> {
         fs::write(&diff_path, serde_json::to_string_pretty(&diff)?)?;
         let new_n = diff["new"].as_array().map(|a| a.len()).unwrap_or(0);
         let closed_n = diff["closed"].as_array().map(|a| a.len()).unwrap_or(0);
-        if prior_set.is_empty() {
+        if prior_set.is_empty() && open_records.is_empty() {
+            println!("Diff: no opens this run (and no prior in scope) → {:?}", diff_path);
+        } else if prior_set.is_empty() {
             println!("Diff: first scan (no prior baseline) → {:?}", diff_path);
         } else {
             println!(
