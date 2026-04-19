@@ -335,6 +335,19 @@ Usually (a) service bound to `127.0.0.1` only, (b) provider firewall (AWS SG / H
 
 See [CHANGELOG.md](CHANGELOG.md) for the full version history.
 
+## Credits & thanks
+
+portwave's recon pipeline stands on the shoulders of [ProjectDiscovery](https://projectdiscovery.io/)'s excellent tooling:
+
+- [**httpx**](https://github.com/projectdiscovery/httpx) — HTTP fingerprinting, status/size/title/location extraction. Resolved dynamically at scan time via `PATH` or `PORTWAVE_HTTPX_BIN` config key.
+- [**nuclei**](https://github.com/projectdiscovery/nuclei) — template-driven vulnerability scanner. Resolved dynamically at scan time via `PATH` or `PORTWAVE_NUCLEI_BIN` config key.
+
+Thanks to:
+
+- [**@nittoSec**](https://github.com/nittoSec) — reported the tool-resolution issue that led to v0.8.3 (dynamic `which httpx` / `which nuclei` + interactive install prompt + Windows `where.exe`-style extension resolution).
+
+---
+
 ## Contact
 
 Developed by **[@assassin_marcos](https://twitter.com/assassin_marcos)** on X / Twitter. Issues + PRs: https://github.com/assassin-marcos/portwave/issues

@@ -132,6 +132,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     refresh_cdn: bool,
 
+    /// Suppress the interactive "install httpx/nuclei via `go install`?"
+    /// prompt when those tools aren't on PATH. Useful for CI / scripted
+    /// runs where an unattended skip is better than a blocked prompt.
+    #[arg(long, default_value_t = false)]
+    no_install_prompt: bool,
+
     #[arg(long, default_value_t = false)]
     no_httpx: bool,
 
@@ -733,15 +739,160 @@ fn format_for_nuclei(ip: &IpAddr, port: u16, tls: bool) -> String {
     }
 }
 
-fn which(bin: &str) -> bool {
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            if Path::new(dir).join(bin).is_file() {
-                return true;
+// Cross-platform PATH resolver. Returns the full path to the first hit, not
+// just a bool. Matches the semantics of `which` on Unix and `where.exe` on
+// Windows (including .exe / .cmd / .bat extensions).
+fn find_binary(name: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let sep = ';';
+    #[cfg(not(windows))]
+    let sep = ':';
+
+    // Windows resolves bare binary names by trying PATHEXT extensions. On
+    // Unix we just test the literal name.
+    #[cfg(windows)]
+    let extensions: Vec<String> = {
+        let mut out: Vec<String> = vec![String::new()]; // literal first
+        if let Ok(pathext) = std::env::var("PATHEXT") {
+            for ext in pathext.split(';') {
+                let ext = ext.trim();
+                if !ext.is_empty() {
+                    out.push(ext.to_string());
+                }
+            }
+        } else {
+            out.extend(
+                [".exe", ".bat", ".cmd", ".com"]
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
+        }
+        out
+    };
+    #[cfg(not(windows))]
+    let extensions: Vec<String> = vec![String::new()];
+
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in path_var.split(sep) {
+        if dir.is_empty() {
+            continue;
+        }
+        for ext in &extensions {
+            let candidate = Path::new(dir).join(format!("{}{}", name, ext));
+            if candidate.is_file() {
+                // On Unix we also need the +x bit; on Windows `is_file()`
+                // is enough since executables aren't mode-gated.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let exec = candidate
+                        .metadata()
+                        .ok()
+                        .map(|m| m.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false);
+                    if !exec {
+                        continue;
+                    }
+                }
+                return Some(candidate);
             }
         }
     }
-    false
+    None
+}
+
+// Resolve a tool to an absolute path. Precedence:
+//   1. CLI flag env var (PORTWAVE_HTTPX_BIN / PORTWAVE_NUCLEI_BIN)
+//   2. Config file key of the same name
+//   3. PATH lookup via find_binary()
+// Returns None only if all three miss.
+fn resolve_tool(
+    name: &str,
+    cfg: &std::collections::HashMap<String, String>,
+    env_key: &str,
+) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var(env_key) {
+        let p = path.trim();
+        if !p.is_empty() && Path::new(p).is_file() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Some(path) = cfg.get(env_key) {
+        let p = path.trim();
+        if !p.is_empty() && Path::new(p).is_file() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    find_binary(name)
+}
+
+// Interactive "install X?" prompt. Returns true if install succeeded.
+// Respects --no-install-prompt and skips silently on non-TTY stdin.
+fn offer_install(tool: &str, go_pkg: &str, allow_prompt: bool) -> bool {
+    if !allow_prompt {
+        return false;
+    }
+    // Only prompt on an actual TTY — CI / piped input auto-declines.
+    #[cfg(unix)]
+    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+    #[cfg(not(unix))]
+    let is_tty = true; // best-effort on Windows
+
+    if !is_tty {
+        eprintln!(
+            "[install] {} not found and stdin is not a TTY — skipping. \
+             Install with:  go install -v {}@latest",
+            tool, go_pkg
+        );
+        return false;
+    }
+
+    // Need `go` to install. If it's missing, tell the user where to get it.
+    let go_path = find_binary("go");
+    if go_path.is_none() {
+        eprintln!(
+            "[install] {} not found, and `go` is not on PATH either. \
+             Install Go from https://go.dev/dl/ then retry, or install {} \
+             manually: go install -v {}@latest",
+            tool, tool, go_pkg
+        );
+        return false;
+    }
+
+    eprint!(
+        "[install] {} not found. Install via `go install -v {}@latest` now? [Y/n] ",
+        tool, go_pkg
+    );
+    use std::io::Write as _;
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    let ans = line.trim();
+    if !(ans.is_empty() || ans.eq_ignore_ascii_case("y") || ans.eq_ignore_ascii_case("yes")) {
+        eprintln!("[install] skipped.");
+        return false;
+    }
+
+    eprintln!("[install] running: go install -v {}@latest", go_pkg);
+    let status = Command::new(go_path.unwrap())
+        .args(["install", "-v", &format!("{}@latest", go_pkg)])
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("[install] {} installed.", tool);
+            true
+        }
+        Ok(s) => {
+            eprintln!("[install] go install exited with status {}. Install {} manually.", s, tool);
+            false
+        }
+        Err(e) => {
+            eprintln!("[install] failed to launch `go install`: {}. Install {} manually.", e, tool);
+            false
+        }
+    }
 }
 
 // Minimal TLS 1.0 ClientHello — we only care whether the peer *speaks* TLS.
@@ -2449,49 +2600,77 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── httpx ──
-    if !args.no_httpx && which("httpx") {
-        println!("\n--- httpx ---");
-        let httpx_started = Instant::now();
-        let mut cmd = Command::new("httpx");
-        cmd.arg("-l").arg(&raw_path)
-            .arg("-sc")
-            .arg("-cl")
-            .arg("-location")
-            .arg("-title")
-            .arg("-nc")
-            .arg("-threads").arg(args.httpx_threads.to_string())
-            .arg("-timeout").arg("10")
-            .arg("-retries").arg("1")
-            .arg("-o").arg(&httpx_out);
-        if args.httpx_follow_redirects {
-            cmd.arg("-fr");
-        }
-        if let Some(p) = &args.httpx_paths {
-            cmd.arg("-path").arg(p);
-        }
-        match cmd.status() {
-            Ok(s) if s.success() => println!("httpx OK -> {:?}", httpx_out),
-            Ok(s) => eprintln!("httpx exited {}", s),
-            Err(e) => eprintln!("httpx launch failed: {}", e),
-        }
-        summary.httpx_ms = httpx_started.elapsed().as_millis();
-    } else if args.no_httpx {
+    if args.no_httpx {
         println!("Skipping httpx (--no-httpx).");
     } else {
-        eprintln!("httpx not in PATH; skipping.");
+        // Resolve: env → config → PATH. Offer to install if still missing.
+        let mut httpx_bin = resolve_tool("httpx", &cfg, "PORTWAVE_HTTPX_BIN");
+        if httpx_bin.is_none() {
+            let installed = offer_install(
+                "httpx",
+                "github.com/projectdiscovery/httpx/cmd/httpx",
+                !args.no_install_prompt,
+            );
+            if installed {
+                httpx_bin = resolve_tool("httpx", &cfg, "PORTWAVE_HTTPX_BIN");
+            }
+        }
+        if let Some(bin) = httpx_bin {
+            println!("\n--- httpx ({}) ---", bin.display());
+            let httpx_started = Instant::now();
+            let mut cmd = Command::new(&bin);
+            cmd.arg("-l").arg(&raw_path)
+                .arg("-sc")
+                .arg("-cl")
+                .arg("-location")
+                .arg("-title")
+                .arg("-nc")
+                .arg("-threads").arg(args.httpx_threads.to_string())
+                .arg("-timeout").arg("10")
+                .arg("-retries").arg("1")
+                .arg("-o").arg(&httpx_out);
+            if args.httpx_follow_redirects {
+                cmd.arg("-fr");
+            }
+            if let Some(p) = &args.httpx_paths {
+                cmd.arg("-path").arg(p);
+            }
+            match cmd.status() {
+                Ok(s) if s.success() => println!("httpx OK -> {:?}", httpx_out),
+                Ok(s) => eprintln!("httpx exited {}", s),
+                Err(e) => eprintln!("httpx launch failed: {}", e),
+            }
+            summary.httpx_ms = httpx_started.elapsed().as_millis();
+        } else {
+            eprintln!("httpx not found on PATH or in config — skipping. Set PORTWAVE_HTTPX_BIN or install httpx.");
+        }
     }
 
     // ── nuclei ──
-    if !args.no_nuclei && which("nuclei") {
-        println!("\n--- nuclei ---");
-        let nuclei_started = Instant::now();
-        let mut cmd = Command::new("nuclei");
-        cmd.arg("-l").arg(&nuclei_path)
-            .arg("-c").arg(args.nuclei_concurrency.to_string())
-            .arg("-rl").arg(args.nuclei_rate.to_string())
-            .arg("-mhe").arg(args.nuclei_max_host_error.to_string())
-            .arg("-o").arg(&nuclei_out);
-        if args.tags_from_banner && !by_proto.is_empty() {
+    if args.no_nuclei {
+        println!("Skipping nuclei (--no-nuclei).");
+    } else {
+        let mut nuclei_bin = resolve_tool("nuclei", &cfg, "PORTWAVE_NUCLEI_BIN");
+        if nuclei_bin.is_none() {
+            let installed = offer_install(
+                "nuclei",
+                "github.com/projectdiscovery/nuclei/v3/cmd/nuclei",
+                !args.no_install_prompt,
+            );
+            if installed {
+                nuclei_bin = resolve_tool("nuclei", &cfg, "PORTWAVE_NUCLEI_BIN");
+            }
+        }
+        if let Some(bin) = nuclei_bin {
+            println!("\n--- nuclei ({}) ---", bin.display());
+            let nuclei_started = Instant::now();
+            let mut cmd = Command::new(&bin);
+            cmd.arg("-l").arg(&nuclei_path)
+                .arg("-c").arg(args.nuclei_concurrency.to_string())
+                .arg("-rl").arg(args.nuclei_rate.to_string())
+                .arg("-mhe").arg(args.nuclei_max_host_error.to_string())
+                .arg("-o").arg(&nuclei_out);
+            if args.tags_from_banner && !by_proto.is_empty() {
             // Cover every protocol the banner classifier can emit (see
             // classify() in src/main.rs). Previously missed pop3 / imap /
             // smtp_or_ftp / udp/* and silently sent fewer tags than
@@ -2530,16 +2709,15 @@ async fn main() -> anyhow::Result<()> {
                 println!("Nuclei tags: {}", tags.join(","));
             }
         }
-        match cmd.status() {
-            Ok(s) if s.success() => println!("nuclei OK -> {:?}", nuclei_out),
-            Ok(s) => eprintln!("nuclei exited {}", s),
-            Err(e) => eprintln!("nuclei launch failed: {}", e),
+            match cmd.status() {
+                Ok(s) if s.success() => println!("nuclei OK -> {:?}", nuclei_out),
+                Ok(s) => eprintln!("nuclei exited {}", s),
+                Err(e) => eprintln!("nuclei launch failed: {}", e),
+            }
+            summary.nuclei_ms = nuclei_started.elapsed().as_millis();
+        } else {
+            eprintln!("nuclei not found on PATH or in config — skipping. Set PORTWAVE_NUCLEI_BIN or install nuclei.");
         }
-        summary.nuclei_ms = nuclei_started.elapsed().as_millis();
-    } else if args.no_nuclei {
-        println!("Skipping nuclei (--no-nuclei).");
-    } else {
-        eprintln!("nuclei not in PATH; skipping.");
     }
 
     // Rewrite summary so final httpx_ms / nuclei_ms land on disk.
