@@ -3543,17 +3543,65 @@ async fn main() -> anyhow::Result<()> {
     // totals. The old spinner-mode template (engaged above 10M probes) had
     // a hardcoded "open" token that collided with the {msg} ("open: <sa>")
     // and rendered as "scanned 0 open open: 1.2.3.4:80". Gone.
+    //
+    // v0.13.5: Replaced indicatif's built-in `{per_sec}` and `{eta}` format
+    // keys with our own computed values piped into `{msg}`. indicatif's
+    // rate estimator uses a sliding window that breaks under bursty
+    // loads — on firewalled /24s where 1500 workers all time out in
+    // 800 ms bursts, the window sees either 0 or 1500 events and reports
+    // bogus rates (users saw "0.005/s · ETA 2y" on scans running at
+    // 500/s). Our computed rate uses the global average (position /
+    // elapsed) which is always sensible, refreshed every 500 ms by a
+    // dedicated ticker task.
     let pb = ProgressBar::new(scanned_estimate.max(1));
     pb.set_style(
         ProgressStyle::with_template(
-            // {per_sec} + {eta} give an at-a-glance health check — if the
-            // rate drops or ETA climbs mid-scan, the user knows something
-            // regressed without having to instrument anything.
-            "{spinner} [{elapsed_precise}] {bar:40} {pos}/{len} ({percent}%) {per_sec} · ETA {eta} {msg}",
+            "{spinner} [{elapsed_precise}] {bar:40} {pos}/{len} ({percent}%) {msg}",
         )
         .unwrap(),
     );
     pb.enable_steady_tick(Duration::from_millis(200));
+
+    // Own rate / ETA ticker. Computes global-average rate (pos / elapsed)
+    // — which is ALWAYS accurate — and pushes it into the bar's {msg}
+    // slot every 500 ms. Replaces indicatif's unreliable window-based
+    // {per_sec} + {eta}. Aborts naturally when the bar finishes.
+    let rate_ticker = {
+        let pb = pb.clone();
+        let rate_started = Instant::now();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let elapsed = rate_started.elapsed().as_secs_f64();
+                let pos = pb.position();
+                let len = pb.length().unwrap_or(0);
+                if elapsed < 0.1 {
+                    continue;
+                }
+                let rate = pos as f64 / elapsed;
+                let remaining = len.saturating_sub(pos) as f64;
+                let eta_secs = if rate > 0.1 {
+                    (remaining / rate) as u64
+                } else {
+                    u64::MAX
+                };
+                let eta_str = if eta_secs == u64::MAX || eta_secs > 86_400 * 30 {
+                    // cap unreasonable ETAs (slow start; will reconverge)
+                    "~".to_string()
+                } else if eta_secs >= 3600 {
+                    format!("{}h{}m", eta_secs / 3600, (eta_secs % 3600) / 60)
+                } else if eta_secs >= 60 {
+                    format!("{}m{}s", eta_secs / 60, eta_secs % 60)
+                } else {
+                    format!("{}s", eta_secs)
+                };
+                // pb.message() may already hold a live-hit "open: ip:port"
+                // from Phase A workers — append/replace instead of overwrite
+                // so both bits of info stay visible.
+                pb.set_message(format!("{:.0}/s · ETA {}", rate, eta_str));
+            }
+        })
+    };
 
     let stats = Arc::new(Stats {
         shutdown: AtomicBool::new(false),
@@ -3796,6 +3844,11 @@ async fn main() -> anyhow::Result<()> {
     while workers.join_next().await.is_some() {}
     let _ = collector.await;
     let phase_a_ms = phase_a_started.elapsed().as_millis();
+
+    // Stop the rate ticker before writing the final bar message, otherwise
+    // its 500 ms loop can overwrite the "N open" finish message.
+    rate_ticker.abort();
+    let _ = rate_ticker.await;
 
     pb.finish_with_message(format!("{} open", stats.opens.load(Ordering::Relaxed)));
     // Wake the watcher if it hasn't already returned (scan may have had
