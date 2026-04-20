@@ -478,6 +478,7 @@ fn refresh_bundled_ports_files() {
     // De-duplicate so we don't log the same path twice.
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut refreshed = 0usize;
+    let mut skipped_git = 0usize;
     for p in &paths {
         let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
         if !seen.insert(canon) {
@@ -485,6 +486,16 @@ fn refresh_bundled_ports_files() {
         }
         if !p.is_file() {
             continue; // only refresh files that already existed
+        }
+        // Never write inside a git working tree. Users who keep their
+        // portwave clone checked out AND had an older install.sh point
+        // PORTWAVE_PORTS at <repo>/ports/portwave-top-ports.txt would
+        // otherwise see `git pull` fail every time because --update
+        // rewrote a tracked file. Detect by walking the path's
+        // ancestry looking for a `.git` directory or file.
+        if is_inside_git_repo(p) {
+            skipped_git += 1;
+            continue;
         }
         if let Some(parent) = p.parent() {
             let _ = fs::create_dir_all(parent);
@@ -497,9 +508,30 @@ fn refresh_bundled_ports_files() {
             Err(e) => eprintln!("(could not refresh {}: {})", p.display(), e),
         }
     }
-    if refreshed == 0 {
+    if skipped_git > 0 {
+        println!(
+            "(skipped {} path(s) inside a git working tree — embedded list in the binary is already current)",
+            skipped_git
+        );
+    }
+    if refreshed == 0 && skipped_git == 0 {
         println!("(no on-disk ports files to refresh; embedded list is in the binary)");
     }
+}
+
+// Walk a file path's ancestors looking for a `.git` directory or file.
+// Covers both regular clones and git-worktree checkouts (where `.git` is
+// a file pointing at the worktree's shared metadata).
+fn is_inside_git_repo(p: &Path) -> bool {
+    let mut dir: Option<&Path> = p.parent();
+    while let Some(d) = dir {
+        let git = d.join(".git");
+        if git.exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 // Parse a single input token into one or more IpNetworks. Accepts:
