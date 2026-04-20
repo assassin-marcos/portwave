@@ -1505,9 +1505,21 @@ const BANNER_ART: &str = r"
 fn print_banner() {
     // ANSI cyan for the art, bold for the byline.
     eprintln!("\x1b[36m{}\x1b[0m", BANNER_ART);
+    let current = env!("CARGO_PKG_VERSION");
+    // Nuclei-style inline "(outdated → vX.Y.Z)" / "(latest)" tag derived
+    // purely from the 24 h update cache — no network hit on startup.
+    // Populated by maybe_show_update_banner (scan path) and by run_update
+    // after a successful install, so users see drift the moment it exists.
+    let tag = match cached_latest_version() {
+        Some(latest) if version_is_newer(&latest, current) => {
+            format!("  \x1b[31m(outdated → v{})\x1b[0m", latest)
+        }
+        Some(_) => "  \x1b[32m(latest)\x1b[0m".to_string(),
+        None => String::new(),
+    };
     eprintln!(
-        "        \x1b[1mportwave {}\x1b[0m  \x1b[2m·\x1b[0m  \x1b[2mby assassin_marcos\x1b[0m  \x1b[2m·\x1b[0m  \x1b[2mgithub.com/assassin-marcos/portwave\x1b[0m",
-        env!("CARGO_PKG_VERSION")
+        "        \x1b[1mportwave {}\x1b[0m{}  \x1b[2m·\x1b[0m  \x1b[2mby assassin_marcos\x1b[0m  \x1b[2m·\x1b[0m  \x1b[2mgithub.com/assassin-marcos/portwave\x1b[0m",
+        current, tag
     );
     eprintln!();
 }
@@ -1529,6 +1541,25 @@ fn update_cache_path() -> Option<PathBuf> {
         std::env::var("HOME")
             .ok()
             .map(|h| PathBuf::from(h).join(".cache/portwave/last_check"))
+    }
+}
+
+// Non-blocking cache-only lookup of the latest known release. Returns
+// None if the cache is absent, unreadable, or older than 24 h. Used by
+// the startup banner to tag the current version `(outdated)`/`(latest)`
+// without paying a network round-trip on every invocation.
+fn cached_latest_version() -> Option<String> {
+    let p = update_cache_path()?;
+    let meta = fs::metadata(&p).ok()?;
+    let age = meta.modified().ok()?.elapsed().ok()?;
+    if age > Duration::from_secs(86_400) {
+        return None;
+    }
+    let s = fs::read_to_string(&p).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 
@@ -1781,6 +1812,7 @@ async fn maybe_show_update_banner(disabled: bool, no_prompt: bool) {
 }
 
 async fn run_update() -> anyhow::Result<()> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
     println!("portwave: checking GitHub releases for assassin-marcos/portwave…");
     let result = tokio::task::spawn_blocking(|| {
         self_update::backends::github::Update::configure()
@@ -1810,9 +1842,69 @@ async fn run_update() -> anyhow::Result<()> {
                 }
                 let _ = fs::write(&p, &v);
             }
+            // Fetch + print What's-new changelog (nuclei-style) so the user
+            // sees what they just got. Best-effort: failures are silent
+            // because the update itself already succeeded and we don't want
+            // to muddy the exit code on a flaky network.
+            let notes_res = tokio::time::timeout(
+                Duration::from_secs(4),
+                tokio::task::spawn_blocking({
+                    let cur = current.clone();
+                    move || fetch_release_notes_since(&cur)
+                }),
+            )
+            .await;
+            if let Ok(Ok(Ok(notes))) = notes_res {
+                if !notes.is_empty() {
+                    print_post_update_changelog(&current, &v, &notes);
+                }
+            }
         }
     }
     Ok(())
+}
+
+// Prints a "What's new" block after a successful `portwave --update`,
+// dumping GitHub release notes for every version between the user's old
+// install and the one they just landed on. Mirrors the nuclei UX where
+// the tool tells you what you got instead of leaving you to go read the
+// release page manually.
+fn print_post_update_changelog(from: &str, to: &str, notes: &[(String, String)]) {
+    println!();
+    println!(
+        "\x1b[1m─────── What's new in portwave v{}  (was v{}) ───────\x1b[0m",
+        to, from
+    );
+    // Cap at 5 intermediate versions × 10 lines each so updates that skip
+    // many releases don't flood the terminal. Skips GitHub's auto-generated
+    // section headers ("## What's Changed") and the boilerplate compare link.
+    for (ver, body) in notes.iter().take(5) {
+        println!();
+        println!("  \x1b[1;36mv{}\x1b[0m", ver);
+        let mut printed = 0;
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty()
+                || line.starts_with("## ")
+                || line.starts_with("**Full Changelog**")
+            {
+                continue;
+            }
+            if printed >= 10 {
+                println!("    …");
+                break;
+            }
+            let trimmed: String = line.chars().take(120).collect();
+            println!("    {}", trimmed);
+            printed += 1;
+        }
+        if printed == 0 {
+            println!("    (no release notes attached)");
+        }
+    }
+    println!();
+    println!("\x1b[2m    Full history: https://github.com/assassin-marcos/portwave/releases\x1b[0m");
+    println!();
 }
 
 async fn run_check_update() -> anyhow::Result<()> {
