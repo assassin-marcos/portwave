@@ -28,142 +28,107 @@ struct Args {
     #[arg(index = 1)]
     folder_name: Option<String>,
 
-    /// Comma-separated CIDRs, IPs, or IP ranges (e.g. "203.0.113.0/24,1.2.3.4,5.6.7.10-5.6.7.20")
+    /// Comma-separated CIDRs, IPs, or IP ranges
     #[arg(index = 2)]
     cidr_input: Option<String>,
 
-    /// File with one target per line (CIDR, single IP, or IP range). Merged with <CIDR_INPUT>.
+    /// Targets file (one per line); merges with <CIDR_INPUT>
     #[arg(short = 'i', long)]
     input_file: Option<String>,
 
-    /// Comma-separated ASNs (e.g. "AS13335,AS15169"). Expanded to CIDRs via RIPE stat.
+    /// Comma-separated ASNs (e.g. "AS13335") — expanded via RIPE stat
     #[arg(short = 'a', long)]
     asn: Option<String>,
 
-    /// Comma-separated CIDRs / IPs / IP ranges to SKIP (scope exclusions).
+    /// Comma-separated CIDRs/IPs/ranges to exclude from scope
     #[arg(short = 'e', long)]
     exclude: Option<String>,
 
-    /// Comma-separated ports and port ranges (e.g. "22,80,443,8000-9000").
-    /// Takes precedence over --port-file and the embedded list.
+    /// Comma-separated ports/ranges (e.g. "22,80,443,8000-9000")
     #[arg(short = 'p', long)]
     ports: Option<String>,
 
-    /// Path to comma-separated port list. Falls back to $PORTWAVE_PORTS, config file, then bundled list.
+    /// Path to a comma-separated port-list file
     #[arg(short = 'f', long)]
     port_file: Option<String>,
 
-    /// Max concurrent probes (adaptive controller may shrink this).
-    /// 1500 is a sweet spot on most systems — higher values cause
-    /// ephemeral-port exhaustion on long scans.
+    /// Max concurrent probes (adaptive controller may shrink)
     #[arg(short = 't', long, default_value_t = 1500)]
     threads: usize,
 
-    /// Phase-A connect timeout (ms) — discovery. 800 ms catches slow
-    /// firewalled hosts without bloating total runtime on cold targets.
+    /// Phase-A (discovery) connect timeout, ms
     #[arg(short = 'T', long, default_value_t = 800)]
     timeout_ms: u64,
 
-    /// Phase-B connect timeout (ms) — enrichment/banner
+    /// Phase-B (banner) connect timeout, ms
     #[arg(long, default_value_t = 1500)]
     enrich_timeout_ms: u64,
 
-    /// Retry count for Phase-A timeouts only. 1 catches transient SYN
-    /// drops without doubling scan time (only timeouts retry, not RSTs).
+    /// Retries for Phase-A timeouts only
     #[arg(short = 'r', long, default_value_t = 1)]
     retries: u8,
 
-    /// Base output directory. Falls back to $PORTWAVE_OUTPUT_DIR, config file, then ./scans.
+    /// Output directory (default: ./scans)
     #[arg(short = 'o', long)]
     output_dir: Option<String>,
 
-    /// httpx `-threads` concurrency. Default 150 is the upstream
-    /// recommendation for typical internet scans.
+    /// httpx -threads concurrency
     #[arg(long, default_value_t = 150)]
     httpx_threads: usize,
 
-    /// Extra paths for httpx to probe in addition to `/` (comma-separated,
-    /// e.g. `/actuator,/.git/HEAD,/server-status`). Useful for surfacing
-    /// framework / CI-leak endpoints the default root probe misses.
+    /// Extra paths for httpx besides `/` (comma-separated)
     #[arg(long)]
     httpx_paths: Option<String>,
 
-    /// Follow HTTP redirects in httpx. Auto-enabled under `--asn` since
-    /// most ASN-scanned hosts redirect to a portal / WAF and the final
-    /// status + title is what matters.
+    /// Follow HTTP redirects in httpx (auto with --asn)
     #[arg(long, default_value_t = false)]
     httpx_follow_redirects: bool,
 
-    /// nuclei -c. Matched to --nuclei-max-host-error by default so nuclei
-    /// doesn't emit "concurrency is higher than max-host-error" warnings.
+    /// nuclei -c (concurrency)
     #[arg(long, default_value_t = 25)]
     nuclei_concurrency: usize,
 
-    /// nuclei -rl rate limit (requests per second per host).
+    /// nuclei -rl (per-host rate limit)
     #[arg(long, default_value_t = 200)]
     nuclei_rate: usize,
 
-    /// nuclei -max-host-error. Fail a host after N errors so doomed targets
-    /// don't bleed scan time. 25 matches the concurrency default; raise for
-    /// flaky networks.
+    /// nuclei -max-host-error
     #[arg(long, default_value_t = 25)]
     nuclei_max_host_error: usize,
 
-    /// Don't filter non-HTTP ports out of nuclei_targets.txt. Default is to
-    /// drop ports whose Phase-B banner classified as ssh/smtp/ftp/etc. or
-    /// whose port number is in the "definitely not HTTP" blocklist (22,
-    /// 25, 179, 445, 3306, 5432, 6379, 27017, ...). Opt in to this flag if
-    /// you really want nuclei to run against every open port.
+    /// Run nuclei against every open port (skip HTTP filter)
     #[arg(long, default_value_t = false)]
     nuclei_all_ports: bool,
 
-    /// POST scan_summary.json (with scan_diff.json merged in) to this URL
-    /// once the workflow finishes. Works with Slack/Discord/custom
-    /// collectors. Silent on failure so a flaky webhook doesn't break
-    /// the exit code.
+    /// POST scan summary to this URL on completion
     #[arg(short = 'w', long)]
     webhook: Option<String>,
 
-    /// Opt-in UDP discovery. Sends protocol-specific probes to a curated
-    /// set of well-known UDP ports (DNS, NTP, SNMP, SSDP, mDNS, IKE,
-    /// OpenVPN, memcached, NetBIOS, TFTP, portmap, MSSQL-browser) on
-    /// every target IP and records anything that replies. Off by default
-    /// — TCP-connect scanning covers most services; UDP is slower and
-    /// relies on probe-specific replies.
+    /// Enable UDP discovery on well-known ports (opt-in)
     #[arg(short = 'U', long, default_value_t = false)]
     udp: bool,
 
-    /// Re-fetch CDN/WAF edge CIDRs from upstream (Cloudflare IPs list,
-    /// Fastly public IP API) and write the merged list to the user's
-    /// cache so future scans use it instead of the embedded snapshot.
-    /// Keeps the CDN tagger accurate year-over-year without a new
-    /// release.
+    /// Refresh CDN/WAF edge CIDRs from upstream sources
     #[arg(long, default_value_t = false)]
     refresh_cdn: bool,
 
-    /// Suppress the interactive "install httpx/nuclei via `go install`?"
-    /// prompt when those tools aren't on PATH. Useful for CI / scripted
-    /// runs where an unattended skip is better than a blocked prompt.
+    /// Don't prompt to install httpx/nuclei if missing
     #[arg(long, default_value_t = false)]
     no_install_prompt: bool,
 
-    /// Remove portwave (binary + share dir + cache + optional config).
-    /// Shows exactly what will be deleted and prompts `[y/N]` before
-    /// anything is touched. Same auto-detection logic as uninstall.sh.
+    /// Uninstall portwave (binary + share + cache)
     #[arg(short = 'X', long, default_value_t = false)]
     uninstall: bool,
 
-    /// Skip the uninstall confirmation prompt. Useful for scripted /
-    /// automated removal. Combined with `--uninstall`, nukes portwave
-    /// without user input.
+    /// Skip the uninstall confirmation prompt
     #[arg(short = 'y', long, default_value_t = false)]
     yes: bool,
 
-    /// Skip the httpx HTTP-fingerprint step.
+    /// Skip the httpx HTTP-fingerprint step
     #[arg(long, default_value_t = false)]
     no_httpx: bool,
 
-    /// Skip the nuclei vulnerability-scan step.
+    /// Skip the nuclei vulnerability-scan step
     #[arg(long, default_value_t = false)]
     no_nuclei: bool,
 
@@ -179,42 +144,35 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_tls_sniff: bool,
 
-    /// Disable adaptive concurrency controller
+    /// Disable the adaptive concurrency controller
     #[arg(long, default_value_t = false)]
     no_adaptive: bool,
 
-    /// Filter nuclei templates to match detected protocols (ssh, http, smtp,
-    /// ftp, pop3, imap, tls→ssl+http). Cuts nuclei runtime 30-60 % on
-    /// mixed-port scans by skipping irrelevant template packs.
-    /// Auto-enabled under `--asn`.
+    /// Filter nuclei templates by detected protocol (auto with --asn)
     #[arg(long, default_value_t = false)]
     tags_from_banner: bool,
 
-    /// Download the latest portwave release for this OS+arch and replace the
-    /// running binary in place (no rebuild needed). Requires no positional args.
+    /// Download + install the latest portwave release
     #[arg(short = 'u', long, default_value_t = false)]
     update: bool,
 
-    /// Just check if a newer version is available, then exit.
+    /// Check for a newer version, then exit
     #[arg(short = 'c', long, default_value_t = false)]
     check_update: bool,
 
-    /// Suppress the startup "update available" banner.
+    /// Suppress the "update available" startup banner
     #[arg(long, default_value_t = false)]
     no_update_check: bool,
 
-    /// Suppress only the interactive `Update now? [Y/n]` prompt while
-    /// keeping the banner + changelog visible. Useful for users who
-    /// want to see version drift but don't want a blocking prompt
-    /// at the top of every scan.
+    /// Suppress only the interactive update prompt
     #[arg(long, default_value_t = false)]
     no_update_prompt: bool,
 
-    /// Suppress the startup ASCII banner art.
+    /// Suppress the ASCII banner art
     #[arg(long, default_value_t = false)]
     no_art: bool,
 
-    /// Suppress both the banner and the update notice (equivalent to --no-art --no-update-check).
+    /// Suppress banner + update notice (= --no-art --no-update-check)
     #[arg(short, long, default_value_t = false)]
     quiet: bool,
 }
