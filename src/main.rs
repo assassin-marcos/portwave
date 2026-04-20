@@ -2984,6 +2984,17 @@ async fn main() -> anyhow::Result<()> {
 
     if open_records.is_empty() {
         println!("No open ports. Done.");
+        // Even on 0-open runs, prune the zero-byte files (targets.txt,
+        // nuclei_targets.txt, open_ports.jsonl) so the folder isn't
+        // polluted with empty husks. Summary + diff are kept — they
+        // carry the "I ran but found nothing" signal.
+        for p in [&raw_path, &nuclei_path, &jsonl_path] {
+            if let Ok(meta) = fs::metadata(p) {
+                if meta.len() == 0 {
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -3048,6 +3059,9 @@ async fn main() -> anyhow::Result<()> {
                 .arg("-location")
                 .arg("-title")
                 .arg("-nc")
+                // -silent suppresses the ASCII banner + [WRN] dashboard noise
+                // while still writing real findings to both stdout and -o.
+                .arg("-silent")
                 .arg("-threads").arg(args.httpx_threads.to_string())
                 .arg("-timeout").arg("10")
                 .arg("-retries").arg("1")
@@ -3092,6 +3106,9 @@ async fn main() -> anyhow::Result<()> {
                 .arg("-c").arg(args.nuclei_concurrency.to_string())
                 .arg("-rl").arg(args.nuclei_rate.to_string())
                 .arg("-mhe").arg(args.nuclei_max_host_error.to_string())
+                // -silent suppresses nuclei's ASCII banner + progress spam
+                // while still writing findings to stdout + -o.
+                .arg("-silent")
                 .arg("-o").arg(&nuclei_out);
             if args.tags_from_banner && !by_proto.is_empty() {
             // Cover every protocol the banner classifier can emit (see
@@ -3169,6 +3186,40 @@ async fn main() -> anyhow::Result<()> {
             Ok(Ok(())) => println!("Webhook: posted summary to {}", url),
             Ok(Err(e)) => eprintln!("Webhook: failed ({}) — continuing.", e),
             Err(e) => eprintln!("Webhook: join error ({}) — continuing.", e),
+        }
+    }
+
+    // Auto-remove any zero-byte output files so the user isn't left with
+    // clutter like an empty httpx_results.txt when httpx found nothing.
+    // Keeps the output folder focused on data that actually has content.
+    let cleanup_candidates = [
+        &raw_path,
+        &nuclei_path,
+        &httpx_out,
+        &nuclei_out,
+        &jsonl_path,
+        &diff_path,
+    ];
+    let mut removed: Vec<&PathBuf> = Vec::new();
+    for p in cleanup_candidates {
+        if let Ok(meta) = fs::metadata(p) {
+            if meta.len() == 0 {
+                if fs::remove_file(p).is_ok() {
+                    removed.push(p);
+                }
+            }
+        }
+    }
+    if !removed.is_empty() {
+        println!(
+            "Cleaned up {} empty file(s) from {:?}:",
+            removed.len(),
+            out_dir
+        );
+        for p in removed {
+            if let Some(name) = p.file_name() {
+                println!("  - {}", name.to_string_lossy());
+            }
         }
     }
 
