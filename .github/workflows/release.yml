@@ -20,7 +20,14 @@ permissions:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 so the built binary links against GLIBC 2.35 (the
+    # baseline shared by Ubuntu 22.04 LTS, Debian 12, RHEL 9, and every
+    # newer distro). `ubuntu-latest` drifts to 24.04 (GLIBC 2.39), which
+    # breaks `portwave --update` for every user on an LTS that hasn't
+    # rolled yet. Pinning trades "always the newest kernel/tools" for
+    # "always runs on a long-supported kernel", which is the right
+    # tradeoff for a single-binary release artifact.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -2050,9 +2050,12 @@ async fn run_udp_phase(
     }
     let sem = Arc::new(Semaphore::new(max_concurrency));
     let mut set: JoinSet<Option<OpenPort>> = JoinSet::new();
-    for ip in all_ips {
+    // Labeled break so a closed semaphore (abnormal shutdown) exits both
+    // the port-probe inner loop and the IP-iteration outer loop without
+    // panicking. Mirrors the Phase B graceful-acquire pattern (v0.8.0).
+    'outer: for ip in all_ips {
         for &(port, probe, label) in UDP_PROBES {
-            let p = sem.clone().acquire_owned().await.unwrap();
+            let Ok(p) = sem.clone().acquire_owned().await else { break 'outer; };
             set.spawn(async move {
                 let sa = SocketAddr::new(ip, port);
                 let reply = udp_probe_one(sa, probe, timeout).await?;
