@@ -138,6 +138,18 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_install_prompt: bool,
 
+    /// Remove portwave (binary + share dir + cache + optional config).
+    /// Shows exactly what will be deleted and prompts `[y/N]` before
+    /// anything is touched. Same auto-detection logic as uninstall.sh.
+    #[arg(long, default_value_t = false)]
+    uninstall: bool,
+
+    /// Skip the uninstall confirmation prompt. Useful for scripted /
+    /// automated removal. Combined with `--uninstall`, nukes portwave
+    /// without user input.
+    #[arg(long, default_value_t = false)]
+    yes: bool,
+
     #[arg(long, default_value_t = false)]
     no_httpx: bool,
 
@@ -1854,6 +1866,219 @@ fn cdn_cache_path() -> Option<PathBuf> {
     }
 }
 
+// ────────────────────────── Self-uninstall ──────────────────────────
+
+// Collect every filesystem target that belongs to a portwave install on
+// this machine: binaries + share/ports dir + cache file + optional config
+// directory. Used by `--uninstall`. Mirrors the bash uninstall.sh layout
+// one-for-one.
+fn uninstall_collect_targets() -> (Vec<PathBuf>, Vec<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+    #[cfg(unix)]
+    let home = std::env::var("HOME").ok();
+    #[cfg(not(unix))]
+    let home: Option<String> = None;
+    let _ = &home; // suppress unused warning on Windows targets
+
+    // 1. Binaries
+    let mut bin_candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = find_binary("portwave") {
+        bin_candidates.push(p.clone());
+        if let Ok(canon) = p.canonicalize() {
+            if canon != p {
+                bin_candidates.push(canon);
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        if let Some(h) = &home {
+            let h = PathBuf::from(h);
+            bin_candidates.push(h.join(".local/bin/portwave"));
+            bin_candidates.push(h.join("bin/portwave"));
+            bin_candidates.push(h.join(".cargo/bin/portwave"));
+        }
+        bin_candidates.push(PathBuf::from("/usr/local/bin/portwave"));
+        bin_candidates.push(PathBuf::from("/opt/homebrew/bin/portwave"));
+        bin_candidates.push(PathBuf::from("/opt/local/bin/portwave"));
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(up) = std::env::var("USERPROFILE") {
+            let up = PathBuf::from(up);
+            bin_candidates.push(up.join(".local\\bin\\portwave.exe"));
+            bin_candidates.push(up.join("bin\\portwave.exe"));
+            bin_candidates.push(up.join(".cargo\\bin\\portwave.exe"));
+        }
+        if let Ok(la) = std::env::var("LOCALAPPDATA") {
+            bin_candidates.push(PathBuf::from(la).join("Programs\\portwave\\portwave.exe"));
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            bin_candidates.push(PathBuf::from(pf).join("portwave\\portwave.exe"));
+        }
+    }
+
+    // Dedupe existing files only.
+    let mut bins: Vec<PathBuf> = Vec::new();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for c in bin_candidates {
+        let canon = c.canonicalize().unwrap_or_else(|_| c.clone());
+        if c.is_file() && seen.insert(canon) {
+            bins.push(c);
+        }
+    }
+
+    // 2. Share directories
+    let mut shares: Vec<PathBuf> = Vec::new();
+    #[cfg(unix)]
+    {
+        if let Some(h) = &home {
+            shares.push(PathBuf::from(h).join(".local/share/portwave"));
+        }
+        shares.push(PathBuf::from("/usr/local/share/portwave"));
+        shares.push(PathBuf::from("/opt/homebrew/share/portwave"));
+        shares.push(PathBuf::from("/opt/local/share/portwave"));
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(up) = std::env::var("USERPROFILE") {
+            shares.push(PathBuf::from(up).join(".local\\share\\portwave"));
+        }
+        if let Ok(la) = std::env::var("LOCALAPPDATA") {
+            shares.push(PathBuf::from(la).join("portwave"));
+        }
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            shares.push(PathBuf::from(pf).join("share\\portwave"));
+        }
+    }
+    let shares: Vec<PathBuf> = shares.into_iter().filter(|d| d.is_dir()).collect();
+
+    // 3. Config directory (Unix: ~/.config/portwave; Windows: %APPDATA%/portwave)
+    let cfg = default_config_path().and_then(|p| p.parent().map(|d| d.to_path_buf())).filter(|d| d.is_dir());
+
+    // 4. Cache directory
+    let cache = update_cache_path().and_then(|p| p.parent().map(|d| d.to_path_buf())).filter(|d| d.is_dir());
+
+    (bins, shares, cfg, cache)
+}
+
+async fn run_uninstall(skip_prompt: bool) -> anyhow::Result<()> {
+    let (bins, shares, cfg, cache) = uninstall_collect_targets();
+
+    println!("portwave uninstaller");
+    println!();
+
+    if bins.is_empty() && shares.is_empty() && cfg.is_none() && cache.is_none() {
+        eprintln!("[!] No portwave installation found on this system.");
+        eprintln!("    Nothing to remove. If portwave isn't installed yet, run install.sh (or install.ps1 on Windows) first.");
+        return Ok(());
+    }
+
+    // Show the plan
+    println!("About to REMOVE:");
+    for b in &bins {
+        println!("  binary  : {}", b.display());
+    }
+    for s in &shares {
+        println!("  share   : {}", s.display());
+    }
+    if let Some(c) = &cfg {
+        println!("  config  : {}  (will ask per directory)", c.display());
+    }
+    if let Some(c) = &cache {
+        println!("  cache   : {}", c.display());
+    }
+    println!();
+
+    // Confirmation
+    if !skip_prompt {
+        #[cfg(unix)]
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+        #[cfg(not(unix))]
+        let is_tty = true;
+
+        if !is_tty {
+            eprintln!("[!] stdin is not a TTY and --yes was not passed — aborting to be safe.");
+            eprintln!("    Re-run interactively or add --yes to proceed.");
+            return Ok(());
+        }
+
+        eprint!("Proceed? [y/N] ");
+        use std::io::Write as _;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !line.trim().eq_ignore_ascii_case("y") && !line.trim().eq_ignore_ascii_case("yes") {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Execute
+    let mut removed_bins = 0usize;
+    for b in &bins {
+        match fs::remove_file(b) {
+            Ok(_) => {
+                println!("removed {}", b.display());
+                removed_bins += 1;
+            }
+            Err(e) => eprintln!("could not remove {}: {} (check permissions)", b.display(), e),
+        }
+    }
+    for s in &shares {
+        match fs::remove_dir_all(s) {
+            Ok(_) => println!("removed {}", s.display()),
+            Err(e) => eprintln!("could not remove {}: {}", s.display(), e),
+        }
+    }
+    if let Some(c) = &cache {
+        match fs::remove_dir_all(c) {
+            Ok(_) => println!("removed {}", c.display()),
+            Err(e) => eprintln!("could not remove {}: {}", c.display(), e),
+        }
+    }
+    if let Some(c) = &cfg {
+        if !skip_prompt {
+            eprint!("Delete config directory {}? [y/N] ", c.display());
+            use std::io::Write as _;
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            if line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes") {
+                match fs::remove_dir_all(c) {
+                    Ok(_) => println!("removed {}", c.display()),
+                    Err(e) => eprintln!("could not remove {}: {}", c.display(), e),
+                }
+            } else {
+                println!("kept {}", c.display());
+            }
+        } else {
+            let _ = fs::remove_dir_all(c);
+            println!("removed {}", c.display());
+        }
+    }
+
+    println!();
+    if removed_bins > 0 {
+        println!("portwave uninstalled. ({} binary file(s) removed)", removed_bins);
+    } else {
+        println!("portwave uninstalled. (no binaries were removed — check permissions)");
+    }
+
+    #[cfg(windows)]
+    {
+        // On Windows you can't delete a running .exe. Warn if our binary is one of them.
+        if let Ok(exe) = std::env::current_exe() {
+            if bins.iter().any(|b| b.canonicalize().ok() == exe.canonicalize().ok()) {
+                eprintln!();
+                eprintln!("[!] On Windows you cannot delete a running .exe. If {} still exists,", exe.display());
+                eprintln!("    close this terminal and manually remove the file, or reboot and retry.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_refresh_cdn() -> anyhow::Result<()> {
     println!("portwave: refreshing CDN ranges from upstream…");
     let mut entries: Vec<String> = Vec::new();
@@ -1951,6 +2176,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.refresh_cdn {
         return run_refresh_cdn().await;
+    }
+    if args.uninstall {
+        return run_uninstall(args.yes).await;
     }
 
     // Positional args required for a real scan, unless --input-file / --asn supplies them.
