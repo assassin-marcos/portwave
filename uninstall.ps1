@@ -1,4 +1,10 @@
-# portwave uninstaller (Windows)
+# portwave uninstaller (Windows) — LEGACY FALLBACK.
+#
+# Preferred since v0.8.6:   portwave --uninstall
+# This script is kept as a zero-binary-dependency escape hatch for
+# cases where the portwave binary is missing, corrupt, or otherwise
+# unrunnable. Functionally identical to `portwave --uninstall`.
+#
 # Auto-detects the installed binary via `Get-Command portwave` plus a list
 # of common install prefixes, then removes it and its associated share /
 # config directories. If no installation is found, alerts the user and

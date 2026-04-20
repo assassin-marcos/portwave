@@ -101,6 +101,16 @@ portwave --check-update    # report whether a newer version exists
 The default 1433-port list, CDN CIDR snapshot, and banner art are baked into the binary — `--update` always ships the current versions.
 
 ### Uninstall
+
+Preferred — one command, all platforms:
+
+```bash
+portwave --uninstall           # interactive, shows plan + prompts [y/N]
+portwave --uninstall --yes     # non-interactive (for scripts / CI)
+```
+
+Legacy (kept as a fallback if the binary is missing or broken):
+
 ```bash
 bash uninstall.sh                                         # Linux / macOS
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1  # Windows
