@@ -384,18 +384,33 @@ fn resolve_path(
 
 // Raise the file-descriptor soft limit so thousands of concurrent sockets work.
 // On Windows this is a no-op: socket handles aren't bounded by RLIMIT_NOFILE.
+//
+// v0.12.4 bug fix: previously this hardcoded want=50_000 and always set
+// rlim_cur to that min'd with hard_max. On systems where the user had
+// already configured a *higher* soft limit (modern Linux defaults to
+// 1 048 576 on many distros), we were silently *downgrading* them to
+// 50 K, capping concurrency on large scans. Now we only upgrade.
 #[cfg(unix)]
 fn raise_fd_limit() {
     unsafe {
         let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-            let want: libc::rlim_t = 50_000;
-            if rlim.rlim_max < want {
-                rlim.rlim_max = want;
-            }
-            rlim.rlim_cur = want.min(rlim.rlim_max);
-            libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
+            return;
         }
+        // If the existing soft limit is already generous, leave it alone.
+        // Target 1 M — the Linux kernel ceiling since 5.x and enough
+        // headroom for any scan portwave realistically runs.
+        let want: libc::rlim_t = 1_048_576;
+        if rlim.rlim_cur >= want {
+            return;
+        }
+        // Never exceed the hard limit (we'd need CAP_SYS_RESOURCE for that).
+        let new_cur = want.min(rlim.rlim_max);
+        if new_cur <= rlim.rlim_cur {
+            return; // can't improve — hard limit caps us below `want`
+        }
+        rlim.rlim_cur = new_cur;
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
     }
 }
 
@@ -3572,7 +3587,12 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // MPMC work queue + hit channel.
-    let (work_tx, work_rx) = flume::bounded::<SocketAddr>(args.threads * 4);
+    // v0.12.4: bumped from threads*4 to threads*8. With the FD-limit fix
+    // letting us run genuinely wide concurrency, the old bound could
+    // starve workers momentarily between producer batches on large scans.
+    // Doubling the capacity smooths the producer-worker handoff with ~5 KB
+    // extra memory at threads=1500 (SocketAddr is 28 B on 64-bit Linux).
+    let (work_tx, work_rx) = flume::bounded::<SocketAddr>(args.threads * 8);
     // Bounded so Phase A workers can't let the hit-receive queue grow
     // unbounded if the writer is slow. 2048 is generous — opens are rare
     // relative to probes (even a hot /24 rarely hits double-digit

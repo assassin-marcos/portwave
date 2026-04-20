@@ -48,35 +48,37 @@ Exact command:
 
 ## Feature matrix
 
+Every cell below was verified against the current source of each tool as of the last README update. No "❌" unless the feature was checked and truly missing.
+
 |                                    | masscan | rustscan | naabu | **portwave** |
 |------------------------------------|:---:|:---:|:---:|:---:|
-| IPv4 + IPv6 TCP discovery          | ⚠️ | ⚠️ | ✅ | ✅ |
+| IPv4 + IPv6 TCP discovery          | ⚠️ SYN only | ✅ | ✅ experimental | ✅ |
 | Smart IPv6 scanning (RFC 7707 patterns) | ❌ | ❌ | ❌ | ✅ |
-| Scope safety net (refuse 2^20+ hosts by default) | ❌ | ❌ | ❌ | ✅ |
-| Adaptive concurrency (local-error) | ❌ | ❌ | ❌ | ✅ |
-| Banner grab + protocol classify    | ❌ | ❌ | partial | ✅ |
-| TLS sniff on non-443               | ❌ | ❌ | ❌ | ✅ |
-| CDN / WAF edge tagging             | ❌ | ❌ | ❌ | ✅ |
-| ASN expansion built in             | ❌ | ❌ | ❌ | ✅ |
+| Scope safety net (refuse 2²⁰+ hosts by default) | ❌ | ❌ | ❌ | ✅ |
+| Adaptive concurrency (local-resource error) | ❌ | ⚠️ static ulimit-batch only | ❌ | ✅ |
+| Banner grab / protocol classify    | ✅ `--banners` | ⚠️ via nmap passthrough | ⚠️ via nmap `-sV` | ✅ native |
+| TLS sniff on non-443               | ⚠️ `--hello ssl` per port | ❌ | ⚠️ gated `ENABLE_TLS_DETECTION` env | ✅ |
+| CDN / WAF edge tagging             | ❌ | ❌ | ⚠️ tag + exclude only (`-cdn`, `-exclude-cdn`) | ✅ |
+| ASN expansion built in             | ❌ | ❌ | ✅ | ✅ |
 | Top-20 priority port scan (early results) | ❌ | ❌ | ❌ | ✅ |
-| Nmap-style `--top-ports N`         | ✅ | ✅ | ❌ | ✅ |
-| UDP top-20 opt-in                  | partial | ❌ | partial | ✅ |
-| Global packet-per-second cap (`--max-pps`) | ✅ | ❌ | ✅ | ✅ |
+| Nmap-style `--top-ports N`         | ✅ | ⚠️ `--top` boolean only | ⚠️ preset `100/1000/full` only | ✅ any N |
+| UDP well-known-port opt-in         | ✅ `U:port` syntax | ✅ `--udp` | ⚠️ `-p u:port` syntax | ✅ `--udp` |
+| Global packet-per-second cap       | ✅ `--rate` | ❌ | ✅ `-rate` | ✅ `--max-pps` |
 | Wallclock budget (`--max-scan-time`) | ❌ | ❌ | ❌ | ✅ |
-| Dry-run / scan-plan preview        | ❌ | ❌ | ❌ | ✅ |
+| Dry-run / scan-plan preview        | ✅ `--offline` | ❌ | ❌ | ✅ |
 | `scan_diff.json` vs. prior run     | ❌ | ❌ | ❌ | ✅ |
 | Webhook on completion              | ❌ | ❌ | ❌ | ✅ |
 | Webhook only on diff change        | ❌ | ❌ | ❌ | ✅ |
-| NDJSON stream to stdout            | ❌ | ❌ | partial | ✅ |
-| Dynamic CDN list refresh           | ❌ | ❌ | ❌ | ✅ |
-| Exclude list (scope discipline)    | ✅ | ❌ | ✅ | ✅ |
-| Resume after crash / Ctrl+C        | ❌ | ❌ | ❌ | ✅ |
-| Built-in httpx + nuclei chain      | ❌ | plugin | chain | ✅ |
-| Structured JSON artefacts          | ❌ | ❌ | partial | ✅ |
-| Self-update (`--update`)           | ❌ | ❌ | ❌ | ✅ |
+| NDJSON output                      | ⚠️ file-based `-oD` | ❌ | ✅ `-j/-jsonl` | ✅ stdout + file |
+| Dynamic CDN list refresh (runtime) | ❌ | ❌ | ⚠️ via lib release cycle | ✅ live upstream |
+| Exclude list / exclude-file        | ✅ | ✅ | ✅ | ✅ |
+| Resume after crash / Ctrl+C        | ✅ `--resume paused.conf` | ❌ | ✅ `-resume` | ✅ |
+| Built-in httpx + nuclei chain      | ❌ | ⚠️ nmap only | ⚠️ `-nmap-cli` only | ✅ httpx + nuclei |
+| Structured JSON output files       | ✅ `-oJ` | ❌ greppable only | ✅ `-j` + `-csv` | ✅ |
+| Self-update (`--update`)           | ❌ | ❌ | ✅ `-up` | ✅ |
 | Self-uninstall (`--uninstall`)     | ❌ | ❌ | ❌ | ✅ |
-| Clear input validation errors      | ❌ | partial | partial | ✅ |
-| Single static cross-platform binary| ✅ | ✅ | ✅ | ✅ |
+| Clear input validation errors      | ⚠️ some `hint:` lines | ✅ | ✅ `validate.go` | ✅ |
+| Single static cross-platform binary | ⚠️ compile per platform | ✅ | ⚠️ needs libpcap/Npcap for SYN | ✅ |
 
 ---
 
@@ -258,21 +260,40 @@ Every scan writes to `<OUTPUT_DIR>/<FOLDER_NAME>/`:
 | `httpx_results.txt`  | httpx output |
 | `nuclei_results.txt` | nuclei output |
 
-Example live terminal:
+Example live terminal (ANSI colors in a real TTY — here shown plain):
 ```text
---- OPEN PORTS (4 total, 2 on CDN edge) ---
-  151.101.1.1:80   [http, cdn:fastly]        HTTP/1.1 200 OK
-  151.101.1.1:443  [http, tls, cdn:fastly]   HTTP/1.1 200 OK
-  203.0.113.42:22  [ssh]                     SSH-2.0-OpenSSH_8.9p1
-  203.0.113.42:443 [http, tls]               HTTP/1.1 200 OK
+[+] 151.101.1.1:80 opened
+[+] 151.101.1.1:443 opened
+[+] 203.0.113.42:22 opened
+[+] 203.0.113.42:443 opened
+⠙ [00:06:28] ████████████████████████ 363982/363982 (100%) 938/s · ETA 0s 75 open
+Phase A done: 75 new open ports.
 
-Totals — 363,982 probes  ·  open: 75  ·  closed: 68  ·  filtered: 363,839 (99.94%)
+Totals — 363,982 probes · open: 75 · closed: 68 · filtered: 363,839 (99.94%) · local_err: 0
+
+--- OPEN PORTS (75 total across 12 hosts) ---
+  151.101.1.1
+      :80   [http, cdn:fastly]     HTTP/1.1 200 OK
+      :443  [https, cdn:fastly]
+  203.0.113.42
+      :22   [ssh]                  SSH-2.0-OpenSSH_8.9p1
+      :443  [https]
+  (...)
+
+Results: 75 open · 6m30s · ./scans/acme
 ```
+
+Live behavior:
+- **`[+] IP:PORT opened`** — hits streamed as they're discovered (bright green). Disable with `--no-live-hits`.
+- **Progress bar** shows `938/s` probe rate + ETA so you can spot a stuck scan instantly.
+- **Totals** colored by state: open = green, closed = dim, filtered = yellow above 50 %, local_err = red when > 0.
+- **OPEN PORTS** grouped by host (nmap-style); port labels colored by protocol — `http` green, `https` bright cyan, database protocols bright magenta, IoT/ICS bright red, TLS yellow.
 
 Metric meanings:
 - **open** — TCP handshake completed
 - **closed** — RST / ICMP-unreachable (port closed, host alive)
 - **filtered** — no reply within timeout (firewall dropped SYN or host down)
+- **local_err** — our OS pushed back (ephemeral-port / FD / buffer full) — investigate if non-zero
 
 ---
 
