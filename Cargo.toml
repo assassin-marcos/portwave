@@ -1,6 +1,6 @@
 [package]
 name = "portwave"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 description = "Ultra-fast, IP-focused IPv4/IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, CDN tagging, scan-diff, webhook, self-update, and a built-in httpx + nuclei recon pipeline."
 license = "MIT"

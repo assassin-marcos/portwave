@@ -33,10 +33,23 @@ jobs:
         run: |
           cd target/x86_64-unknown-linux-gnu/release
           tar czf ../../../portwave-x86_64-unknown-linux-gnu.tar.gz portwave
+      - name: Extract release notes from commit body
+        run: |
+          # portwave ships by direct push (no PRs), so GitHub's
+          # generate_release_notes produces empty bodies. Use the commit
+          # body — everything after the first blank line of the HEAD
+          # commit message — as the release body instead.
+          git log -1 --pretty=format:'%b' HEAD > release_notes.md
+          # Fallback: if the commit had no body, use the tag annotation.
+          if [ ! -s release_notes.md ]; then
+            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release_notes.md
+          fi
+          echo '--- release_notes.md ---'
+          cat release_notes.md
       - uses: softprops/action-gh-release@v2
         with:
           files: portwave-x86_64-unknown-linux-gnu.tar.gz
-          generate_release_notes: true
+          body_path: release_notes.md
 
   macos:
     # macos-14 = Apple Silicon. Builds aarch64 natively + x86_64 via cross.
@@ -60,12 +73,18 @@ jobs:
           cd target/x86_64-apple-darwin/release  && tar czf ../../../portwave-x86_64-apple-darwin.tar.gz  portwave && cd -
           ls -la portwave-*.tar.gz
 
+      - name: Extract release notes from commit body
+        run: |
+          git log -1 --pretty=format:'%b' HEAD > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release_notes.md
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             portwave-aarch64-apple-darwin.tar.gz
             portwave-x86_64-apple-darwin.tar.gz
-          generate_release_notes: true
+          body_path: release_notes.md
 
   windows:
     runs-on: windows-latest
@@ -82,7 +101,14 @@ jobs:
         run: |
           Compress-Archive -Path target/x86_64-pc-windows-msvc/release/portwave.exe `
                            -DestinationPath portwave-x86_64-pc-windows-msvc.zip
+      - name: Extract release notes from commit body
+        shell: bash
+        run: |
+          git log -1 --pretty=format:'%b' HEAD > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release_notes.md
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: portwave-x86_64-pc-windows-msvc.zip
-          generate_release_notes: true
+          body_path: release_notes.md
