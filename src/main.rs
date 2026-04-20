@@ -1377,6 +1377,11 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
             tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await
         {
             if n > 0 && buf.starts_with(b"HTTP/") {
+                // If the port is canonically HTTPS but we somehow got a
+                // plain HTTP reply (some targets speak HTTP on 443 for
+                // redirect-to-https), label it "http" still — the TLS
+                // refinement block below will override if we also detect
+                // TLS bytes via the dedicated sniff path.
                 out.protocol = Some("http".into());
                 if want_banner {
                     out.banner = Some(
@@ -1410,6 +1415,38 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
                     }
                 }
             }
+        }
+    }
+
+    // ── Port-aware classification refinement ──
+    // Before v0.12.1 every TLS-confirmed port showed as "[unknown, tls]"
+    // because our plaintext HTTP probe fails on a real TLS stack. And
+    // port 8443 in particular showed plain "[unknown]" when TLS sniff
+    // itself failed (the minimal ClientHello has no SNI, so strict
+    // servers close on us). Both cases were confusing UX for what is
+    // in practice almost always HTTPS.
+    //
+    // When we hit a port that's canonically HTTPS (443, 4443, 8443,
+    // 9443, 10443) and didn't learn a better protocol, label it
+    // "https". Leaves genuine ssh/smtp/etc. banners alone — those are
+    // deliberate overrides and classifying them as https would be a
+    // real error. Also leaves the "tls" label for non-canonical ports
+    // where we only confirmed TLS but don't know what's on top.
+    let is_canonical_https_port = matches!(sa.port(), 443 | 4443 | 8443 | 9443 | 10443);
+    if is_canonical_https_port {
+        match out.protocol.as_deref() {
+            // "tls" → "https" on a canonical HTTPS port. No change to
+            // out.tls (still true — we did confirm TLS).
+            Some("tls") => out.protocol = Some("https".into()),
+            // Unclassified open port on a canonical HTTPS port. Best
+            // guess is HTTPS — a 10x better UX than "unknown". tls stays
+            // whatever we actually learned (true if sniff succeeded /
+            // auto-set on 443, false if sniff failed on 8443-style
+            // SNI-requiring servers). Users reading scan_summary can
+            // tell from (tls=false, banner=null) that the label is
+            // inferred from port number, not verified at the protocol.
+            None => out.protocol = Some("https".into()),
+            _ => {}
         }
     }
 
@@ -1663,6 +1700,67 @@ async fn producer(
 
 // Returns true if stderr looks like a terminal (so ANSI colour + banner art
 // are safe). On non-TTY (piped / redirected / CI) we stay plain.
+// Tiny color helpers. Only emit ANSI codes when stdout is an actual
+// terminal — piping to a file or another tool gives plain text so grep
+// / jq / awk stay happy. Checked once at startup and stashed in a
+// thread-local-ish Atomic so the per-port print loop doesn't syscall.
+static STDOUT_IS_TTY: AtomicBool = AtomicBool::new(false);
+
+fn init_stdout_color() {
+    #[cfg(unix)]
+    let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) != 0 };
+    #[cfg(not(unix))]
+    let tty = true;
+    STDOUT_IS_TTY.store(tty, Ordering::Relaxed);
+}
+
+fn cfmt(code: &str, text: &str) -> String {
+    if STDOUT_IS_TTY.load(Ordering::Relaxed) {
+        format!("\x1b[{}m{}\x1b[0m", code, text)
+    } else {
+        text.to_string()
+    }
+}
+
+// Color palette for the OPEN PORTS table. Kept consistent across
+// output so users build muscle memory: green = HTTP/open services,
+// cyan = HTTPS/TLS-protected, yellow = TLS-only or known service
+// banners, red = error-coded HTTP responses, magenta = CDN-edge,
+// dim grey = unknown/opaque.
+fn color_protocol(proto: &str) -> String {
+    match proto {
+        "http"        => cfmt("32", proto),         // green
+        "https"       => cfmt("1;36", proto),       // bright cyan
+        "ssh"         => cfmt("1;33", proto),       // bright yellow
+        "ftp" | "smtp" | "smtp_or_ftp" | "pop3" | "imap"
+                      => cfmt("33", proto),         // yellow
+        "tls"         => cfmt("36", proto),         // cyan
+        "unknown"     => cfmt("2", proto),          // dim
+        _             => proto.to_string(),
+    }
+}
+
+fn color_banner_status(banner: &str) -> String {
+    // Tag HTTP status codes by class: 2xx green, 3xx cyan, 4xx yellow, 5xx red.
+    // Only applies when the banner looks like an HTTP status line.
+    if let Some(rest) = banner.strip_prefix("HTTP/") {
+        if let Some((_ver, after_ver)) = rest.split_once(' ') {
+            let code = after_ver.chars().take(3).collect::<String>();
+            let color = match code.chars().next() {
+                Some('2') => "32",    // green
+                Some('3') => "36",    // cyan
+                Some('4') => "33",    // yellow
+                Some('5') => "31",    // red
+                _ => "",
+            };
+            if !color.is_empty() {
+                return cfmt(color, banner);
+            }
+        }
+    }
+    banner.to_string()
+}
+
 fn atty_like_stderr() -> bool {
     #[cfg(unix)]
     {
@@ -2623,6 +2721,10 @@ async fn run_refresh_cdn() -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
 
+    // Initialize the stdout-TTY flag used by the color helpers.
+    // Checked once here so per-port-print loop skips the syscall.
+    init_stdout_color();
+
     // ASN scans touch a much wider, noisier target set than hand-picked
     // CIDRs. Auto-enable the two flags that give the most useful results
     // in that context:
@@ -3568,14 +3670,20 @@ async fn main() -> anyhow::Result<()> {
     // httpx might report fewer hits (non-HTTP services like SSH show up here
     // but don't produce httpx output).
     let cdn_count = open_records.iter().filter(|o| o.cdn.is_some()).count();
+    let cdn_suffix = if cdn_count > 0 {
+        format!(", {} on CDN edge", cdn_count)
+    } else {
+        String::new()
+    };
+    // Bold-green header when there's at least one open; dim grey otherwise.
+    // Makes the "did this find anything?" question answerable at a glance.
+    let header_color = if open_records.is_empty() { "2" } else { "1;32" };
     println!(
-        "\n--- OPEN PORTS ({} total{}) ---",
-        open_records.len(),
-        if cdn_count > 0 {
-            format!(", {} on CDN edge", cdn_count)
-        } else {
-            String::new()
-        }
+        "\n{}",
+        cfmt(
+            header_color,
+            &format!("--- OPEN PORTS ({} total{}) ---", open_records.len(), cdn_suffix),
+        )
     );
     for op in &open_records {
         let host = match op.ip.parse::<IpAddr>() {
@@ -3583,18 +3691,30 @@ async fn main() -> anyhow::Result<()> {
             _ => op.ip.clone(),
         };
         let proto = op.protocol.as_deref().unwrap_or("unknown");
-        let tls_tag = if op.tls { ", tls" } else { "" };
-        let cdn_tag = match &op.cdn {
-            Some(c) => format!(", cdn:{}", c),
-            None => String::new(),
-        };
         let banner = op.banner.as_deref().unwrap_or("");
+
+        // Compose a colored [proto, tls, cdn:x] tag bundle. TLS is only
+        // printed as a separate tag when the protocol isn't already
+        // "https" (which implies TLS) — avoids the redundant
+        // "[https, tls]" that v0.12.0 produced on port 443.
+        let mut tags: Vec<String> = Vec::with_capacity(3);
+        tags.push(color_protocol(proto));
+        if op.tls && proto != "https" {
+            tags.push(cfmt("33", "tls"));
+        }
+        if let Some(c) = &op.cdn {
+            tags.push(cfmt("35", &format!("cdn:{}", c)));
+        }
+        let tag_bundle = format!("[{}]", tags.join(cfmt("2", ", ").as_str()));
+
+        // Host:port in bold, tag bundle colored, banner colored by status class.
+        let hostport = cfmt("1", &format!("{}:{}", host, op.port));
+
         if banner.is_empty() {
-            println!("  {}:{}  [{}{}{}]", host, op.port, proto, tls_tag, cdn_tag);
+            println!("  {}  {}", hostport, tag_bundle);
         } else {
-            // Trim banner to one line, max 120 cols for terminal sanity.
             let b: String = banner.chars().take(120).collect();
-            println!("  {}:{}  [{}{}{}]  {}", host, op.port, proto, tls_tag, cdn_tag, b);
+            println!("  {}  {}  {}", hostport, tag_bundle, color_banner_status(&b));
         }
     }
 
@@ -3617,8 +3737,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── httpx ──
+    // Skip the subprocess entirely if (a) no open ports were found at all
+    // or (b) none of the open ports passed the HTTP-candidate filter
+    // (i.e., everything was SSH / BGP / MySQL / Redis etc.). Spawning
+    // httpx on a non-HTTP-only hit list just burns a subprocess and
+    // produces an empty file that auto-prune deletes.
+    let raw_targets_nonempty = std::fs::metadata(&raw_path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    let nuclei_targets_has_http = std::fs::metadata(&nuclei_path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
     if args.no_httpx {
         println!("Skipping httpx (--no-httpx).");
+    } else if !raw_targets_nonempty {
+        println!("Skipping httpx — no open ports to probe.");
+    } else if !nuclei_targets_has_http {
+        println!("Skipping httpx — no HTTP-candidate ports (all opens were non-HTTP services).");
     } else {
         // Resolve: env → config → PATH. Offer to install if still missing.
         let mut httpx_bin = resolve_tool("httpx", &cfg, "PORTWAVE_HTTPX_BIN");
@@ -3667,8 +3802,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── nuclei ──
+    // Same guard as httpx: if the filtered nuclei target list is empty
+    // (everything was non-HTTP like SSH/BGP/MySQL), skip the subprocess
+    // entirely. Addresses the case where e.g. a range exposes only port
+    // 179 (BGP) — there's nothing for nuclei to do and spawning it just
+    // produces empty artefacts.
+    let nuclei_targets_nonempty = std::fs::metadata(&nuclei_path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
     if args.no_nuclei {
         println!("Skipping nuclei (--no-nuclei).");
+    } else if !nuclei_targets_nonempty {
+        println!("Skipping nuclei — no HTTP-candidate ports to probe (non-HTTP services filtered out).");
     } else {
         let mut nuclei_bin = resolve_tool("nuclei", &cfg, "PORTWAVE_NUCLEI_BIN");
         if nuclei_bin.is_none() {
