@@ -1556,7 +1556,15 @@ async fn phase_a(
     // internal Mutex on every call — at 10–15 K probes/sec × 1500 workers
     // the contention shows up on profiles. Instead, keep a per-worker
     // local counter and flush every PB_BATCH probes (or on exit).
-    const PB_BATCH: u64 = 64;
+    //
+    // v0.13.4: reduced 64 → 8. On firewalled scans (>99 % timeouts),
+    // probes complete in 800 ms bursts. With batch=64 most workers would
+    // accumulate <64 probes per burst and only flush to pb on worker
+    // exit, making indicatif's per-second rate calculator under-report
+    // (users saw "0.5/s · ETA 4d" on scans actually running at 700/s).
+    // Batch=8 updates pb 8× more often with negligible lock contention
+    // (still 8× fewer than unbatched); rate + ETA now track reality.
+    const PB_BATCH: u64 = 8;
     let mut pb_accum: u64 = 0;
     // Throttle the "open: <addr>" message to once per second per worker —
     // otherwise a hot /24 with 100 opens drowns the bar in redraws.
