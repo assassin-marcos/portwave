@@ -1,15 +1,28 @@
 [package]
 name = "portwave"
-version = "0.8.8"
+version = "0.8.9"
 edition = "2021"
-description = "Ultra-fast hybrid IPv4/IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, and httpx/nuclei pipeline."
+description = "Ultra-fast, IP-focused IPv4/IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, CDN tagging, scan-diff, webhook, self-update, and a built-in httpx + nuclei recon pipeline."
 license = "MIT"
 repository = "https://github.com/assassin-marcos/portwave"
 homepage = "https://github.com/assassin-marcos/portwave"
+documentation = "https://github.com/assassin-marcos/portwave#readme"
 readme = "README.md"
-keywords = ["port-scanner", "network", "security", "recon", "ipv6"]
+keywords = ["port-scanner", "network-scanner", "security", "recon", "bugbounty"]
 categories = ["command-line-utilities", "network-programming"]
 authors = ["assassin-marcos"]
+rust-version = "1.75"
+# Ship all artefacts crates.io needs, exclude build outputs + temp dirs
+# that would bloat the uploaded .crate file.
+include = [
+    "src/**/*",
+    "ports/*.txt",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+]
 
 [[bin]]
 name = "portwave"

@@ -2287,7 +2287,39 @@ async fn run_refresh_cdn() -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // ASN scans touch a much wider, noisier target set than hand-picked
+    // CIDRs. Auto-enable the two flags that give the most useful results
+    // in that context:
+    //   --tags-from-banner      → nuclei only runs templates matching
+    //                             detected protocols, avoiding template
+    //                             floods against 10 K+ random hosts.
+    //   --httpx-follow-redirects → most ASN hosts return 30x chains to
+    //                             a portal / WAF; following them gives
+    //                             meaningful status + title, not just
+    //                             "[302] [Moved]".
+    // The user can still disable these by editing their invocation; the
+    // clap default_value_t means they don't need to be passed manually
+    // under --asn. We print a one-line info note so the behaviour is
+    // not surprising.
+    if args.asn.is_some() {
+        let mut notes: Vec<&str> = Vec::new();
+        if !args.tags_from_banner {
+            args.tags_from_banner = true;
+            notes.push("--tags-from-banner");
+        }
+        if !args.httpx_follow_redirects {
+            args.httpx_follow_redirects = true;
+            notes.push("--httpx-follow-redirects");
+        }
+        if !notes.is_empty() && !args.quiet {
+            eprintln!(
+                "[asn] auto-enabled {} for maximum result coverage",
+                notes.join(" + ")
+            );
+        }
+    }
 
     // Banner art — first thing on screen (but skip when piped or quieted).
     let show_art = !args.quiet && !args.no_art && atty_like_stderr();
