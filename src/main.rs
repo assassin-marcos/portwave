@@ -4229,6 +4229,16 @@ async fn main() -> anyhow::Result<()> {
                 // -silent suppresses the ASCII banner + [WRN] dashboard noise
                 // while still writing real findings to both stdout and -o.
                 .arg("-silent")
+                // -no-fallback (v0.13.2): without this, httpx "scheme fallback"
+                // silently drops the port we asked about when its TLS probe
+                // fails. E.g. given `1.1.1.4:443`, if the TLS handshake fails
+                // (no SNI / cert mismatch), httpx falls back to probing
+                // `http://1.1.1.4` on port 80 and outputs THAT — making users
+                // think port 443 is missing. With -nf, httpx probes the
+                // requested scheme/port as-is and reports both http and https
+                // independently per target. See portwave issue where
+                // Cloudflare :443 targets silently disappeared from output.
+                .arg("-no-fallback")
                 .arg("-threads").arg(args.httpx_threads.to_string())
                 .arg("-timeout").arg("10")
                 .arg("-retries").arg("1")
