@@ -1331,7 +1331,13 @@ fn service_for_port(port: u16) -> Option<&'static str> {
         9418 => "git",
         11434 => "ollama",
         50070 | 50075 | 50090 => "hadoop",
-        8020 | 8021 | 8032 | 8088 => "hadoop-alt",
+        // 8021 is ftp-proxy on macOS/FreeBSD /etc/services (default launchd
+        // socket — hit most often on personal Macs). Hadoop-adjacent ports
+        // (8020 NameNode IPC, 8032 YARN RM, 8088 YARN RM web UI) keep the
+        // hadoop-alt label since those deployments specifically configure
+        // them; bare port 8021 on a Mac is overwhelmingly ftp-proxy.
+        8021 => "ftp-proxy",
+        8020 | 8032 | 8088 => "hadoop-alt",
 
         // ── VPN / tunneling ──
         500 => "isakmp",
