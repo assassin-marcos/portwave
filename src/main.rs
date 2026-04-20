@@ -189,6 +189,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_update_check: bool,
 
+    /// Suppress only the interactive `Update now? [Y/n]` prompt while
+    /// keeping the banner + changelog visible. Useful for users who
+    /// want to see version drift but don't want a blocking prompt
+    /// at the top of every scan.
+    #[arg(long, default_value_t = false)]
+    no_update_prompt: bool,
+
     /// Suppress the startup ASCII banner art.
     #[arg(long, default_value_t = false)]
     no_art: bool,
@@ -1523,6 +1530,25 @@ fn fetch_latest_version() -> anyhow::Result<Option<String>> {
     Ok(releases.first().map(|r| r.version.clone()))
 }
 
+// Returns (version, body) tuples for every release newer than `current`,
+// sorted newest-first. Body is the GitHub Release notes (markdown).
+// Used by the startup banner to show users what changed since their
+// install before prompting them to update.
+fn fetch_release_notes_since(current: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let releases = self_update::backends::github::ReleaseList::configure()
+        .repo_owner(REPO_OWNER)
+        .repo_name(REPO_NAME)
+        .build()?
+        .fetch()?;
+    let mut out: Vec<(String, String)> = Vec::new();
+    for r in releases {
+        if version_is_newer(&r.version, current) {
+            out.push((r.version.clone(), r.body.clone().unwrap_or_default()));
+        }
+    }
+    Ok(out)
+}
+
 // GitHub tags API peek — tags appear immediately on `git push --tags`, before
 // CI has built release binaries. Used by --check-update to distinguish
 // "you're up to date" from "a newer version is tagged but binaries are
@@ -1580,60 +1606,162 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
     false
 }
 
-fn print_update_banner(latest: &str) {
+fn print_update_banner(latest: &str, notes: &[(String, String)]) {
     eprintln!();
     eprintln!(
-        "\x1b[33m[!] portwave update available: {} → {}.\x1b[0m",
+        "\x1b[33m[!] portwave update available: {} → {}\x1b[0m",
         env!("CARGO_PKG_VERSION"),
         latest
     );
-    eprintln!("\x1b[33m    Run `portwave --update` to install (no rebuild needed).\x1b[0m");
+    if !notes.is_empty() {
+        eprintln!();
+        eprintln!("\x1b[1mWhat's new:\x1b[0m");
+        // Cap to last 3 versions × 6 lines each so we don't drown the
+        // scan output. Notes are GitHub release-notes markdown — strip
+        // the "## What's Changed" / "## New Contributors" headers and
+        // print the rest as plain text.
+        for (ver, body) in notes.iter().take(3) {
+            eprintln!("  \x1b[1mv{}\x1b[0m", ver);
+            let mut printed = 0;
+            for line in body.lines() {
+                let line = line.trim();
+                if line.is_empty()
+                    || line.starts_with("## ")
+                    || line.starts_with("**Full Changelog**")
+                {
+                    continue;
+                }
+                if printed >= 6 {
+                    eprintln!("    …");
+                    break;
+                }
+                // Trim individual line length so super-long bullets don't wrap badly.
+                let trimmed: String = line.chars().take(110).collect();
+                eprintln!("    {}", trimmed);
+                printed += 1;
+            }
+            if printed == 0 {
+                eprintln!("    (no release notes attached)");
+            }
+            eprintln!();
+        }
+    }
+    eprintln!("\x1b[2m    `portwave --update` installs the new binary in place.\x1b[0m");
     eprintln!();
 }
 
 // Fast, cached startup check. Skipped if disabled or in CI/test environments.
-async fn maybe_show_update_banner(disabled: bool) {
+// On a TTY with a newer version detected, also prompts the user `[Y/n]` and
+// runs the update inline if they accept. Suppress the prompt with
+// --no-update-prompt while keeping the banner visible.
+async fn maybe_show_update_banner(disabled: bool, no_prompt: bool) {
     if disabled || std::env::var("PORTWAVE_NO_UPDATE_CHECK").is_ok() {
         return;
     }
     let cache_path = update_cache_path();
 
-    // Try cached value first (24 h TTL).
+    // Try cached value first (24 h TTL). The cache only stores the latest
+    // version string — release notes are always fetched fresh when an
+    // update is detected (rare event, worth the round-trip).
+    let mut latest_from_cache: Option<String> = None;
     if let Some(p) = &cache_path {
         if let Ok(meta) = fs::metadata(p) {
             if let Ok(age) = meta.modified().ok().and_then(|t| t.elapsed().ok()).ok_or(()) {
                 if age < Duration::from_secs(86_400) {
                     if let Ok(latest) = fs::read_to_string(p) {
                         let latest = latest.trim().to_string();
-                        if !latest.is_empty()
-                            && version_is_newer(&latest, env!("CARGO_PKG_VERSION"))
-                        {
-                            print_update_banner(&latest);
+                        if !latest.is_empty() {
+                            latest_from_cache = Some(latest);
                         }
-                        return;
                     }
                 }
             }
         }
     }
 
-    // No fresh cache — fetch with a short timeout so a slow network never
-    // blocks the actual scan.
-    let res = tokio::time::timeout(
-        Duration::from_secs(3),
-        tokio::task::spawn_blocking(fetch_latest_version),
+    let latest = if let Some(v) = latest_from_cache {
+        v
+    } else {
+        let res = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::task::spawn_blocking(fetch_latest_version),
+        )
+        .await;
+        match res {
+            Ok(Ok(Ok(Some(v)))) => {
+                if let Some(p) = cache_path.clone() {
+                    if let Some(parent) = p.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(&p, &v);
+                }
+                v
+            }
+            _ => return, // network slow / no release yet — silently skip
+        }
+    };
+
+    if !version_is_newer(&latest, env!("CARGO_PKG_VERSION")) {
+        return;
+    }
+
+    // We have a real update. Fetch release notes (best-effort, 4 s budget)
+    // so the banner actually tells the user WHAT changed, not just THAT
+    // something did.
+    let notes_res = tokio::time::timeout(
+        Duration::from_secs(4),
+        tokio::task::spawn_blocking({
+            let cur = env!("CARGO_PKG_VERSION").to_string();
+            move || fetch_release_notes_since(&cur)
+        }),
     )
     .await;
+    let notes: Vec<(String, String)> = match notes_res {
+        Ok(Ok(Ok(v))) => v,
+        _ => Vec::new(),
+    };
 
-    if let Ok(Ok(Ok(Some(latest)))) = res {
-        if let Some(p) = cache_path {
-            if let Some(parent) = p.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::write(&p, &latest);
+    print_update_banner(&latest, &notes);
+
+    // Interactive prompt — only on real TTY, only if the user hasn't asked
+    // us to be quiet about it. Default action on Enter is YES (capital Y
+    // in the [Y/n]) since the user just saw the changelog and presumably
+    // wants the new version.
+    if no_prompt {
+        return;
+    }
+    #[cfg(unix)]
+    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+    #[cfg(not(unix))]
+    let is_tty = true;
+    if !is_tty {
+        return;
+    }
+
+    eprint!("Update now? [Y/n] ");
+    use std::io::Write as _;
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return;
+    }
+    let ans = line.trim();
+    if ans.eq_ignore_ascii_case("n") || ans.eq_ignore_ascii_case("no") {
+        eprintln!("\x1b[2m    Skipped. You can run `portwave --update` later.\x1b[0m");
+        eprintln!();
+        return;
+    }
+
+    eprintln!();
+    eprintln!("Updating now…");
+    match run_update().await {
+        Ok(()) => {
+            eprintln!();
+            eprintln!("\x1b[32mUpdated. Re-run your command to use the new version.\x1b[0m");
+            std::process::exit(0);
         }
-        if version_is_newer(&latest, env!("CARGO_PKG_VERSION")) {
-            print_update_banner(&latest);
+        Err(e) => {
+            eprintln!("\x1b[33m[!] update failed: {} — continuing with current version.\x1b[0m", e);
         }
     }
 }
@@ -2198,7 +2326,10 @@ async fn main() -> anyhow::Result<()> {
     let cfg = load_config();
 
     // Non-blocking startup update check (cached 24 h, 3 s timeout).
-    maybe_show_update_banner(args.no_update_check || args.quiet).await;
+    maybe_show_update_banner(
+        args.no_update_check || args.quiet,
+        args.no_update_prompt || args.quiet,
+    ).await;
 
     let output_root = resolve_path(
         args.output_dir.as_deref(),
