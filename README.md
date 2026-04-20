@@ -48,37 +48,88 @@ Exact command:
 
 ## Feature matrix
 
-Every cell below was verified against the current source of each tool as of the last README update. No "❌" unless the feature was checked and truly missing.
+Every cell verified against the current source of each tool. **Legend**: ✅ native · ⚠️ partial or via external tool · ❌ missing. Expandable sections below explain every ⚠️.
 
-|                                    | masscan | rustscan | naabu | **portwave** |
-|------------------------------------|:---:|:---:|:---:|:---:|
-| IPv4 + IPv6 TCP discovery          | ⚠️ SYN only | ✅ | ✅ experimental | ✅ |
-| Smart IPv6 scanning (RFC 7707 patterns) | ❌ | ❌ | ❌ | ✅ |
-| Scope safety net (refuse 2²⁰+ hosts by default) | ❌ | ❌ | ❌ | ✅ |
-| Adaptive concurrency (local-resource error) | ❌ | ⚠️ static ulimit-batch only | ❌ | ✅ |
-| Banner grab / protocol classify    | ✅ `--banners` | ⚠️ via nmap passthrough | ⚠️ via nmap `-sV` | ✅ native |
-| TLS sniff on non-443               | ⚠️ `--hello ssl` per port | ❌ | ⚠️ gated `ENABLE_TLS_DETECTION` env | ✅ |
-| CDN / WAF edge tagging             | ❌ | ❌ | ⚠️ tag + exclude only (`-cdn`, `-exclude-cdn`) | ✅ |
-| ASN expansion built in             | ❌ | ❌ | ✅ | ✅ |
-| Top-20 priority port scan (early results) | ❌ | ❌ | ❌ | ✅ |
-| Nmap-style `--top-ports N`         | ✅ | ⚠️ `--top` boolean only | ⚠️ preset `100/1000/full` only | ✅ any N |
-| UDP well-known-port opt-in         | ✅ `U:port` syntax | ✅ `--udp` | ⚠️ `-p u:port` syntax | ✅ `--udp` |
-| Global packet-per-second cap       | ✅ `--rate` | ❌ | ✅ `-rate` | ✅ `--max-pps` |
-| Wallclock budget (`--max-scan-time`) | ❌ | ❌ | ❌ | ✅ |
-| Dry-run / scan-plan preview        | ✅ `--offline` | ❌ | ❌ | ✅ |
-| `scan_diff.json` vs. prior run     | ❌ | ❌ | ❌ | ✅ |
-| Webhook on completion              | ❌ | ❌ | ❌ | ✅ |
-| Webhook only on diff change        | ❌ | ❌ | ❌ | ✅ |
-| NDJSON output                      | ⚠️ file-based `-oD` | ❌ | ✅ `-j/-jsonl` | ✅ stdout + file |
-| Dynamic CDN list refresh (runtime) | ❌ | ❌ | ⚠️ via lib release cycle | ✅ live upstream |
-| Exclude list / exclude-file        | ✅ | ✅ | ✅ | ✅ |
-| Resume after crash / Ctrl+C        | ✅ `--resume paused.conf` | ❌ | ✅ `-resume` | ✅ |
-| Built-in httpx + nuclei chain      | ❌ | ⚠️ nmap only | ⚠️ `-nmap-cli` only | ✅ httpx + nuclei |
-| Structured JSON output files       | ✅ `-oJ` | ❌ greppable only | ✅ `-j` + `-csv` | ✅ |
-| Self-update (`--update`)           | ❌ | ❌ | ✅ `-up` | ✅ |
-| Self-uninstall (`--uninstall`)     | ❌ | ❌ | ❌ | ✅ |
-| Clear input validation errors      | ⚠️ some `hint:` lines | ✅ | ✅ `validate.go` | ✅ |
-| Single static cross-platform binary | ⚠️ compile per platform | ✅ | ⚠️ needs libpcap/Npcap for SYN | ✅ |
+### Discovery & scope
+
+| | masscan | rustscan | naabu | **portwave** |
+|---|:-:|:-:|:-:|:-:|
+| IPv4 + IPv6 TCP discovery           | ⚠️ | ✅ | ⚠️ | ✅ |
+| Smart IPv6 scanning (RFC 7707)      | ❌ | ❌ | ❌ | ✅ |
+| Scope safety net (huge-CIDR refuse) | ❌ | ❌ | ❌ | ✅ |
+| ASN expansion built-in              | ❌ | ❌ | ✅ | ✅ |
+| Exclude list / exclude-file         | ✅ | ✅ | ✅ | ✅ |
+
+### Probing intelligence
+
+| | masscan | rustscan | naabu | **portwave** |
+|---|:-:|:-:|:-:|:-:|
+| Adaptive concurrency (local-error)   | ❌ | ⚠️ | ❌ | ✅ |
+| Banner grab / protocol classify      | ✅ | ⚠️ | ⚠️ | ✅ |
+| TLS sniff on non-443                 | ⚠️ | ❌ | ⚠️ | ✅ |
+| CDN / WAF edge tagging               | ❌ | ❌ | ⚠️ | ✅ |
+| Priority port early-results scan     | ❌ | ❌ | ❌ | ✅ |
+
+### Port selection & rate control
+
+| | masscan | rustscan | naabu | **portwave** |
+|---|:-:|:-:|:-:|:-:|
+| Nmap-style `--top-ports N` (arbitrary N) | ✅ | ⚠️ | ⚠️ | ✅ |
+| UDP well-known-port opt-in               | ✅ | ✅ | ⚠️ | ✅ |
+| Global packet-per-second cap             | ✅ | ❌ | ✅ | ✅ |
+| Wallclock budget (`--max-scan-time`)     | ❌ | ❌ | ❌ | ✅ |
+| Dry-run / scan-plan preview              | ✅ | ❌ | ❌ | ✅ |
+
+### Output & integration
+
+| | masscan | rustscan | naabu | **portwave** |
+|---|:-:|:-:|:-:|:-:|
+| `scan_diff.json` vs. prior run      | ❌ | ❌ | ❌ | ✅ |
+| Webhook on completion               | ❌ | ❌ | ❌ | ✅ |
+| Webhook only on diff change         | ❌ | ❌ | ❌ | ✅ |
+| NDJSON output                       | ⚠️ | ❌ | ✅ | ✅ |
+| Structured JSON files               | ✅ | ❌ | ✅ | ✅ |
+| Built-in httpx + nuclei chain       | ❌ | ⚠️ | ⚠️ | ✅ |
+| Dynamic CDN refresh at runtime      | ❌ | ❌ | ⚠️ | ✅ |
+
+### Operations
+
+| | masscan | rustscan | naabu | **portwave** |
+|---|:-:|:-:|:-:|:-:|
+| Resume after crash / Ctrl+C             | ✅ | ❌ | ✅ | ✅ |
+| Self-update (`--update`)                | ❌ | ❌ | ✅ | ✅ |
+| Self-uninstall (`--uninstall`)          | ❌ | ❌ | ❌ | ✅ |
+| Clear input-validation errors           | ⚠️ | ✅ | ✅ | ✅ |
+| Single static cross-platform binary     | ⚠️ | ✅ | ⚠️ | ✅ |
+
+<details>
+<summary><b>What each ⚠️ actually means (click to expand)</b></summary>
+
+**masscan**
+- *IPv4 + IPv6*: SYN-scan only, no TCP-connect mode (always `-sS`).
+- *TLS on non-443*: `--hello ssl[PORT]` triggers TLS on any port + `--capture cert` reads the cert; no JA3/JA4-style fingerprint.
+- *NDJSON*: file-based via `-oD`; not a stdout stream.
+- *Validation errors*: some errors include `hint:` lines (see `main-conf.c:1388`), most are bare `FAIL:`.
+- *Static binary*: must compile per platform — no pre-built releases shipped.
+
+**rustscan**
+- *Adaptive concurrency*: batch size picked once at startup from `ulimit -n` (`main.rs:262 infer_batch_size`), not runtime-adaptive to local errors.
+- *Banner grab*: delegated to nmap via `-- <nmap args>` passthrough (`input.rs:146`); no native banner reader.
+- *`--top-ports N`*: only a `--top` boolean (fixed ~1000 ports from `config.toml`), no integer argument.
+- *Built-in recon chain*: chains to **nmap** only, not to httpx or nuclei.
+
+**naabu**
+- *IPv4 + IPv6*: dual-stack flagged "experimental" in README.
+- *Banner grab*: uses `-nmap-cli` passthrough / `-sV` (via nmap); no native banner reader.
+- *TLS on non-443*: `netutil.DetectTLS` exists (`scan.go:465`) but gated behind undocumented `ENABLE_TLS_DETECTION` env, off by default.
+- *CDN tagging*: `-cdn` tags + `-exclude-cdn` skip, powered by `projectdiscovery/cdncheck` library.
+- *`--top-ports N`*: only accepts preset `100`, `1000`, or `full` — not arbitrary N.
+- *UDP*: via `-p u:port` syntax; no dedicated `-sU` flag.
+- *Dynamic CDN refresh*: CDN list refreshes via upstream library release cycle, not at runtime.
+- *Built-in recon chain*: chains to **nmap** only via `-nmap-cli`, not httpx/nuclei.
+- *Static binary*: requires **libpcap** (Linux/macOS) or **Npcap** (Windows) at runtime for SYN scans.
+
+</details>
 
 ---
 
