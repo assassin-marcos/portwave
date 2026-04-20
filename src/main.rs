@@ -1503,14 +1503,18 @@ fn update_cache_path() -> Option<PathBuf> {
 }
 
 // Non-blocking cache-only lookup of the latest known release. Returns
-// None if the cache is absent, unreadable, or older than 24 h. Used by
-// the startup banner to tag the current version `(outdated)`/`(latest)`
-// without paying a network round-trip on every invocation.
+// None if the cache is absent, unreadable, or older than 1 h. Used by
+// the startup banner to tag the current version `(outdated)`/`(latest)`.
+// TTL is deliberately short (1 h) because the banner makes a positive
+// claim ("latest") that's hard to verify without a fresh network check —
+// stale cache leads to lies like "v0.10.0 (latest)" when v0.11.0 is out.
+// Combined with `refresh_update_cache_best_effort()` at startup, the
+// cache is almost always freshly written by the time the banner reads it.
 fn cached_latest_version() -> Option<String> {
     let p = update_cache_path()?;
     let meta = fs::metadata(&p).ok()?;
     let age = meta.modified().ok()?.elapsed().ok()?;
-    if age > Duration::from_secs(86_400) {
+    if age > Duration::from_secs(3_600) {
         return None;
     }
     let s = fs::read_to_string(&p).ok()?.trim().to_string();
@@ -1518,6 +1522,42 @@ fn cached_latest_version() -> Option<String> {
         None
     } else {
         Some(s)
+    }
+}
+
+// Eager refresh of the update cache before the banner renders. Runs a
+// 1-second-budget GitHub fetch so the `(outdated)` / `(latest)` banner
+// tag reflects the *current* GitHub state, not a cached value from hours
+// ago. Skipped on a cache-hit fast path (< 5 min old — nothing could
+// have been published since). Silent on failure so offline users still
+// see instant startup (the tag just falls back to whatever stale cache
+// exists, or disappears if the cache is > 1 h old).
+async fn refresh_update_cache_best_effort() {
+    let p = match update_cache_path() {
+        Some(p) => p,
+        None => return,
+    };
+    // Fast path: cache fresh enough that we know any update within the
+    // window has already been seen. No network call.
+    if let Ok(meta) = fs::metadata(&p) {
+        if let Some(age) = meta.modified().ok().and_then(|t| t.elapsed().ok()) {
+            if age < Duration::from_secs(300) {
+                return;
+            }
+        }
+    }
+    // Slow path: GitHub round-trip. 1 s is enough for typical latencies
+    // (~200-400 ms) and doesn't make the banner feel laggy.
+    let res = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking(fetch_latest_version),
+    )
+    .await;
+    if let Ok(Ok(Ok(Some(v)))) = res {
+        if let Some(parent) = p.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&p, v);
     }
 }
 
@@ -2388,6 +2428,13 @@ async fn main() -> anyhow::Result<()> {
     // Banner art — first thing on screen (but skip when piped or quieted).
     let show_art = !args.quiet && !args.no_art && atty_like_stderr();
     if show_art {
+        // Refresh the update cache just before the banner renders so the
+        // `(outdated)` / `(latest)` tag reflects GitHub's current state,
+        // not a cached value from the last scan hours ago. Budgeted at
+        // 1 s with a 5-min cache-hit fast path — silent on failure.
+        if !args.no_update_check {
+            refresh_update_cache_best_effort().await;
+        }
         print_banner();
     }
 
