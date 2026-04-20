@@ -216,6 +216,10 @@ struct Args {
     /// Post the webhook only if the diff shows new opens or closes
     #[arg(long, default_value_t = false)]
     webhook_on_diff_only: bool,
+
+    /// Suppress the real-time "[+] IP:PORT opened" stream during Phase A
+    #[arg(long, default_value_t = false)]
+    no_live_hits: bool,
 }
 
 // ────────────────────────── Types ──────────────────────────
@@ -3506,7 +3510,10 @@ async fn main() -> anyhow::Result<()> {
     let pb = ProgressBar::new(scanned_estimate.max(1));
     pb.set_style(
         ProgressStyle::with_template(
-            "{spinner} [{elapsed_precise}] {bar:40} {pos}/{len} ({percent}%) {msg}",
+            // {per_sec} + {eta} give an at-a-glance health check — if the
+            // rate drops or ETA climbs mid-scan, the user knows something
+            // regressed without having to instrument anything.
+            "{spinner} [{elapsed_precise}] {bar:40} {pos}/{len} ({percent}%) {per_sec} · ETA {eta} {msg}",
         )
         .unwrap(),
     );
@@ -3573,12 +3580,32 @@ async fn main() -> anyhow::Result<()> {
     let (hit_tx, mut hit_rx) = mpsc::channel::<SocketAddr>(2048);
 
     // Writer: collects Phase-A hits into a shared Vec for Phase B.
+    //
+    // New in v0.12.3: also emits a live "[+] IP:PORT opened" line via
+    // `pb.println()` so users watch hits stream in real time instead of
+    // waiting until Phase A completes to see results. `pb.println()` plays
+    // nice with the animated bar — indicatif redraws the bar after each
+    // injected line, so the log reads cleanly top-to-bottom. Per-hit cost
+    // is a single stderr write (~10 µs); even a 10 K-hit /8 scan spends
+    // <100 ms total here.
     let phase_a_hits: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
     let collector = {
         let sink = phase_a_hits.clone();
+        let pb_for_hits = pb.clone();
+        let live = !args.no_live_hits && !args.quiet;
         tokio::spawn(async move {
             while let Some(sa) = hit_rx.recv().await {
                 sink.lock().unwrap().push(sa);
+                if live {
+                    // v6 addresses need bracket-wrapping so "IP:PORT"
+                    // disambiguates the final colon — matches Phase B
+                    // formatting and the OPEN PORTS render.
+                    let host = match sa.ip() {
+                        IpAddr::V6(v) => format!("[{}]", v),
+                        _ => sa.ip().to_string(),
+                    };
+                    pb_for_hits.println(cfmt("1;32", &format!("[+] {}:{} opened", host, sa.port())));
+                }
             }
         })
     };
@@ -3916,18 +3943,30 @@ async fn main() -> anyhow::Result<()> {
     let mut summary = summary;
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
     println!("Summary: {:?}", summary_path);
+
+    // Colored Totals line — at-a-glance scan health check:
+    //   open     → bright green (hits are what the user came for)
+    //   closed   → dim grey (neutral signal)
+    //   filtered → yellow above 50 % (firewalled or SYN-dropped target)
+    //   local_err→ bright red when > 0 (local-resource pressure, means
+    //              the scanner couldn't send as fast as intended — user
+    //              should lower --threads or add --max-pps)
+    let filt_pct = if summary.attempts > 0 {
+        (summary.timeouts as f64 / summary.attempts as f64) * 100.0
+    } else {
+        0.0
+    };
+    let open_col = if summary.open > 0 { "1;32" } else { "2" };
+    let closed_col = "2";
+    let filt_col = if filt_pct > 50.0 { "33" } else { "2" };
+    let le_col = if summary.local_errors > 0 { "1;31" } else { "32" };
     println!(
-        "Totals — {} probes  ·  open: {}  ·  closed: {}  ·  filtered: {} ({:.1}%)  ·  local_err: {}",
+        "Totals — {} probes  ·  {}  ·  {}  ·  {}  ·  {}",
         summary.attempts,
-        summary.open,
-        summary.closed,
-        summary.timeouts,
-        if summary.attempts > 0 {
-            (summary.timeouts as f64 / summary.attempts as f64) * 100.0
-        } else {
-            0.0
-        },
-        summary.local_errors,
+        cfmt(open_col, &format!("open: {}", summary.open)),
+        cfmt(closed_col, &format!("closed: {}", summary.closed)),
+        cfmt(filt_col, &format!("filtered: {} ({:.1}%)", summary.timeouts, filt_pct)),
+        cfmt(le_col, &format!("local_err: {}", summary.local_errors)),
     );
     // Quick legend for first-time users:
     //   open     = TCP 3-way handshake completed
@@ -3996,6 +4035,19 @@ async fn main() -> anyhow::Result<()> {
     // httpx might report fewer hits (non-HTTP services like SSH show up here
     // but don't produce httpx output).
     let cdn_count = open_records.iter().filter(|o| o.cdn.is_some()).count();
+    // Count unique hosts for the header. open_records is already sorted
+    // by (IpAddr, port) so hosts-with-opens form contiguous runs.
+    let unique_hosts = {
+        let mut ips: Vec<&str> = open_records.iter().map(|o| o.ip.as_str()).collect();
+        ips.sort();
+        ips.dedup();
+        ips.len()
+    };
+    let host_suffix = if unique_hosts > 1 {
+        format!(" across {} hosts", unique_hosts)
+    } else {
+        String::new()
+    };
     let cdn_suffix = if cdn_count > 0 {
         format!(", {} on CDN edge", cdn_count)
     } else {
@@ -4008,9 +4060,19 @@ async fn main() -> anyhow::Result<()> {
         "\n{}",
         cfmt(
             header_color,
-            &format!("--- OPEN PORTS ({} total{}) ---", open_records.len(), cdn_suffix),
+            &format!(
+                "--- OPEN PORTS ({} total{}{}) ---",
+                open_records.len(), host_suffix, cdn_suffix,
+            ),
         )
     );
+
+    // Per-host grouping (v0.12.3): emit the IP once, then list every port
+    // on that host indented beneath it — same layout as `nmap` uses.
+    // Drastically easier to visually parse on multi-host scans where the
+    // same IP used to repeat on every line. open_records is sorted by
+    // (IpAddr, port) so we walk it linearly and track the "current host".
+    let mut current_ip: Option<String> = None;
     for op in &open_records {
         let host = match op.ip.parse::<IpAddr>() {
             Ok(IpAddr::V6(v)) => format!("[{}]", v),
@@ -4019,10 +4081,18 @@ async fn main() -> anyhow::Result<()> {
         let proto = op.protocol.as_deref().unwrap_or("unknown");
         let banner = op.banner.as_deref().unwrap_or("");
 
-        // Compose a colored [proto, tls, cdn:x] tag bundle. TLS is only
-        // printed as a separate tag when the protocol isn't already
-        // "https" (which implies TLS) — avoids the redundant
-        // "[https, tls]" that v0.12.0 produced on port 443.
+        // Emit a host header when the IP changes.
+        if current_ip.as_ref() != Some(&op.ip) {
+            if current_ip.is_some() {
+                println!();
+            }
+            println!("  {}", cfmt("1", &host));
+            current_ip = Some(op.ip.clone());
+        }
+
+        // Colored [proto, tls, cdn:x] tag bundle. TLS is only printed as
+        // a separate tag when the protocol isn't already "https" (which
+        // implies TLS) — avoids the redundant "[https, tls]".
         let mut tags: Vec<String> = Vec::with_capacity(3);
         tags.push(color_protocol(proto));
         if op.tls && proto != "https" {
@@ -4033,14 +4103,15 @@ async fn main() -> anyhow::Result<()> {
         }
         let tag_bundle = format!("[{}]", tags.join(cfmt("2", ", ").as_str()));
 
-        // Host:port in bold, tag bundle colored, banner colored by status class.
-        let hostport = cfmt("1", &format!("{}:{}", host, op.port));
+        // Port column in dim white, tag bundle colored, banner colored
+        // by HTTP-status class (2xx green, 3xx cyan, 4xx yellow, 5xx red).
+        let port_col = cfmt("2", &format!(":{:<5}", op.port));
 
         if banner.is_empty() {
-            println!("  {}  {}", hostport, tag_bundle);
+            println!("      {} {}", port_col, tag_bundle);
         } else {
-            let b: String = banner.chars().take(120).collect();
-            println!("  {}  {}  {}", hostport, tag_bundle, color_banner_status(&b));
+            let b: String = banner.chars().take(110).collect();
+            println!("      {} {}  {}", port_col, tag_bundle, color_banner_status(&b));
         }
     }
 
@@ -4292,6 +4363,25 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("\n--- WORKFLOW COMPLETE ---");
+    // Compact end-of-scan summary line. Puts the output path where eyes
+    // naturally land (bottom of terminal) + one-line recap of what
+    // happened. Colored by result count: bright green if anything opened,
+    // dim if the scan came up empty.
+    let total_s = started.elapsed().as_secs_f64();
+    let line_color = if summary.open > 0 { "1;32" } else { "2" };
+    println!(
+        "\n{}",
+        cfmt(
+            line_color,
+            &format!(
+                "Results: {} open · {:.2}s · {}",
+                summary.open,
+                total_s,
+                out_dir.display(),
+            ),
+        )
+    );
+
+    println!("\n{}", cfmt("1;32", "--- WORKFLOW COMPLETE ---"));
     Ok(())
 }
