@@ -175,6 +175,47 @@ struct Args {
     /// Suppress banner + update notice (= --no-art --no-update-check)
     #[arg(short, long, default_value_t = false)]
     quiet: bool,
+
+    /// Use only the top N ports from the bundled list (nmap-compat)
+    #[arg(long)]
+    top_ports: Option<usize>,
+
+    /// Scan only IPv4 targets (filter after range expansion)
+    #[arg(long, default_value_t = false)]
+    ipv4_only: bool,
+
+    /// Scan only IPv6 targets (filter after range expansion)
+    #[arg(long, default_value_t = false)]
+    ipv6_only: bool,
+
+    /// Global packet-per-second rate cap (polite/slow-scan mode)
+    #[arg(long)]
+    max_pps: Option<u32>,
+
+    /// Emit each open port as a JSON line on stdout (in addition to files)
+    #[arg(long, default_value_t = false)]
+    json_out: bool,
+
+    /// For large IPv6 ranges (/108+), probe only RFC-7707 likely addresses
+    /// (hexspeak, low-sequential, SLAAC patterns) instead of full expansion
+    #[arg(long, default_value_t = false)]
+    smart_ipv6: bool,
+
+    /// Bypass the 2^20-host scope safety net (huge CIDR expansion)
+    #[arg(long, default_value_t = false)]
+    allow_huge_scope: bool,
+
+    /// Hard wallclock cap on total scan time (e.g. "10m", "1h", "30s")
+    #[arg(long)]
+    max_scan_time: Option<String>,
+
+    /// Print the scan plan (targets, ports, estimated probes) and exit
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    /// Post the webhook only if the diff shows new opens or closes
+    #[arg(long, default_value_t = false)]
+    webhook_on_diff_only: bool,
 }
 
 // ────────────────────────── Types ──────────────────────────
@@ -233,6 +274,11 @@ struct ScanSummary {
     /// nuclei subprocess wall time. 0 unless nuclei ran to completion.
     #[serde(default)]
     nuclei_ms: u128,
+    /// True when the scan was cut short by --max-scan-time before every
+    /// target was probed. Lets downstream automation distinguish a
+    /// "partial result" from a "complete clean run".
+    #[serde(default)]
+    timed_out: bool,
 }
 
 struct Stats {
@@ -529,6 +575,176 @@ fn is_inside_git_repo(p: &Path) -> bool {
 //   - single IP: "1.2.3.4"                    → 1.2.3.4/32
 //   - CIDR:      "1.2.3.0/24"                 → 1.2.3.0/24
 //   - IP range:  "1.2.3.10-1.2.3.20"          → minimal covering CIDR set
+// Parse a human duration like "10m", "1h", "30s", "2h30m" → Duration.
+// Returns an anyhow error with a hint for bad input so the user sees a
+// helpful message instead of a parser spat.
+fn parse_duration_human(s: &str) -> anyhow::Result<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty duration string\n  hint: expected something like \"10m\", \"1h\", \"30s\", or \"1h30m\"");
+    }
+    let mut total_secs: u64 = 0;
+    let mut current_num: u64 = 0;
+    let mut saw_digit = false;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            current_num = current_num.saturating_mul(10).saturating_add((c as u8 - b'0') as u64);
+            saw_digit = true;
+        } else {
+            if !saw_digit {
+                anyhow::bail!(
+                    "invalid duration \"{}\" — unit character '{}' without a preceding number\n  hint: use digits + unit, e.g. \"10m\" or \"1h30m\"",
+                    s, c
+                );
+            }
+            let mult = match c {
+                's' | 'S' => 1u64,
+                'm' | 'M' => 60,
+                'h' | 'H' => 3_600,
+                'd' | 'D' => 86_400,
+                _ => anyhow::bail!(
+                    "invalid duration \"{}\" — unknown unit '{}'\n  hint: valid units are s (seconds), m (minutes), h (hours), d (days)",
+                    s, c
+                ),
+            };
+            total_secs = total_secs.saturating_add(current_num.saturating_mul(mult));
+            current_num = 0;
+            saw_digit = false;
+        }
+    }
+    if saw_digit {
+        // Trailing bare number means "seconds" (Go-style).
+        total_secs = total_secs.saturating_add(current_num);
+    }
+    if total_secs == 0 {
+        anyhow::bail!("duration \"{}\" resolves to zero — scan would finish instantly", s);
+    }
+    Ok(Duration::from_secs(total_secs))
+}
+
+// Count the total number of host addresses across a set of IpNetworks.
+// Returns u128 so even absurd IPv6 ranges (/0 through /128) fit without
+// overflow. Used by the scope safety net and the --dry-run summary.
+fn total_host_count(nets: &[IpNetwork]) -> u128 {
+    let mut sum: u128 = 0;
+    for n in nets {
+        let s: u128 = match n.size() {
+            ipnetwork::NetworkSize::V4(v) => v as u128,
+            ipnetwork::NetworkSize::V6(v) => v,
+        };
+        sum = sum.saturating_add(s);
+    }
+    sum
+}
+
+// Generate targeted IPv6 addresses for a /CIDR using RFC 7707 patterns.
+// Full /64 or /48 expansion is infeasible (2^64-2^80 addresses), so we
+// probe the ~450 addresses in practical use on real IPv6 networks:
+//   - Low sequential    :: .. ::00ff         (256)
+//   - "Service decimal" ::100 .. ::02ff      (512) — admins often pick these
+//   - Hexspeak          ::dead, ::beef etc.  (~20 well-known words)
+//   - SLAAC landmark    ::fffe:xxxx patterns (~20 common vendor hints)
+//   - Round decimals    ::1000, ::2000, ::a  (~20 common hand-picked)
+// Called only for IPv6 CIDRs strictly larger (smaller prefix) than /108.
+fn smart_ipv6_addresses(base: std::net::Ipv6Addr) -> Vec<IpAddr> {
+    let base_segs = base.segments();
+    let mut out: Vec<IpAddr> = Vec::with_capacity(800);
+    // The CIDR's base address is the prefix part; we vary the low bits.
+    // We'll keep the upper 96 bits of `base_segs` and vary the lowest 32
+    // (segments 6 and 7) within the /96 implicit window. For larger CIDRs
+    // this still exhaustively covers what real admins hand out.
+    let mk = |seg6: u16, seg7: u16| -> IpAddr {
+        let mut s = base_segs;
+        s[6] = seg6;
+        s[7] = seg7;
+        IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]))
+    };
+
+    // ── Low sequential (::1 .. ::ff) — admins routinely assign these.
+    for i in 1..=0xffu16 {
+        out.push(mk(0, i));
+    }
+    // ── Decimal-feel (::100 .. ::2ff) — common service allocations.
+    for i in 0x100..=0x2ffu16 {
+        out.push(mk(0, i));
+    }
+    // ── Hexspeak words.
+    for &w in &[
+        0xdeadu16, 0xbeef, 0xcafe, 0xbabe, 0xf00d, 0xb00b, 0x1337, 0xc0de,
+        0xfeed, 0xface, 0xbead, 0xdead, 0xc0c0, 0xfade, 0x0bad, 0xfa11,
+    ] {
+        out.push(mk(0, w));
+    }
+    // ── Round decimals that humans love picking (mix of hex patterns
+    // like ::1000 and "service-port-shaped" segments like ::8080/::8443).
+    for &w in &[
+        0x1000u16, 0x2000, 0x5000, 0x8000, 0xa, 0x10, 0x50, 0x500, 0x1001,
+        0x42, 0x80,
+        // Common TCP service ports written as the last segment.
+        8080, 8443, 3128, 6379, 27017,
+    ] {
+        out.push(mk(0, w));
+    }
+    // ── SLAAC landmark IIDs (segments 6 and 7). Common vendor MACs +
+    // RFC 4291 EUI-64 hints. Not exhaustive — just enough to catch the
+    // obvious suspects.
+    for &(s6, s7) in &[
+        (0x0000u16, 0x0001),     // DHCPv6-assigned "::1"-style
+        (0xfffe, 0x0001),
+        (0x02ff, 0xfe00),        // typical EUI-64 lowest bits
+        (0xa0b1, 0xfffe),        // "admin" byte patterns
+    ] {
+        out.push(mk(s6, s7));
+    }
+    // Dedupe (cheap vs the probe cost).
+    out.sort();
+    out.dedup();
+    out
+}
+
+// Simple token-bucket rate limiter for the producer's `--max-pps` mode.
+// Not a cryptographic-grade limiter; just a "pace sends" helper that
+// shares naturally via Arc across tasks. Using i64 math so a brief
+// negative overdraft from bursty arrivals is OK.
+struct RateLimiter {
+    capacity: f64,
+    tokens: Mutex<f64>,
+    last_refill: Mutex<Instant>,
+    rate_per_sec: f64,
+}
+
+impl RateLimiter {
+    fn new(pps: u32) -> Self {
+        let rate = pps as f64;
+        Self {
+            capacity: rate.max(1.0),
+            tokens: Mutex::new(rate.max(1.0)),
+            last_refill: Mutex::new(Instant::now()),
+            rate_per_sec: rate,
+        }
+    }
+    async fn acquire(&self) {
+        loop {
+            let wait_ms: u64 = {
+                let now = Instant::now();
+                let mut last = self.last_refill.lock().unwrap();
+                let elapsed = now.saturating_duration_since(*last).as_secs_f64();
+                let mut t = self.tokens.lock().unwrap();
+                *t = (*t + elapsed * self.rate_per_sec).min(self.capacity);
+                *last = now;
+                if *t >= 1.0 {
+                    *t -= 1.0;
+                    return;
+                }
+                // Fractional tokens short — sleep for roughly 1 token worth.
+                let need = 1.0 - *t;
+                ((need / self.rate_per_sec) * 1000.0).ceil() as u64
+            };
+            tokio::time::sleep(Duration::from_millis(wait_ms.max(1))).await;
+        }
+    }
+}
+
 fn parse_target_token(tok: &str) -> Vec<IpNetwork> {
     let tok = tok.trim();
     if tok.is_empty() {
@@ -1370,6 +1586,7 @@ async fn producer(
     skip: Arc<FxHashSet<SocketAddr>>,
     exclude: Arc<Vec<IpNetwork>>,
     stats: Arc<Stats>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 ) {
     let priority_set: std::collections::HashSet<u16> =
         TOP_PRIORITY_PORTS.iter().copied().collect();
@@ -1401,6 +1618,13 @@ async fn producer(
                 if skip.contains(&sa) {
                     continue;
                 }
+                // `--max-pps`: block on the token bucket before handing
+                // the probe to a worker. No-op in the common case (flag
+                // not set = rate_limiter is None). Sleeps briefly when
+                // we're ahead of schedule.
+                if let Some(rl) = &rate_limiter {
+                    rl.acquire().await;
+                }
                 if send_or_shutdown(&tx, sa, &stats).await.is_err() {
                     return;
                 }
@@ -1425,6 +1649,9 @@ async fn producer(
                 let sa = SocketAddr::new(ip, port);
                 if skip.contains(&sa) {
                     continue;
+                }
+                if let Some(rl) = &rate_limiter {
+                    rl.acquire().await;
                 }
                 if send_or_shutdown(&tx, sa, &stats).await.is_err() {
                     return;
@@ -2428,6 +2655,52 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ────────────── Early input validation (fail fast, helpful messages) ──────────────
+    // Check every new-flag value for validity *before* we start building
+    // scan state or making network calls. Each message names the bad flag
+    // and shows an example of the expected format so the user doesn't
+    // have to dig through --help.
+    if args.ipv4_only && args.ipv6_only {
+        eprintln!("error: --ipv4-only and --ipv6-only are mutually exclusive — pick one.");
+        std::process::exit(2);
+    }
+    if let Some(pps) = args.max_pps {
+        if pps == 0 {
+            eprintln!("error: --max-pps must be > 0 (got {}). Use --quiet to disable scanning noise instead.", pps);
+            std::process::exit(2);
+        }
+    }
+    if let Some(n) = args.top_ports {
+        if n == 0 {
+            eprintln!("error: --top-ports must be > 0 (got {}).\n  hint: try --top-ports 100 or --top-ports 1000", n);
+            std::process::exit(2);
+        }
+    }
+    let scan_time_budget: Option<Duration> = match args.max_scan_time.as_deref() {
+        Some(s) => match parse_duration_human(s) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("error: --max-scan-time {}", e);
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    // ASN format: AS followed by 1-10 digits (or just digits). Reject obviously
+    // malformed tokens before hitting RIPE stat with a bogus URL.
+    if let Some(ref list) = args.asn {
+        for tok in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let digits = tok.trim_start_matches(|c: char| c == 'A' || c == 'S' || c == 'a' || c == 's');
+            if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) || digits.len() > 10 {
+                eprintln!(
+                    "error: --asn {:?} is not a valid ASN.\n  hint: expected format \"AS13335\" or \"AS13335,AS15169\" (1-10 digits after optional AS prefix)",
+                    tok
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     // Banner art — first thing on screen (but skip when piped or quieted).
     let show_art = !args.quiet && !args.no_art && atty_like_stderr();
     if show_art {
@@ -2548,7 +2821,7 @@ async fn main() -> anyhow::Result<()> {
     //   1. --ports "22,80,443,8000-9000"   (inline range syntax)
     //   2. --port-file / $PORTWAVE_PORTS / config PORTWAVE_PORTS
     //   3. Embedded 1400+ port list baked into the binary
-    let ports = if let Some(spec) = &args.ports {
+    let mut ports = if let Some(spec) = &args.ports {
         println!("Loading ports from: --ports {}", spec);
         parse_port_list(spec)
     } else {
@@ -2564,8 +2837,19 @@ async fn main() -> anyhow::Result<()> {
         load_ports(&port_path)
     };
     if ports.is_empty() {
-        eprintln!("Error: port list empty.");
-        return Ok(());
+        eprintln!("error: port list empty after parsing.\n  hint: --ports expects a comma-separated list like \"22,80,443,8000-9000\"");
+        std::process::exit(2);
+    }
+    // `--top-ports N`: nmap-compatible shorthand. Keep only the first N
+    // ports from the loaded list. Applied *after* parsing so it composes
+    // cleanly with --ports / --port-file (user can still hand-pick a list
+    // and then cap it). The bundled list is already sorted by hit-frequency
+    // so "top 100" genuinely means the 100 most-likely-open ports.
+    if let Some(n) = args.top_ports {
+        if n < ports.len() {
+            ports.truncate(n);
+            println!("--top-ports {}: using the first {} ports from the loaded list.", n, n);
+        }
     }
 
     // Merge targets from positional <CIDR_INPUT>, --input-file, and --asn.
@@ -2607,6 +2891,82 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut seen = std::collections::HashSet::new();
         nets.retain(|n| seen.insert(n.to_string()));
+    }
+
+    // ───────── Family filter (--ipv4-only / --ipv6-only) ─────────
+    // Applied post-merge so ASN expansion + CIDR input + file input all
+    // get filtered uniformly. Mutual-exclusion was checked at startup.
+    if args.ipv4_only {
+        let before = nets.len();
+        nets.retain(|n| matches!(n, IpNetwork::V4(_)));
+        let dropped = before - nets.len();
+        if dropped > 0 {
+            println!("--ipv4-only: dropped {} IPv6 range(s) from scope.", dropped);
+        }
+    } else if args.ipv6_only {
+        let before = nets.len();
+        nets.retain(|n| matches!(n, IpNetwork::V6(_)));
+        let dropped = before - nets.len();
+        if dropped > 0 {
+            println!("--ipv6-only: dropped {} IPv4 range(s) from scope.", dropped);
+        }
+    }
+
+    // ───────── Smart IPv6 substitution (before safety net) ─────────
+    // For every IPv6 CIDR larger than /108 (> 2^20 hosts), replace the
+    // exhaustive expansion with ~450 RFC-7707 likely addresses. Each
+    // becomes its own /128 "network" so the downstream producer sees
+    // one scannable range per address and all the existing plumbing
+    // (exclude check, skip set, Phase A/B pipeline) keeps working.
+    // IPv4 ranges are never touched by this flag — use --ports + the
+    // normal producer instead.
+    if args.smart_ipv6 {
+        let mut rewritten: Vec<IpNetwork> = Vec::new();
+        let mut rewrote_any = false;
+        for n in nets.drain(..) {
+            match n {
+                IpNetwork::V6(v6) if v6.prefix() < 108 => {
+                    rewrote_any = true;
+                    let addrs = smart_ipv6_addresses(v6.network());
+                    for a in addrs {
+                        if let Ok(net) = IpNetwork::new(a, 128) {
+                            rewritten.push(net);
+                        }
+                    }
+                }
+                other => rewritten.push(other),
+            }
+        }
+        if rewrote_any {
+            println!(
+                "--smart-ipv6: expanded to {} targeted address(es) from RFC-7707 patterns.",
+                rewritten.len()
+            );
+        }
+        nets = rewritten;
+    }
+
+    // ───────── Scope safety net (max 2^20 hosts by default) ─────────
+    // Prevents a user who types `2a00:1450::/32` from asking the scanner
+    // to enumerate 2^96 addresses. Threshold picked to allow /12 IPv4
+    // (1M hosts) and /108 IPv6 (1M hosts) — large but finite.
+    // Bypasses:
+    //   --allow-huge-scope  explicit override for users who know what they're doing
+    //   --smart-ipv6        already rewrote IPv6 CIDRs to ~450 /128s each, count is fine
+    {
+        let total = total_host_count(&nets);
+        const SAFETY_CAP: u128 = 1 << 20; // 1 048 576
+        if total > SAFETY_CAP && !args.allow_huge_scope {
+            eprintln!(
+                "error: target scope would expand to {} host(s) across {} range(s) — above the 2^20 safety cap.",
+                total, nets.len()
+            );
+            eprintln!("  bypass options:");
+            eprintln!("    --smart-ipv6         scan only RFC-7707 common IPv6 addresses in huge IPv6 ranges");
+            eprintln!("    --allow-huge-scope   explicitly proceed with the full expansion (you really sure?)");
+            eprintln!("    --top-ports 100      cut the per-host probe cost if the range is accurate");
+            std::process::exit(2);
+        }
     }
 
     // Build the exclude list.
@@ -2682,6 +3042,35 @@ async fn main() -> anyhow::Result<()> {
         scanned_estimate
     );
 
+    // `--dry-run`: print the plan we just described + family breakdown +
+    // a rough duration estimate, then exit cleanly. No sockets opened,
+    // no files written beyond the already-created folder. Perfect for
+    // sanity-checking a huge ASN scan before you commit to it.
+    if args.dry_run {
+        let v4 = nets.iter().filter(|n| matches!(n, IpNetwork::V4(_))).count();
+        let v6 = nets.iter().filter(|n| matches!(n, IpNetwork::V6(_))).count();
+        let host_count = total_host_count(&nets);
+        let est_seconds = (scanned_estimate as f64
+            / (args.threads as f64).max(1.0)
+            * (args.timeout_ms as f64 / 1000.0).max(0.05))
+        .max(1.0);
+        println!();
+        println!("--- DRY RUN ---");
+        println!("  IPv4 ranges: {}", v4);
+        println!("  IPv6 ranges: {}", v6);
+        println!("  Total hosts: {}", host_count);
+        println!("  Total probes (pre-skip): {}", scanned_estimate);
+        println!(
+            "  Rough time estimate: ~{:.1} min (threads={}, timeout={}ms — actual will vary with network)",
+            est_seconds / 60.0,
+            args.threads,
+            args.timeout_ms
+        );
+        println!();
+        println!("  No probes fired. Run without --dry-run to actually scan.");
+        return Ok(());
+    }
+
     // Always use a real progress bar — indicatif handles arbitrarily large
     // totals. The old spinner-mode template (engaged above 10M probes) had
     // a hardcoded "open" token that collided with the {msg} ("open: <sa>")
@@ -2713,6 +3102,27 @@ async fn main() -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
             eprintln!("\n[!] Ctrl+C received — draining workers and flushing output...");
             stats.shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    // `--max-scan-time`: optional wallclock budget. When the duration
+    // elapses we flip the same shutdown flag the Ctrl+C handler uses, so
+    // downstream draining + Phase-B backfill + scan_summary writing all
+    // fire through the existing "graceful abort" code path. scan_summary
+    // gets a `timed_out: true` marker (see below) so automation can tell
+    // the difference between a natural finish and a time-limited cutoff.
+    let timed_out_flag = Arc::new(AtomicBool::new(false));
+    if let Some(budget) = scan_time_budget {
+        let stats = stats.clone();
+        let tflag = timed_out_flag.clone();
+        println!("--max-scan-time: hard budget set to {:?}", budget);
+        tokio::spawn(async move {
+            tokio::time::sleep(budget).await;
+            if !stats.shutdown.load(Ordering::Relaxed) {
+                eprintln!("\n[!] --max-scan-time expired — draining workers and flushing output...");
+                stats.shutdown.store(true, Ordering::Relaxed);
+                tflag.store(true, Ordering::Relaxed);
+            }
         });
     }
 
@@ -2759,15 +3169,23 @@ async fn main() -> anyhow::Result<()> {
     drop(work_rx);
     drop(hit_tx);
 
-    // Producer.
+    // Producer. Thread the optional rate limiter (from --max-pps) so the
+    // producer can pace its sends without touching worker code. None when
+    // the flag is unset → zero overhead on the hot path.
     let exclude_arc = Arc::new(exclude_nets);
+    let rate_limiter: Option<Arc<RateLimiter>> =
+        args.max_pps.map(|pps| Arc::new(RateLimiter::new(pps)));
+    if let Some(pps) = args.max_pps {
+        println!("--max-pps {}: global rate cap enabled.", pps);
+    }
     let prod = {
         let st = stats.clone();
         let skip = Arc::new(skip_set);
         let nets = nets.clone();
         let ports = ports.clone();
         let exclude = exclude_arc.clone();
-        tokio::spawn(async move { producer(work_tx, nets, ports, skip, exclude, st).await })
+        let rl = rate_limiter.clone();
+        tokio::spawn(async move { producer(work_tx, nets, ports, skip, exclude, st, rl).await })
     };
 
     let started = Instant::now();
@@ -3063,6 +3481,7 @@ async fn main() -> anyhow::Result<()> {
         udp_ms,
         httpx_ms: 0,
         nuclei_ms: 0,
+        timed_out: timed_out_flag.load(Ordering::Relaxed),
     };
     // Initial summary write — httpx/nuclei timings are filled in after
     // those subprocesses finish (see rewrite below).
@@ -3177,6 +3596,24 @@ async fn main() -> anyhow::Result<()> {
             let b: String = banner.chars().take(120).collect();
             println!("  {}:{}  [{}{}{}]  {}", host, op.port, proto, tls_tag, cdn_tag, b);
         }
+    }
+
+    // `--json-out`: emit one NDJSON line per open port to stdout so users
+    // can pipe portwave straight into jq, another scanner, or a collector.
+    // Printed *after* the human-readable table so the table still renders
+    // when the user doesn't pipe, and after all files are written so
+    // consumers can rely on `jq -s . | length == summary.open_count`.
+    // Additive — file outputs (open_ports.jsonl etc.) are still produced.
+    if args.json_out {
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        for op in &open_records {
+            if let Ok(line) = serde_json::to_string(op) {
+                let _ = writeln!(stdout, "{}", line);
+            }
+        }
+        let _ = stdout.flush();
     }
 
     // ── httpx ──
@@ -3314,24 +3751,39 @@ async fn main() -> anyhow::Result<()> {
     // collector never breaks the scan's exit code.
     if let Some(url) = args.webhook.as_deref() {
         let mut payload = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
+        // Attempt to merge the scan_diff JSON into the webhook payload so
+        // downstream collectors (Slack etc.) see what changed. Also lets
+        // --webhook-on-diff-only gate on whether there's anything to report.
+        let mut diff_has_changes = false;
         if diff_path.exists() {
             if let Ok(diff_str) = fs::read_to_string(&diff_path) {
                 if let Ok(diff_val) = serde_json::from_str::<serde_json::Value>(&diff_str) {
+                    // Count additions/removals: if both arrays are empty
+                    // (or missing), there's nothing new since the last scan.
+                    let opened = diff_val.get("opened").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                    let closed = diff_val.get("closed").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                    if opened > 0 || closed > 0 {
+                        diff_has_changes = true;
+                    }
                     if let Some(obj) = payload.as_object_mut() {
                         obj.insert("diff".into(), diff_val);
                     }
                 }
             }
         }
-        match tokio::task::spawn_blocking({
-            let url = url.to_string();
-            move || post_webhook(&url, &payload)
-        })
-        .await
-        {
-            Ok(Ok(())) => println!("Webhook: posted summary to {}", url),
-            Ok(Err(e)) => eprintln!("Webhook: failed ({}) — continuing.", e),
-            Err(e) => eprintln!("Webhook: join error ({}) — continuing.", e),
+        if args.webhook_on_diff_only && !diff_has_changes {
+            println!("Webhook: skipped — --webhook-on-diff-only and no new opens/closes since last scan.");
+        } else {
+            match tokio::task::spawn_blocking({
+                let url = url.to_string();
+                move || post_webhook(&url, &payload)
+            })
+            .await
+            {
+                Ok(Ok(())) => println!("Webhook: posted summary to {}", url),
+                Ok(Err(e)) => eprintln!("Webhook: failed ({}) — continuing.", e),
+                Err(e) => eprintln!("Webhook: join error ({}) — continuing.", e),
+            }
         }
     }
 

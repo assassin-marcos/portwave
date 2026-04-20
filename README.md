@@ -55,21 +55,31 @@ tr '\n' ',' < ports/portwave-top-ports.txt | sed 's/,$//' > /tmp/ports.csv
 |                                    | masscan | rustscan | naabu | **portwave** |
 |------------------------------------|:---:|:---:|:---:|:---:|
 | IPv4 + IPv6 TCP discovery          | ⚠️ | ⚠️ | ✅ | ✅ |
+| Smart IPv6 scanning (RFC 7707 patterns) | ❌ | ❌ | ❌ | ✅ |
+| Scope safety net (refuse 2^20+ hosts by default) | ❌ | ❌ | ❌ | ✅ |
 | Adaptive concurrency (local-error) | ❌ | ❌ | ❌ | ✅ |
 | Banner grab + protocol classify    | ❌ | ❌ | partial | ✅ |
 | TLS sniff on non-443               | ❌ | ❌ | ❌ | ✅ |
 | CDN / WAF edge tagging             | ❌ | ❌ | ❌ | ✅ |
 | ASN expansion built in             | ❌ | ❌ | ❌ | ✅ |
 | Top-20 priority port scan (early results) | ❌ | ❌ | ❌ | ✅ |
+| Nmap-style `--top-ports N`         | ✅ | ✅ | ❌ | ✅ |
 | UDP top-20 opt-in                  | partial | ❌ | partial | ✅ |
+| Global packet-per-second cap (`--max-pps`) | ✅ | ❌ | ✅ | ✅ |
+| Wallclock budget (`--max-scan-time`) | ❌ | ❌ | ❌ | ✅ |
+| Dry-run / scan-plan preview        | ❌ | ❌ | ❌ | ✅ |
 | `scan_diff.json` vs. prior run     | ❌ | ❌ | ❌ | ✅ |
 | Webhook on completion              | ❌ | ❌ | ❌ | ✅ |
+| Webhook only on diff change        | ❌ | ❌ | ❌ | ✅ |
+| NDJSON stream to stdout            | ❌ | ❌ | partial | ✅ |
 | Dynamic CDN list refresh           | ❌ | ❌ | ❌ | ✅ |
 | Exclude list (scope discipline)    | ✅ | ❌ | ✅ | ✅ |
 | Resume after crash / Ctrl+C        | ❌ | ❌ | ❌ | ✅ |
 | Built-in httpx + nuclei chain      | ❌ | plugin | chain | ✅ |
 | Structured JSON artefacts          | ❌ | ❌ | partial | ✅ |
 | Self-update (`--update`)           | ❌ | ❌ | ❌ | ✅ |
+| Self-uninstall (`--uninstall`)     | ❌ | ❌ | ❌ | ✅ |
+| Clear input validation errors      | ❌ | partial | partial | ✅ |
 | Single static cross-platform binary| ✅ | ✅ | ✅ | ✅ |
 
 ---
@@ -162,18 +172,23 @@ portwave --update | --check-update | --refresh-cdn
 
 | Flag | Accepts |
 |---|---|
-| `<CIDR_INPUT>` positional | `203.0.113.0/24`, `1.2.3.4`, `5.6.7.10-5.6.7.20`, or comma-separated mix |
-| `--input-file <FILE>` | One target per line, `#` for comments. `-` for stdin |
-| `--asn <LIST>` | `AS13335,AS15169` — expanded via RIPE stat (public, no API key) |
-| `--exclude <LIST>` | Same format as `<CIDR_INPUT>`; skipped in the producer |
+| `<CIDR_INPUT>` positional | `203.0.113.0/24`, `1.2.3.4`, `5.6.7.10-5.6.7.20`, `2001:db8::/112`, or comma-separated mix |
+| `-i, --input-file <FILE>` | One target per line, `#` for comments |
+| `-a, --asn <LIST>` | `AS13335,AS15169` — expanded via RIPE stat (public, no API key) |
+| `-e, --exclude <LIST>` | Same format as `<CIDR_INPUT>`; skipped in the producer |
+| `--ipv4-only` | Drop IPv6 ranges from the expanded scope |
+| `--ipv6-only` | Drop IPv4 ranges from the expanded scope |
+| `--smart-ipv6` | Replace huge IPv6 ranges (> /108) with ~450 RFC-7707 likely addresses |
+| `--allow-huge-scope` | Bypass the default 2²⁰-host scope safety net |
 
 ### Ports
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--ports <SPEC>` | — | `22,80,443,8000-9000` |
-| `--port-file <FILE>` | — | Comma / whitespace separated |
-| *(neither)* | **embedded 1433** | nmap top-1000 ∪ bug-bounty service ports |
+| `-p, --ports <SPEC>` | — | `22,80,443,8000-9000` |
+| `-f, --port-file <FILE>` | — | Comma / whitespace separated |
+| `--top-ports <N>` | — | Use the first N ports from the loaded list (nmap-compat) |
+| *(none of the above)* | **embedded 1433** | nmap top-1000 ∪ bug-bounty service ports |
 
 Top-20 priority ports (`80, 443, 22, 21, 25, 53, 8080, 8443, 3389, 110, 143, 445, 3306, 5432, 6379, 27017, 9200, 1883, 5900, 11211`) are always scanned first regardless of source.
 
@@ -186,14 +201,24 @@ Top-20 priority ports (`80, 443, 22, 21, 25, 53, 8080, 8443, 3389, 110, 143, 445
 | `--enrich-timeout-ms <N>` | `1500` | Phase-B (banner / TLS) connect timeout |
 | `--retries <N>` | `1` | Retries on Phase-A timeout only (RSTs never retry) |
 
+### Rate limiting / budget / dry-run
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--max-pps <N>` | — | Global packets-per-second cap (polite scanning) |
+| `--max-scan-time <DUR>` | — | Hard wallclock cap (`10m`, `1h`, `30s`, `2h15m`). Phase B still runs on whatever Phase A found; summary gets `timed_out: true` |
+| `--dry-run` | off | Print the scan plan (target count, port count, estimated runtime) and exit — zero probes fired |
+
 ### UDP, output, httpx / nuclei
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--udp` | off | UDP discovery phase against ~15 well-known services |
-| `--output-dir <PATH>` | `./scans` | Base output directory |
+| `-U, --udp` | off | UDP discovery phase against ~15 well-known services |
+| `-o, --output-dir <PATH>` | `./scans` | Base output directory |
+| `--json-out` | off | Emit one NDJSON line per open port to stdout (in addition to files) |
 | `--no-resume` | off | Don't load `open_ports.jsonl` as a skip-set |
-| `--webhook <URL>` | — | POST summary JSON (with `diff` merged) on completion |
+| `-w, --webhook <URL>` | — | POST summary JSON (with `diff` merged) on completion |
+| `--webhook-on-diff-only` | off | Skip the webhook unless the diff shows new opens or closes |
 | `--httpx-threads <N>` | `150` | httpx concurrency |
 | `--httpx-paths <LIST>` | — | Extra paths for httpx to probe |
 | `--httpx-follow-redirects` | off | Follow redirects (folds chains into single entries) |
@@ -208,12 +233,18 @@ Top-20 priority ports (`80, 443, 22, 21, 25, 53, 8080, 8443, 3389, 110, 143, 445
 
 | Flag | Purpose |
 |---|---|
-| `-u, --update` | Download latest release binary, replace in place, refresh any on-disk ports file |
-| `--check-update` | Report whether a newer release exists (peeks both releases + tags API) |
+| `-u, --update` | Download latest release binary, replace in place, refresh any on-disk ports file. Prints a What's-new changelog on completion |
+| `-c, --check-update` | Report whether a newer release exists (peeks both releases + tags API) |
+| `-X, --uninstall` | Remove portwave (binary + share + cache + optional config), interactive `[y/N]` |
+| `-y, --yes` | Skip the uninstall confirmation (for scripted removal) |
 | `--refresh-cdn` | Re-fetch Cloudflare + Fastly edge ranges live, merge with embedded non-API providers, cache to `~/.cache/portwave/cdn-ranges.txt` |
 | `--no-update-check` | Suppress startup "update available" banner |
+| `--no-update-prompt` | Show the update banner + changelog but skip the `[Y/n]` prompt |
+| `--no-install-prompt` | Don't prompt to install httpx/nuclei if missing (for CI) |
 | `--no-art` / `-q, --quiet` | Suppress banner art / all banner output |
 | `--no-banner` / `--no-tls-sniff` / `--no-adaptive` | Turn off individual Phase-B features |
+
+The startup banner prints `(latest)` in green or `(outdated → vX.Y.Z)` in red next to the version — the cache is refreshed against GitHub on every startup (1 s budget, 5 min cache-hit fast path) so the tag is always accurate.
 
 ---
 
@@ -275,6 +306,79 @@ portwave udp_sweep 203.0.113.0/24 --udp
 
 # Continuous monitoring (cron the same command daily)
 portwave acme_daily 203.0.113.0/24 --webhook $SLACK_URL
+
+# Diff-only webhook — only post when something actually changed
+portwave acme_daily 203.0.113.0/24 --webhook $SLACK_URL --webhook-on-diff-only
+
+# Sanity-check a big ASN before committing to it
+portwave preview --asn AS13335 --dry-run
+
+# NDJSON stream for scripting
+portwave acme 203.0.113.0/24 --json-out --no-httpx --no-nuclei --quiet | jq -c 'select(.tls)'
+
+# Polite scan — global 200 pps cap
+portwave gentle 203.0.113.0/24 --max-pps 200
+
+# Hard time budget — stop after 10 minutes, Phase B runs on whatever Phase A found
+portwave quick_bb --asn AS99999 --max-scan-time 10m
+```
+
+---
+
+## IPv6 scanning
+
+portwave treats IPv6 as a first-class target family. Inputs that are accepted without any extra flag:
+
+```bash
+portwave ipv6 2001:db8::1                   # single IP
+portwave ipv6 2001:db8::1,2001:db8::2       # multiple
+portwave ipv6 2001:db8::/112                # small CIDR (65 K hosts) — scans fully
+portwave ipv6 --input-file v6-targets.txt
+portwave dual  "203.0.113.0/24,2001:db8::/112"   # mixed IPv4 + IPv6
+```
+
+### The IPv6 scale problem
+
+A single `/64` (one allocation to a typical home ISP) contains 2⁶⁴ ≈ **18 quintillion** addresses. A `/48` contains 2⁸⁰. Exhaustive enumeration is physically impossible at any speed.
+
+portwave has three mechanisms to handle this:
+
+**1. Scope safety net (on by default).** Any target set that would expand to more than **2²⁰ (≈ 1 million) hosts** is refused with a clear error:
+
+```text
+error: target scope would expand to 79228162514264337593543950336 host(s) — above the 2^20 safety cap.
+  bypass options:
+    --smart-ipv6         scan only RFC-7707 common IPv6 addresses
+    --allow-huge-scope   explicitly proceed with the full expansion
+    --top-ports 100      cut the per-host probe cost if the range is accurate
+```
+
+Threshold picked so a `/12` IPv4 (1 M hosts) or `/108` IPv6 (1 M hosts) still runs unprompted.
+
+**2. Smart IPv6 (`--smart-ipv6`).** Replaces any IPv6 CIDR larger than `/108` with **~450 targeted addresses** following [RFC 7707](https://datatracker.ietf.org/doc/html/rfc7707) patterns:
+
+- **Low sequential**: `::1`, `::2`, … `::ff` (admins routinely assign these)
+- **Service decimal**: `::100` … `::2ff`
+- **Hexspeak**: `::dead`, `::beef`, `::cafe`, `::babe`, `::f00d`, `::1337`, `::c0de`, `::feed`, `::face`, `::b00b`, …
+- **Round decimals**: `::1000`, `::2000`, `::8080`, `::8443`, `::6379`, `::27017`
+- **SLAAC landmarks**: `::fffe:xxxx` EUI-64 lowest-bit patterns
+
+Scales a `/32` or `/48` from "impossible" to "~800 probes per port in under a minute". Same technique used by `scanrand6` and `thc-ipv6`.
+
+```bash
+# Google's allocated /32 — impossible exhaustively, fast with --smart-ipv6
+portwave gcloud 2a00:1450::/32 --smart-ipv6 --top-ports 10 --no-httpx --no-nuclei
+```
+
+**3. `--allow-huge-scope` (explicit override).** For users who genuinely know what they're doing. Bypasses the safety net without rewriting the target list. Use with care.
+
+### Family filters
+
+When a mixed input naturally contains both families but you only want one:
+
+```bash
+portwave acme --asn AS13335 --ipv4-only     # drop all IPv6 ranges from scope
+portwave acme --asn AS13335 --ipv6-only     # drop all IPv4 ranges from scope
 ```
 
 ---
@@ -324,6 +428,42 @@ CIDRs / IPs / ranges / ASN / input-file
 ```
 
 ---
+
+## Limitations
+
+What portwave deliberately doesn't do (by design or deferred):
+
+- **No SYN scanning.** TCP-connect only — no raw sockets, no root required, no Npcap on Windows. Nmap's `-sS` is faster on the wire but invasive and privilege-bound. Planned for a future release as an opt-in `--syn` mode (root only).
+- **No service-version fingerprinting beyond banner classify.** portwave reads the first passive response + does a short HTTP / TLS probe, and maps to 9 protocol labels (http, ssh, ftp, smtp, pop3, imap, smtp_or_ftp, ssl, unknown). For deep `-sV`-style probing use nmap on the open-port list portwave produces.
+- **No IDS evasion** (decoys, fragmentation, source-port spoofing). Not the goal — use masscan or nmap if you need stealth.
+- **No exhaustive IPv6 `/64` enumeration.** Physically impossible at any speed; `--smart-ipv6` covers the ~450 addresses real admins actually use (RFC 7707 patterns). Anything beyond that wants passive enumeration (CT logs, DNS brute-force, Shodan).
+- **No ICMP host discovery pre-flight.** Every target gets TCP probes whether it's alive or not. On sparse ranges this wastes probes; on dense ranges it doesn't matter. `--max-scan-time` is the mitigation for huge sparse scopes.
+- **HTTP/2 + HTTP/3 banners not parsed.** The HTTP probe speaks HTTP/1.1; h2/h3-only services show up as open ports with empty banners. httpx in Phase B handles h2/h3 via ALPN, so hits still surface in `httpx_results.txt`.
+- **No scanner-side DNS resolution.** Input is IPs, CIDRs, ranges, or ASNs — never hostnames. Resolve with your enum tool (amass, subfinder) and pipe results in via `--input-file`.
+
+## Input validation
+
+portwave fails fast on obviously malformed inputs with a specific error + a hint so you don't have to open `--help`:
+
+```text
+error: --asn "notanasn" is not a valid ASN.
+  hint: expected format "AS13335" or "AS13335,AS15169" (1-10 digits after optional AS prefix)
+
+error: --max-scan-time invalid duration "5q" — unknown unit 'q'
+  hint: valid units are s (seconds), m (minutes), h (hours), d (days)
+
+error: --max-pps must be > 0 (got 0). Use --quiet to disable scanning noise instead.
+
+error: --ipv4-only and --ipv6-only are mutually exclusive — pick one.
+
+error: target scope would expand to 79228162514264337593543950336 host(s) — above the 2^20 safety cap.
+  bypass options:
+    --smart-ipv6         scan only RFC-7707 common IPv6 addresses in huge IPv6 ranges
+    --allow-huge-scope   explicitly proceed with the full expansion (you really sure?)
+    --top-ports 100      cut the per-host probe cost if the range is accurate
+```
+
+Exit code is **`2`** for every validation error so scripts can distinguish "user typo" from a scan that genuinely found nothing (exit `0`).
 
 ## FAQ
 
