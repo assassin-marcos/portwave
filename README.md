@@ -135,77 +135,82 @@ Every cell verified against the current source of each tool. **Legend**: ✅ nat
 
 ## Install
 
-### Linux / macOS
+**Linux / macOS:**
 ```bash
-git clone https://github.com/assassin-marcos/portwave
-cd portwave
-bash install.sh
+git clone https://github.com/assassin-marcos/portwave && cd portwave && bash install.sh
 ```
 
-### Windows (PowerShell)
+**Windows (PowerShell):**
 ```powershell
-git clone https://github.com/assassin-marcos/portwave
-cd portwave
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+git clone https://github.com/assassin-marcos/portwave; cd portwave; powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Both installers auto-detect `httpx` / `nuclei` across `$PATH`, `~/go/bin`, `~/.pdtm/go/bin`, Homebrew, MacPorts, `~/.local/bin`; pick an install prefix that's already on `$PATH`; and offer to append the PATH line to the right shell rc. Non-interactive: `NONINTERACTIVE=1`.
+Installers auto-detect `httpx` / `nuclei` across `$PATH`, `~/go/bin`, `~/.pdtm/go/bin`, Homebrew, MacPorts, `~/.local/bin`; append PATH to the right shell rc. Non-interactive: `NONINTERACTIVE=1`.
 
-### Updating
+**Update / uninstall** (all platforms):
 ```bash
-portwave --update          # download + replace binary for current OS/arch
-portwave --check-update    # report whether a newer version exists
-```
-
-The default 1433-port list, CDN CIDR snapshot, and banner art are baked into the binary — `--update` always ships the current versions.
-
-### Uninstall
-
-Preferred — one command, all platforms:
-
-```bash
-portwave --uninstall           # interactive, shows plan + prompts [y/N]
-portwave --uninstall --yes     # non-interactive (for scripts / CI)
-```
-
-Legacy (kept as a fallback if the binary is missing or broken):
-
-```bash
-bash uninstall.sh                                         # Linux / macOS
-powershell -ExecutionPolicy Bypass -File .\uninstall.ps1  # Windows
+portwave -u          # install latest release + print What's-new changelog
+portwave -c          # check for updates (does not install)
+portwave -X          # uninstall (binary + share + cache); -Xy to skip the prompt
 ```
 
 ---
 
-## Quickstart
+## Recommended commands
+
+### 🎯 Maximum coverage — don't miss any open port (CIDR)
 
 ```bash
-# Full pipeline: scan → httpx → nuclei
-portwave acme 203.0.113.0/24
+portwave acme 203.0.113.0/24 \
+    -t 1000 -T 1500 -r 2 --enrich-timeout-ms 3000 \
+    --tags-from-banner --httpx-follow-redirects \
+    --httpx-paths "/actuator,/.git/HEAD,/server-status,/robots.txt,/.env,/swagger-ui,/admin,/api/v1"
+```
 
-# Mixed input
-portwave acme "203.0.113.0/24,1.2.3.4,5.6.7.10-5.6.7.20"
+### 🎯 Maximum coverage — ASN (one company's full public infra)
 
-# From a file (CIDRs / IPs / ranges, `#` comments)
-portwave acme --input-file scope.txt
+```bash
+portwave acme --asn AS13335 \
+    -t 800 -T 1500 -r 2 --enrich-timeout-ms 3000 \
+    --httpx-paths "/actuator,/.git/HEAD,/server-status,/robots.txt,/.env,/swagger-ui,/admin,/api/v1"
+# --tags-from-banner + --httpx-follow-redirects auto-enable under --asn
+```
 
-# Everything a company announces via BGP
-portwave acme --asn AS13335
+**Why these flags?**
 
-# Inline port spec
-portwave acme 203.0.113.0/24 --ports "22,80,443,8000-9000"
+| Flag | Value | What it buys |
+|---|---|---|
+| `-t 1000` (CIDR) / `-t 800` (ASN) | lower than default 1500 | Avoids ephemeral-port exhaustion on long ASN scans → fewer local-resource errors → fewer missed ports |
+| `-T 1500` | 1.5 s discovery timeout | Catches slow / firewalled hosts that default 800 ms misses — common on gov / enterprise IPs |
+| `-r 2` | 2 retries | Catches transient SYN drops (ISP rate-limits, router buffer overflow). Default 1 is fine for clean LAN; bump to 2 over internet |
+| `--enrich-timeout-ms 3000` | 3 s enrichment timeout | Slow HTTP servers + TLS handshakes that default 1.5 s cuts off (gov / old embedded gear) |
+| `--tags-from-banner` | — | Feeds nuclei only templates matching detected protocols → 30–60 % faster nuclei runs, no coverage loss |
+| `--httpx-follow-redirects` | — | Most hosts 30x to login pages / WAFs; following gives meaningful status + title |
+| `--httpx-paths` | list | Probes common leak / config / admin endpoints beyond `/` |
 
-# Exclude out-of-scope ranges
-portwave acme 203.0.113.0/22 --exclude "203.0.113.0/24,203.0.114.0/28"
+### ⚡ Quick scan — defaults are already tuned for "fast + accurate"
 
-# UDP discovery (DNS, NTP, SNMP, SSDP, mDNS, memcached, IKE, OpenVPN, …)
-portwave acme 203.0.113.0/24 --udp
+```bash
+portwave acme 203.0.113.0/24                                # full pipeline, defaults
+portwave acme --input-file scope.txt                        # targets from file
+portwave acme --asn AS13335                                 # entire ASN
+portwave acme "203.0.113.0/24,2001:db8::/112"               # mixed IPv4 + IPv6
+portwave acme 203.0.113.0/24 --ports "22,80,443,8000-9000"  # custom ports
+portwave acme 203.0.113.0/24 --top-ports 100                # nmap-style top N
+portwave acme 203.0.113.0/24 --exclude "203.0.113.64/26"    # skip subranges
+portwave acme 203.0.113.0/24 --udp                          # also UDP discovery
+portwave gcloud 2a00:1450::/32 --smart-ipv6 --top-ports 10  # massive IPv6 range
+portwave preview --asn AS13335 --dry-run                    # plan without scanning
+```
 
-# Post summary to Discord/Slack/webhook on completion
-portwave acme 203.0.113.0/24 --webhook https://hooks.slack.com/services/XXX/YYY/ZZZ
+### 🤖 Automation / monitoring
 
-# Re-run daily — scan_diff.json shows which ports are new / closed since last run
-portwave acme 203.0.113.0/24
+```bash
+portwave acme 203.0.113.0/24 --webhook $SLACK_URL                       # post on completion
+portwave acme 203.0.113.0/24 --webhook $SLACK_URL --webhook-on-diff-only # only if opens changed
+portwave acme 203.0.113.0/24 --json-out --no-httpx --no-nuclei | jq .   # NDJSON stream
+portwave acme 203.0.113.0/24 --max-pps 200                              # polite (200 pps cap)
+portwave big --asn AS99999 --max-scan-time 30m                          # hard time budget
 ```
 
 ---
@@ -348,51 +353,6 @@ Metric meanings:
 
 ---
 
-## Recipes
-
-```bash
-# Bug-bounty /20 + webhook on findings
-portwave acme 203.0.113.0/20 --exclude "203.0.113.64/26" \
-    --tags-from-banner --webhook $SLACK_URL
-
-# Full company scan from an ASN
-portwave acme --asn AS12345 --exclude 203.0.113.0/24
-
-# Piped from external enumeration
-amass intel -asn 12345 -whois | portwave acme --input-file -
-
-# Fast top-20 only
-portwave quick 203.0.113.0/16 --ports \
-    "21,22,23,25,53,80,110,143,443,445,993,995,1433,3306,3389,5432,6379,8080,8443,9200" \
-    --no-httpx --no-nuclei
-
-# Full 1-65535 sweep on selected IPs
-portwave deep 1.2.3.4,5.6.7.8 --ports "1-65535" --retries 2
-
-# UDP + TCP combined
-portwave udp_sweep 203.0.113.0/24 --udp
-
-# Continuous monitoring (cron the same command daily)
-portwave acme_daily 203.0.113.0/24 --webhook $SLACK_URL
-
-# Diff-only webhook — only post when something actually changed
-portwave acme_daily 203.0.113.0/24 --webhook $SLACK_URL --webhook-on-diff-only
-
-# Sanity-check a big ASN before committing to it
-portwave preview --asn AS13335 --dry-run
-
-# NDJSON stream for scripting
-portwave acme 203.0.113.0/24 --json-out --no-httpx --no-nuclei --quiet | jq -c 'select(.tls)'
-
-# Polite scan — global 200 pps cap
-portwave gentle 203.0.113.0/24 --max-pps 200
-
-# Hard time budget — stop after 10 minutes, Phase B runs on whatever Phase A found
-portwave quick_bb --asn AS99999 --max-scan-time 10m
-```
-
----
-
 ## IPv6 scanning
 
 portwave treats IPv6 as a first-class target family. Inputs that are accepted without any extra flag:
@@ -453,47 +413,9 @@ portwave acme --asn AS13335 --ipv6-only     # drop all IPv4 ranges from scope
 
 ## How it works
 
-```
-CIDRs / IPs / ranges / ASN / input-file
-      │
-      ▼
-┌─────────────────────────┐        ┌──────────────┐
-│ Two-pass producer:      │◀──skip─│ exclude list │
-│   1. top-20 priority    │◀──skip─│ resume jsonl │
-│   2. remaining ports    │        └──────────────┘
-│  flume MPMC queue,      │
-│  iterator-based (O(nets)│
-│  memory, not O(IPs))    │
-└────────────┬────────────┘
-             │ SocketAddr
-┌────────────▼────────────┐        ┌──────────────┐
-│ Phase-A workers (1500)  │◀──────▶│ Adaptive     │
-│ SO_LINGER + NODELAY     │        │ monitor      │
-│ retries on timeout      │        │ (local errs) │
-└────────────┬────────────┘        └──────────────┘
-             │ hits
-┌────────────▼────────────┐
-│ Phase-B enrichment      │
-│ passive read → HTTP     │
-│ probe → TLS ClientHello │
-│ + CDN CIDR lookup       │
-└────────────┬────────────┘
-             │ OpenPort
-┌────────────▼────────────┐    (optional)
-│ Phase-C UDP probes      │◀── --udp
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│ Writer: numeric sort,   │
-│ dedupe, stream to disk  │
-└────────────┬────────────┘
-             │
-┌────────────▼────────────┐
-│ httpx  → httpx_results  │
-│ nuclei → nuclei_results │
-│ webhook POST summary    │
-└─────────────────────────┘
-```
+Two-pass producer (top-20 priority ports first for early results, then remaining) feeds an MPMC queue → 1500 async Phase A workers → open-port hits stream into Phase B enrichment **concurrently** (banner grab + TLS sniff + HTTP probe + CDN lookup). Optional Phase C for UDP. Writer streams results to disk, then httpx + nuclei chain against the HTTP-candidate subset. Adaptive monitor shrinks concurrency only on local-resource errors (not timeouts — firewalled targets would otherwise be misread as "we're saturated").
+
+Iterator-based producer is O(nets) in memory, not O(IPs) — same memory footprint on a single /32 or a /8.
 
 ---
 
