@@ -982,18 +982,25 @@ fn format_for_nuclei(ip: &IpAddr, port: u16, tls: bool) -> String {
         IpAddr::V4(v) => v.to_string(),
         IpAddr::V6(v) => format!("[{}]", v),
     };
-    if tls {
-        if port == 443 {
-            format!("https://{}", host)
-        } else {
-            format!("https://{}:{}", host, port)
-        }
-    } else if port == 80 {
-        format!("http://{}", host)
-    } else if port == 443 {
-        format!("https://{}", host)
+    // v0.13.3 — always emit explicit scheme. Previously returned bare
+    // "ip:port" for ports we couldn't classify; that made httpx's
+    // scheme-auto-detect probe BOTH http:// and https:// per target,
+    // which could silently drop the user's intended port when TLS
+    // failed (see v0.13.2 fix). With explicit scheme, httpx probes
+    // exactly what we ask.
+    let scheme = if tls || matches!(port, 443 | 4443 | 8443 | 9443 | 10443) {
+        "https"
     } else {
-        format!("{}:{}", host, port)
+        // Best-guess for non-TLS, non-canonical-HTTPS ports.
+        // Users can see the actual tls flag in open_ports.jsonl if the
+        // server unexpectedly negotiated TLS.
+        "http"
+    };
+    // Omit the port only when it's the scheme's default (prettier URLs).
+    if (scheme == "https" && port == 443) || (scheme == "http" && port == 80) {
+        format!("{}://{}", scheme, host)
+    } else {
+        format!("{}://{}:{}", scheme, host, port)
     }
 }
 
@@ -4220,7 +4227,13 @@ async fn main() -> anyhow::Result<()> {
             println!("\n--- httpx ({}) ---", bin.display());
             let httpx_started = Instant::now();
             let mut cmd = Command::new(&bin);
-            cmd.arg("-l").arg(&raw_path)
+            cmd.arg("-l").arg(&nuclei_path)     // v0.13.3: use explicit-scheme
+                                                // URL list instead of bare
+                                                // ip:port. Guarantees httpx
+                                                // probes exactly one scheme
+                                                // per entry — no scheme
+                                                // auto-detect, no conflict
+                                                // in output.
                 .arg("-sc")
                 .arg("-cl")
                 .arg("-location")
@@ -4229,16 +4242,16 @@ async fn main() -> anyhow::Result<()> {
                 // -silent suppresses the ASCII banner + [WRN] dashboard noise
                 // while still writing real findings to both stdout and -o.
                 .arg("-silent")
-                // -no-fallback (v0.13.2): without this, httpx "scheme fallback"
-                // silently drops the port we asked about when its TLS probe
-                // fails. E.g. given `1.1.1.4:443`, if the TLS handshake fails
-                // (no SNI / cert mismatch), httpx falls back to probing
-                // `http://1.1.1.4` on port 80 and outputs THAT — making users
-                // think port 443 is missing. With -nf, httpx probes the
-                // requested scheme/port as-is and reports both http and https
-                // independently per target. See portwave issue where
-                // Cloudflare :443 targets silently disappeared from output.
+                // -no-fallback (v0.13.2): prevents httpx's scheme-fallback
+                // from silently substituting port 80 when TLS fails on :443.
                 .arg("-no-fallback")
+                // -ztls (v0.13.3): use the zcrypto TLS library which is
+                // more lenient with legacy / broken certificates (e.g.
+                // Cisco devices serving certs with negative X.509 serial
+                // numbers). Modern Go crypto/tls rejects these by spec;
+                // -ztls parses them. Without this, legacy IoT / enterprise
+                // gear silently disappears from httpx output.
+                .arg("-ztls")
                 .arg("-threads").arg(args.httpx_threads.to_string())
                 .arg("-timeout").arg("10")
                 .arg("-retries").arg("1")
