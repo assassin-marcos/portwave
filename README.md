@@ -22,52 +22,26 @@ Takes CIDRs, IPs, IP ranges, or an ASN. Finds open TCP (and optional UDP) ports,
 
 ## Benchmarks
 
-Two head-to-heads, same hardware, same TCP-connect technique, matched threads / timeout / retries across every tool.
+Four-way head-to-head: portwave vs rustscan vs naabu vs masscan on the same hardware, same TCP-connect technique, matched threads / timeout / retries across every tool. All four found the **same 15 `ip:port`** — zero false positives, zero false negatives on any side.
 
-### A. `43.230.180.0/24 × {80, 443, 8443}` — 768 probes, 15 expected opens
-
-All four scanners ran with the same flags (`threads=1500, timeout=800 ms, retries=1`) and were each wrapped in `/usr/bin/time -v` for honest metrics. All four found the **same 15 `ip:port`** (zero false positives, zero false negatives on any side).
+### `43.230.180.0/24 × {80, 443, 8443}` — 768 probes
 
 | Tool (config) | Wall time | Peak RSS | Opens | Notes |
 |---|---:|---:|:---:|---|
-| **portwave v0.12.1 (pure discovery)** | **1.72 s** | **8.3 MB** | 15 | `--no-banner --no-tls-sniff --no-adaptive` |
+| **portwave (pure discovery)** | **1.72 s** | **8.3 MB** | 15 | `--no-banner --no-tls-sniff --no-adaptive` |
 | rustscan 2.3.0 (`--tries 1`) | 1.35 s | 63.4 MB | 15 | Fewer attempts than others (not parity) |
 | rustscan 2.3.0 (`--tries 2`, parity) | 1.98 s | 63.4 MB | 15 | Matched retries |
-| **portwave v0.12.1 (default, with Phase B)** | **3.03 s** | **8.5 MB** | 15 | Also produces banners + TLS tags + HTTP fingerprint |
+| **portwave (default, with Phase B)** | **3.03 s** | **8.5 MB** | 15 | Also produces banners + TLS tags + HTTP fingerprint |
 | masscan (SYN, `--rate 2000`) | 6.47 s | 40.2 MB | 15 | SYN mode, requires root |
 | naabu (`-s c`) | 133.92 s | 56.6 MB | 15 | Connect mode internal rate-limit |
 
-**Takeaway**: with matched retries, portwave **wins speed AND memory** vs rustscan (1.72 s vs 1.98 s, 7.6× less RAM) in pure-discovery mode; default portwave spends an extra 1.3 s on banner/TLS/HTTP enrichment that no other tool here produces.
+**Takeaway**: with matched retries, portwave **wins speed AND memory** vs rustscan (1.72 s vs 1.98 s, 7.6× less RAM) in pure-discovery mode; default portwave spends an extra 1.3 s on banner + TLS + HTTP enrichment that no other tool here produces.
 
 Exact command:
 ```bash
 /usr/bin/time -v portwave -t 1500 -T 800 -r 1 -p 80,443,8443 \
     --no-httpx --no-nuclei --no-art --no-update-check --quiet \
     bench 43.230.180.0/24
-```
-
-### B. `193.109.229.0/24 × 1433 ports` — 367 K probes, 99.94 % firewalled
-
-|                            | **portwave** | naabu |
-|----------------------------|------------------:|------:|
-| Wall-clock                 | **6 min 30 s**    | 18 min 27 s |
-| User CPU                   | 19.7 s            | 89.6 s |
-| Peak RSS                   | **10.3 MB**       | 81.5 MB |
-| Concurrency model          | 1500 async tokio workers | 1000 socks + 2000 pps cap |
-| Output style               | Streaming         | LevelDB buffer, end-flush |
-
-**Accuracy — 100 % agreement:** both tools reported the exact same **75 open `ip:port`**. Zero false positives, zero false negatives on either side.
-
-Reproduce (large-scan variant):
-```bash
-tr '\n' ',' < ports/portwave-top-ports.txt | sed 's/,$//' > /tmp/ports.csv
-
-/usr/bin/time -v portwave bench 193.109.229.0/24 \
-    -t 1500 -T 800 -r 1 --no-httpx --no-nuclei
-
-/usr/bin/time -v naabu -host 193.109.229.0/24 \
-    -pf /tmp/ports.csv -s c -rate 2000 -retries 1 -timeout 800 \
-    -silent -o /tmp/naabu.txt
 ```
 
 ---
