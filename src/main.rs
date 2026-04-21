@@ -5066,9 +5066,17 @@ async fn main() -> anyhow::Result<()> {
     // the richer response line.
     //
     // Concurrency is independent of --threads (which drives the 3000-worker
-    // Phase A pool): --probe-concurrency (short -C) defaults to 100, with
-    // an auto-halve to 50 on ASN scans to stay under WAF burst thresholds
-    // that blocked httpx coverage on the 164.121.0.0/16 scan.
+    // Phase A pool): --probe-concurrency (short -C) defaults to 100.
+    //
+    // v0.14.11: follow-redirects is default-on. Warn the user if --no-enrich
+    // is passed, so they know status / title / redirect-chain won't be
+    // populated in open_ports.jsonl / enrichment_results.txt.
+    if args.no_enrich && !args.quiet {
+        eprintln!(
+            "[!] --no-enrich: skipping HTTP(S) probe. Status codes, titles, \
+             redirect chains, and final URLs will NOT be populated in output."
+        );
+    }
     let http_probe_ms: u128 = if args.no_enrich || args.no_banner || open_records.is_empty() {
         0
     } else {
@@ -5621,15 +5629,22 @@ async fn main() -> anyhow::Result<()> {
 
             for (url, status, cl, title, final_url) in &rows {
                 // File line: plain, httpx-format for grep-friendliness.
+                // v0.14.12: include " → final_url" suffix when a redirect was
+                // followed, so downstream tools can see the landing URL
+                // without having to parse the JSONL.
                 if let Some(w) = file_writer.as_mut() {
                     let s = status.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
                     let l = cl.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+                    let suffix = match final_url.as_deref() {
+                        Some(u) => format!(" -> {}", u),
+                        None => String::new(),
+                    };
                     match title.as_deref() {
                         Some(t) if !t.is_empty() => {
-                            let _ = writeln!(w, "{} [{}] [{}] [{}]", url, s, l, t);
+                            let _ = writeln!(w, "{} [{}] [{}] [{}]{}", url, s, l, t, suffix);
                         }
                         _ => {
-                            let _ = writeln!(w, "{} [{}] [{}]", url, s, l);
+                            let _ = writeln!(w, "{} [{}] [{}]{}", url, s, l, suffix);
                         }
                     }
                 }
