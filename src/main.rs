@@ -5154,11 +5154,22 @@ async fn main() -> anyhow::Result<()> {
             );
 
             let sem = Arc::new(Semaphore::new(concurrency));
-            let mut handles = Vec::with_capacity(probe_targets.len());
+            let stats_probe = stats.clone();
+            let mut set: futures::stream::FuturesUnordered<
+                tokio::task::JoinHandle<(usize, Option<HttpProbeResult>)>,
+            > = futures::stream::FuturesUnordered::new();
             for (idx, url) in probe_targets {
                 let sem = sem.clone();
-                handles.push(tokio::spawn(async move {
+                let stats_inner = stats_probe.clone();
+                set.push(tokio::spawn(async move {
+                    // Early bail if shutdown fired before our turn came up.
+                    if stats_inner.shutdown.load(Ordering::Relaxed) {
+                        return (idx, None);
+                    }
                     let _permit = sem.acquire_owned().await.ok();
+                    if stats_inner.shutdown.load(Ordering::Relaxed) {
+                        return (idx, None);
+                    }
                     let res = tokio::task::spawn_blocking(move || {
                         http_probe_blocking(&url, follow)
                     })
@@ -5169,25 +5180,50 @@ async fn main() -> anyhow::Result<()> {
                 }));
             }
 
-            for h in handles {
-                if let Ok((idx, Some(r))) = h.await {
-                    // Overwrite enrich()'s banner with the real status line;
-                    // keep the existing enrich() protocol classification
-                    // unless the scheme-flip retry promoted us to HTTPS.
-                    open_records[idx].banner = Some(r.status_line);
-                    open_records[idx].title = r.title;
-                    open_records[idx].final_url = r.final_url;
-                    open_records[idx].content_length = r.content_length;
-                    if !r.chain.is_empty() {
-                        open_records[idx].redirect_chain = Some(r.chain);
+            // v0.14.13: Ctrl+C-responsive collection loop. The previous
+            // version awaited each JoinHandle sequentially with no
+            // shutdown check, so Ctrl+C during a big enrichment had to
+            // wait for every in-flight reqwest call to hit its 5 s
+            // timeout. Now FuturesUnordered yields completions as they
+            // arrive, and the whole loop is raced against ctrl_c — on
+            // interrupt we flip the shutdown flag (which makes queued
+            // probes bail fast) and break out, keeping whatever we
+            // already collected.
+            use futures::StreamExt as _;
+            let probe_stats = stats.clone();
+            let collector = async {
+                while let Some(joined) = set.next().await {
+                    if probe_stats.shutdown.load(Ordering::Relaxed) {
+                        break;
                     }
-                    if r.via_https {
-                        open_records[idx].tls = true;
-                        match open_records[idx].protocol.as_deref() {
-                            Some("https") | Some("ssh") | Some("ssl") => {}
-                            _ => open_records[idx].protocol = Some("https".into()),
+                    if let Ok((idx, Some(res))) = joined {
+                        open_records[idx].banner = Some(res.status_line);
+                        open_records[idx].title = res.title;
+                        open_records[idx].final_url = res.final_url;
+                        open_records[idx].content_length = res.content_length;
+                        if !res.chain.is_empty() {
+                            open_records[idx].redirect_chain = Some(res.chain);
+                        }
+                        if res.via_https {
+                            open_records[idx].tls = true;
+                            match open_records[idx].protocol.as_deref() {
+                                Some("https") | Some("ssh") | Some("ssl") => {}
+                                _ => open_records[idx].protocol = Some("https".into()),
+                            }
                         }
                     }
+                }
+            };
+
+            tokio::select! {
+                _ = collector => {}
+                _ = tokio::signal::ctrl_c() => {
+                    stats.shutdown.store(true, Ordering::Relaxed);
+                    eprintln!(
+                        "\n[!] Ctrl+C during enrichment — saving what we have. \
+                         ({} probes may still finish in the background)",
+                        set.len()
+                    );
                 }
             }
             started.elapsed().as_millis()
