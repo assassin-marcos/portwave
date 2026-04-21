@@ -3726,25 +3726,32 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
 
+        // Collect (domain → outcome) triples so we can print a per-domain
+        // list, not just aggregate counts. Users triaging a big
+        // bug-bounty scope want to see exactly which subdomains got
+        // dropped and why.
         let mut origin_domains = 0usize;
-        let mut cdn_domains = 0usize;
-        let mut error_domains = 0usize;
+        let mut cdn_skipped: Vec<(String, &'static str)> = Vec::new();
+        let mut error_list: Vec<(String, String)> = Vec::new();
         let breakdown = domain::cdn_breakdown(&results);
 
         for r in &results {
             if let Some(err) = &r.error {
-                error_domains += 1;
-                eprintln!("  ✗ {} — {}", r.domain, err);
+                error_list.push((r.domain.clone(), err.clone()));
                 continue;
             }
             if r.ips.is_empty() {
-                error_domains += 1;
-                eprintln!("  ✗ {} — no usable A/AAAA records", r.domain);
+                error_list.push((
+                    r.domain.clone(),
+                    "no usable A/AAAA records".to_string(),
+                ));
                 continue;
             }
-            if r.cdn.is_some() && !args.allow_cdn {
-                cdn_domains += 1;
-                continue;
+            if let Some(tag) = r.cdn {
+                if !args.allow_cdn {
+                    cdn_skipped.push((r.domain.clone(), tag));
+                    continue;
+                }
             }
             origin_domains += 1;
             for ip in &r.ips {
@@ -3761,23 +3768,50 @@ async fn main() -> anyhow::Result<()> {
         }
 
         println!(
-            "  ✓ {} domain(s) → {} origin IP(s)",
+            "  {} {} domain(s) → {} origin IP(s)",
+            cfmt("1;32", "✓"),
             origin_domains,
             domain_origin_map.len()
         );
-        if cdn_domains > 0 {
+
+        if !cdn_skipped.is_empty() {
             let breakdown_str: Vec<String> = breakdown
                 .iter()
                 .map(|(tag, n)| format!("{}:{}", tag, n))
                 .collect();
             println!(
-                "  ⚠ {} domain(s) → CDN edge ({}) — skipped",
-                cdn_domains,
+                "  {} {} domain(s) → CDN edge ({}) — skipped:",
+                cfmt("33", "⚠"),
+                cdn_skipped.len(),
                 breakdown_str.join(", ")
             );
+            // Sort by provider so reports stay stable across runs.
+            let mut sorted = cdn_skipped.clone();
+            sorted.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(&b.0)));
+            for (d, tag) in &sorted {
+                println!(
+                    "      {} {} {}",
+                    cfmt("33", d),
+                    cfmt("2", "→"),
+                    cfmt("35", tag),
+                );
+            }
         }
-        if error_domains > 0 {
-            println!("  ✗ {} domain(s) → DNS failure / no records — skipped", error_domains);
+
+        if !error_list.is_empty() {
+            println!(
+                "  {} {} domain(s) → DNS failure / no records — skipped:",
+                cfmt("1;31", "✗"),
+                error_list.len()
+            );
+            for (d, reason) in &error_list {
+                println!(
+                    "      {} {} {}",
+                    cfmt("31", d),
+                    cfmt("2", "→"),
+                    cfmt("2", reason),
+                );
+            }
         }
 
         if origin_domains == 0 && nets.is_empty() {
