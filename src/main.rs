@@ -1000,10 +1000,28 @@ fn is_http_candidate(port: u16, _protocol: Option<&str>, _tls: bool) -> bool {
     !NON_HTTP_PORTS.binary_search(&port).is_ok()
 }
 
-fn format_for_nuclei(ip: &IpAddr, port: u16, tls: bool) -> String {
-    let host = match ip {
-        IpAddr::V4(v) => v.to_string(),
-        IpAddr::V6(v) => format!("[{}]", v),
+fn format_for_nuclei(
+    ip: &IpAddr,
+    port: u16,
+    tls: bool,
+    source_label: Option<&str>,
+) -> String {
+    // v0.14.3 — when the scan was seeded from a domain input, the host
+    // part of the URL should be the DOMAIN, not the resolved IP.
+    // Reasons:
+    //   1. TLS SNI — httpx/nuclei sending `Host: 1.2.3.4` vs
+    //      `Host: example.com` gets entirely different server responses
+    //      on virtual-hosted / multi-tenant servers.
+    //   2. Many webservers serve a 400/default for raw-IP requests but
+    //      serve the real app for hostname-based ones.
+    //   3. Nuclei templates match on URL paths that the real app serves;
+    //      the IP endpoint often 404s everything.
+    let host = match source_label {
+        Some(dom) => dom.to_string(),
+        None => match ip {
+            IpAddr::V4(v) => v.to_string(),
+            IpAddr::V6(v) => format!("[{}]", v),
+        },
     };
     // v0.13.3 — always emit explicit scheme. Previously returned bare
     // "ip:port" for ports we couldn't classify; that made httpx's
@@ -3472,10 +3490,20 @@ async fn main() -> anyhow::Result<()> {
         Some(f) => f.clone(),
         None => {
             eprintln!("error: <FOLDER_NAME> is required for a scan.");
-            eprintln!("usage: portwave <FOLDER_NAME> <CIDR_INPUT> [OPTIONS]");
-            eprintln!("       portwave <FOLDER_NAME> --input-file targets.txt");
-            eprintln!("       portwave <FOLDER_NAME> --asn AS13335");
-            eprintln!("       portwave --update | --check-update");
+            eprintln!("usage:");
+            eprintln!("  portwave <FOLDER_NAME> <CIDR_INPUT> [OPTIONS]");
+            eprintln!("  portwave <FOLDER_NAME> -d example.com,sub.example.com");
+            eprintln!("  portwave <FOLDER_NAME> -i targets.txt");
+            eprintln!("  portwave <FOLDER_NAME> -a AS13335");
+            eprintln!("  portwave -u | -c | -X | --refresh-cdn");
+            eprintln!();
+            eprintln!("examples:");
+            eprintln!("  portwave bb 203.0.113.0/24                     # CIDR");
+            eprintln!("  portwave bb -d adityasec.com                   # single domain");
+            eprintln!("  portwave bb -i subdomains.txt --no-httpx --no-nuclei");
+            eprintln!("  portwave bb -a AS13335 -e 203.0.113.64/26      # ASN + exclude");
+            eprintln!();
+            eprintln!("see all flags with: portwave -h");
             std::process::exit(2);
         }
     };
@@ -4541,6 +4569,11 @@ async fn main() -> anyhow::Result<()> {
     );
     let mut raw = BufWriter::new(fs::File::create(&raw_path)?);
     let mut nuc = BufWriter::new(fs::File::create(&nuclei_path)?);
+    // v0.14.3 — dedupe nuclei_targets.txt entries. When a scan is seeded
+    // from a domain that resolves to N IPs, we'd otherwise write the
+    // same https://example.com URL N times (once per IP). httpx / nuclei
+    // handle duplicates fine but the files look messy and bloat up.
+    let mut nuclei_written: std::collections::HashSet<String> = Default::default();
     let mut by_port: std::collections::BTreeMap<u16, u64> = Default::default();
     let mut by_proto: std::collections::BTreeMap<String, u64> = Default::default();
     let mut by_cdn: std::collections::BTreeMap<String, u64> = Default::default();
@@ -4555,7 +4588,10 @@ async fn main() -> anyhow::Result<()> {
         let include_in_nuclei = args.nuclei_all_ports
             || is_http_candidate(op.port, op.protocol.as_deref(), op.tls);
         if include_in_nuclei {
-            writeln!(nuc, "{}", format_for_nuclei(&ip, op.port, op.tls))?;
+            let url = format_for_nuclei(&ip, op.port, op.tls, op.source_label.as_deref());
+            if nuclei_written.insert(url.clone()) {
+                writeln!(nuc, "{}", url)?;
+            }
         } else {
             nuclei_skipped += 1;
         }
