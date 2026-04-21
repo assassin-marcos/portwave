@@ -16,6 +16,11 @@ use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
+// v0.14.0 — domain / subdomain input + CDN-fronted auto-skip.
+// Lives in a dedicated module so DNS + CDN concerns don't leak into
+// the scanner hot path and so main.rs stays under 5 K lines.
+mod domain;
+
 // ────────────────────────── CLI ──────────────────────────
 
 #[derive(Parser, Debug, Clone)]
@@ -220,6 +225,27 @@ struct Args {
     /// Suppress the real-time "[+] IP:PORT opened" stream during Phase A
     #[arg(long, default_value_t = false)]
     no_live_hits: bool,
+
+    /// Comma-separated domains to resolve + scan. CDN-fronted hosts are
+    /// skipped by default (see --allow-cdn). Accepts sub.example.com,
+    /// IDN / Unicode, anything hickory-resolver can parse.
+    #[arg(short = 'd', long)]
+    domain: Option<String>,
+
+    /// Scan origin IPs even if the domain resolves to a known CDN edge
+    /// range. Default behavior is to skip such domains with a summary
+    /// line, since CDN edges only expose 80/443 and anything you find
+    /// belongs to the CDN, not the customer.
+    #[arg(long, default_value_t = false)]
+    allow_cdn: bool,
+
+    /// Per-domain DNS timeout, in seconds. Applies to each A/AAAA query.
+    #[arg(long, default_value_t = 3)]
+    dns_timeout: u64,
+
+    /// Max concurrent DNS lookups for --input-file / --domain.
+    #[arg(long, default_value_t = 50)]
+    dns_concurrency: usize,
 }
 
 // ────────────────────────── Types ──────────────────────────
@@ -237,6 +263,13 @@ struct OpenPort {
     /// None = presumed origin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cdn: Option<String>,
+    /// v0.14.0 — original domain this IP was resolved from, if the scan
+    /// was seeded from `-d` / `--input-file` domain entries. `None` when
+    /// the user supplied IPs directly. Drives the "domain → ip" grouping
+    /// in the OPEN PORTS render and preserves the user's intent in the
+    /// JSON / NDJSON output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_label: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -842,20 +875,10 @@ fn expand_targets(input: &str) -> Vec<IpNetwork> {
     out
 }
 
-// Read --input-file: one target per line, comments (#) + blanks ignored.
-fn read_input_file(path: &str) -> anyhow::Result<Vec<IpNetwork>> {
-    let content = fs::read_to_string(path)?;
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // A single line may itself contain comma-separated entries.
-        out.extend(expand_targets(line));
-    }
-    Ok(out)
-}
+// v0.14.0: `read_input_file` was removed — `main()` now reads the file
+// inline through `domain::classify_input_line()` + `take_token()`, so
+// domain / CIDR / IP / range rows can coexist in one file and each line
+// routes to the correct target bucket.
 
 // ────────────────────────── ASN expansion ──────────────────────────
 
@@ -1649,6 +1672,7 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
         protocol: None,
         banner: None,
         cdn: None,
+        source_label: None, // filled in post-enrichment from the domain→IP map
     };
 
     let start = Instant::now();
@@ -2764,6 +2788,7 @@ async fn run_udp_phase(
                     protocol: Some(format!("udp/{}", label)),
                     banner: Some(banner),
                     cdn: None,
+                    source_label: None,
                 })
             });
         }
@@ -3005,44 +3030,129 @@ async fn run_uninstall(skip_prompt: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// v0.14.0 — expanded CDN provider coverage. Matches the scope of
+// github.com/taythebot/cdn-ranges: 11 providers with public IP-range
+// endpoints (direct fetch), 13 providers whose ranges are advertised
+// only via ASN (resolved through RIPE stat using the existing
+// `fetch_asn_prefixes()` helper). Total: 24 providers.
+//
+// Each direct provider is fetched independently; a failure for one
+// doesn't abort the refresh (best-effort). The output file preserves
+// the `CIDR|provider` pipe-delimited format from v0.13.x so the
+// `load_cdn_ranges()` reader stays unchanged.
+//
+// ASN lookups hit RIPE stat (already used by the `--asn` CLI flag).
+// Cost: ~20 s total for a cold refresh (24 HTTPS calls + 13 RIPE
+// lookups in sequence). Users rarely run this — typically once per
+// month to keep the CDN list current.
+
+// ASN-based providers: (provider_tag, &[ASN]) — hits RIPE stat through
+// fetch_asn_prefixes() for each ASN, tags every returned CIDR.
+const CDN_ASN_PROVIDERS: &[(&str, &[&str])] = &[
+    // Akamai CDN edge ASNs — the networks that actually serve CDN
+    // content. Deliberately EXCLUDES AS63949 ("Akamai Connected Cloud",
+    // the post-2022 rebrand of Linode IaaS) because those are general-
+    // purpose VMs, not CDN edge — flagging a Linode-hosted target as
+    // CDN-fronted would be a false positive (your scan should NOT be
+    // skipped just because your app runs on Linode).
+    ("akamai", &[
+        "AS12222", "AS16625", "AS16702", "AS17204", "AS18680", "AS18717",
+        "AS20189", "AS20940", "AS21342", "AS21357", "AS21399", "AS22207",
+        "AS22452", "AS23454", "AS23455", "AS24319", "AS26008", "AS30675",
+        "AS31108", "AS31109", "AS31110", "AS31377", "AS33047", "AS33905",
+        "AS34164", "AS34850", "AS35204", "AS35993", "AS35994", "AS36183",
+        "AS39836", "AS43639", "AS55409", "AS55770", "AS133103",
+    ]),
+    ("bunny",        &["AS200325"]),
+    ("cdnetworks",   &["AS36408"]),
+    ("ddos-guard",   &["AS57724"]),
+    ("edgecast",     &["AS15133"]),
+    ("edgenext",     &["AS139057", "AS149981"]),
+    ("edgio",        &["AS60261"]),
+    ("limelight",    &["AS22822"]),
+    ("qrator",       &["AS200449"]),
+    ("stackpath",    &["AS12989"]),
+    ("stormwall",    &["AS59796"]),
+    ("sucuri",       &["AS30148"]),
+    ("x4b",          &["AS136165"]),
+];
+
+/// GET a URL with a 15s budget and return the body as a String, or an
+/// error message suitable for surfacing to the user.
+fn fetch_text(url: &str) -> Result<String, String> {
+    match ureq::get(url)
+        .set("User-Agent", concat!("portwave/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(15))
+        .call()
+    {
+        Ok(r) => r.into_string().map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// GET a URL and parse the body as JSON. Errors bubble up with context.
+fn fetch_json(url: &str) -> Result<serde_json::Value, String> {
+    match ureq::get(url)
+        .set("User-Agent", concat!("portwave/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(15))
+        .call()
+    {
+        Ok(r) => r.into_json::<serde_json::Value>().map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Push every CIDR-looking token from `body` into `entries` under the
+/// given provider tag. Used for plaintext / newline-separated feeds
+/// (Cloudflare, Cachefly, ArvanCloud).
+fn extract_cidrs_plain(body: &str, provider: &'static str, entries: &mut Vec<String>) -> usize {
+    let mut n = 0;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.parse::<IpNetwork>().is_ok() {
+            entries.push(format!("{}|{}", line, provider));
+            n += 1;
+        }
+    }
+    n
+}
+
 async fn run_refresh_cdn() -> anyhow::Result<()> {
-    println!("portwave: refreshing CDN ranges from upstream…");
+    println!("portwave: refreshing CDN ranges from upstream (24 providers)…");
     let mut entries: Vec<String> = Vec::new();
 
-    // Cloudflare
-    match ureq::get("https://www.cloudflare.com/ips-v4")
-        .timeout(Duration::from_secs(15))
-        .call()
-    {
-        Ok(r) => {
-            let body = r.into_string().unwrap_or_default();
-            let mut n = 0;
-            for line in body.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                entries.push(format!("{}|cloudflare", line));
-                n += 1;
+    // ── 11 direct-URL fetchers ────────────────────────────────────
+
+    // Cloudflare v4 + v6
+    for (url, tag) in &[
+        ("https://www.cloudflare.com/ips-v4", "cloudflare"),
+        ("https://www.cloudflare.com/ips-v6", "cloudflare"),
+    ] {
+        match fetch_text(url) {
+            Ok(body) => {
+                let n = extract_cidrs_plain(&body, tag, &mut entries);
+                println!("  cloudflare ({}): {} CIDRs", url.rsplit('/').next().unwrap_or(""), n);
             }
-            println!("  cloudflare: {} CIDRs", n);
+            Err(e) => eprintln!("  cloudflare fetch failed ({}): {}", url, e),
         }
-        Err(e) => eprintln!("  cloudflare fetch failed: {}", e),
     }
 
-    // Fastly
-    match ureq::get("https://api.fastly.com/public-ip-list")
-        .timeout(Duration::from_secs(15))
-        .call()
-    {
-        Ok(r) => {
-            let j: serde_json::Value = r.into_json().unwrap_or(serde_json::Value::Null);
+    // Fastly — JSON { "addresses": [...], "ipv6_addresses": [...] }
+    match fetch_json("https://api.fastly.com/public-ip-list") {
+        Ok(j) => {
             let mut n = 0;
-            if let Some(arr) = j.get("addresses").and_then(|a| a.as_array()) {
-                for v in arr {
-                    if let Some(cidr) = v.as_str() {
-                        entries.push(format!("{}|fastly", cidr));
-                        n += 1;
+            for key in &["addresses", "ipv6_addresses"] {
+                if let Some(arr) = j.get(*key).and_then(|a| a.as_array()) {
+                    for v in arr {
+                        if let Some(cidr) = v.as_str() {
+                            if cidr.parse::<IpNetwork>().is_ok() {
+                                entries.push(format!("{}|fastly", cidr));
+                                n += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -3051,23 +3161,184 @@ async fn run_refresh_cdn() -> anyhow::Result<()> {
         Err(e) => eprintln!("  fastly fetch failed: {}", e),
     }
 
-    // Non-API providers: carry forward the compiled-in snapshot entries
-    // for providers we can't hit live (akamai/sucuri/imperva/stackpath/
-    // bunnycdn/cachefly/keycdn).
-    let mut forwarded = 0;
-    for line in CDN_RANGES_RAW.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    // CloudFront — AWS IP ranges JSON, filter service = CLOUDFRONT
+    match fetch_json("https://ip-ranges.amazonaws.com/ip-ranges.json") {
+        Ok(j) => {
+            let mut n = 0;
+            for key in &[("prefixes", "ip_prefix"), ("ipv6_prefixes", "ipv6_prefix")] {
+                if let Some(arr) = j.get(key.0).and_then(|a| a.as_array()) {
+                    for v in arr {
+                        if v.get("service").and_then(|s| s.as_str()) == Some("CLOUDFRONT") {
+                            if let Some(cidr) = v.get(key.1).and_then(|p| p.as_str()) {
+                                if cidr.parse::<IpNetwork>().is_ok() {
+                                    entries.push(format!("{}|cloudfront", cidr));
+                                    n += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            println!("  cloudfront: {} CIDRs", n);
         }
-        if let Some((_, provider)) = line.split_once('|') {
-            if !matches!(provider.trim(), "cloudflare" | "fastly") {
-                entries.push(line.to_string());
-                forwarded += 1;
+        Err(e) => eprintln!("  cloudfront fetch failed: {}", e),
+    }
+
+    // Gcore — JSON { "addresses": [...], "addresses_v6": [...] }
+    match fetch_json("https://api.gcore.com/cdn/public-ip-list") {
+        Ok(j) => {
+            let mut n = 0;
+            for key in &["addresses", "addresses_v6"] {
+                if let Some(arr) = j.get(*key).and_then(|a| a.as_array()) {
+                    for v in arr {
+                        if let Some(cidr) = v.as_str() {
+                            if cidr.parse::<IpNetwork>().is_ok() {
+                                entries.push(format!("{}|gcore", cidr));
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!("  gcore: {} CIDRs", n);
+        }
+        Err(e) => eprintln!("  gcore fetch failed: {}", e),
+    }
+
+    // CDN77 — JSON list of objects { "prefix": "1.2.3.0/24", ... }
+    match fetch_json("https://prefixlists.tools.cdn77.com/public_lmax_prefixes.json") {
+        Ok(j) => {
+            let mut n = 0;
+            let arr = j.as_array().or_else(|| j.get("prefixes").and_then(|v| v.as_array()));
+            if let Some(arr) = arr {
+                for v in arr {
+                    let cidr = v.as_str()
+                        .or_else(|| v.get("prefix").and_then(|p| p.as_str()))
+                        .or_else(|| v.get("cidr").and_then(|p| p.as_str()));
+                    if let Some(cidr) = cidr {
+                        if cidr.parse::<IpNetwork>().is_ok() {
+                            entries.push(format!("{}|cdn77", cidr));
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            println!("  cdn77: {} CIDRs", n);
+        }
+        Err(e) => eprintln!("  cdn77 fetch failed: {}", e),
+    }
+
+    // Imperva — JSON { "ipRanges": [...], "ipv6Ranges": [...] }
+    match fetch_json("https://my.imperva.com/api/integration/v1/ips") {
+        Ok(j) => {
+            let mut n = 0;
+            for key in &["ipRanges", "ipv6Ranges"] {
+                if let Some(arr) = j.get(*key).and_then(|a| a.as_array()) {
+                    for v in arr {
+                        if let Some(cidr) = v.as_str() {
+                            if cidr.parse::<IpNetwork>().is_ok() {
+                                entries.push(format!("{}|imperva", cidr));
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!("  imperva: {} CIDRs", n);
+        }
+        Err(e) => eprintln!("  imperva fetch failed: {}", e),
+    }
+
+    // Cachefly — plaintext, newline-separated
+    match fetch_text("https://cachefly.cachefly.net/ips/rproxy.txt") {
+        Ok(body) => {
+            let n = extract_cidrs_plain(&body, "cachefly", &mut entries);
+            println!("  cachefly: {} CIDRs", n);
+        }
+        Err(e) => eprintln!("  cachefly fetch failed: {}", e),
+    }
+
+    // ArvanCloud — plaintext
+    match fetch_text("https://www.arvancloud.ir/en/ips.txt") {
+        Ok(body) => {
+            let n = extract_cidrs_plain(&body, "arvancloud", &mut entries);
+            println!("  arvancloud: {} CIDRs", n);
+        }
+        Err(e) => eprintln!("  arvancloud fetch failed: {}", e),
+    }
+
+    // Medianova — JSON { "data": [ {"cidr": "..."}, ... ] } or similar
+    match fetch_json("https://cloud.medianova.com/api/v1/ip/blocks-list") {
+        Ok(j) => {
+            let mut n = 0;
+            let arr = j.as_array()
+                .or_else(|| j.get("data").and_then(|v| v.as_array()));
+            if let Some(arr) = arr {
+                for v in arr {
+                    let cidr = v.as_str()
+                        .or_else(|| v.get("cidr").and_then(|p| p.as_str()))
+                        .or_else(|| v.get("prefix").and_then(|p| p.as_str()));
+                    if let Some(cidr) = cidr {
+                        if cidr.parse::<IpNetwork>().is_ok() {
+                            entries.push(format!("{}|medianova", cidr));
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            println!("  medianova: {} CIDRs", n);
+        }
+        Err(e) => eprintln!("  medianova fetch failed: {}", e),
+    }
+
+    // F5 — HTML doc; best-effort regex-pluck of CIDR-looking tokens.
+    // If the endpoint format changes, we just lose F5 coverage that run.
+    match fetch_text("https://docs.cloud.f5.com/docs-v2/platform/reference/network-cloud-ref") {
+        Ok(body) => {
+            let mut n = 0;
+            // Simple CIDR-pattern extraction; accepts both v4 and v6 forms.
+            for tok in body.split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != ':' && c != '/') {
+                if tok.contains('/') && (tok.contains('.') || tok.contains(':')) {
+                    if tok.parse::<IpNetwork>().is_ok() {
+                        entries.push(format!("{}|f5", tok));
+                        n += 1;
+                    }
+                }
+            }
+            println!("  f5: {} CIDRs", n);
+        }
+        Err(e) => eprintln!("  f5 fetch failed: {}", e),
+    }
+
+    // ── 13 ASN-based providers via RIPE stat ──────────────────────
+    for (tag, asns) in CDN_ASN_PROVIDERS {
+        let mut total = 0usize;
+        for asn in *asns {
+            let asn = *asn;
+            let res = tokio::task::spawn_blocking({
+                let asn = asn.to_string();
+                move || fetch_asn_prefixes(&asn)
+            })
+            .await;
+            match res {
+                Ok(Ok(prefixes)) => {
+                    for p in prefixes {
+                        entries.push(format!("{}|{}", p, tag));
+                        total += 1;
+                    }
+                }
+                Ok(Err(e)) => eprintln!("  {} [{}] fetch failed: {}", tag, asn, e),
+                Err(e) => eprintln!("  {} [{}] join error: {}", tag, asn, e),
             }
         }
+        println!("  {}: {} CIDRs (via {} ASN{})",
+            tag, total, asns.len(), if asns.len() == 1 { "" } else { "s" });
     }
-    println!("  embedded providers carried over: {} CIDRs", forwarded);
+
+    // Dedupe (an IP can be advertised by multiple ASNs / providers; keep
+    // the first tag seen so the most-authoritative provider label wins).
+    entries.sort();
+    entries.dedup();
 
     let path = cdn_cache_path()
         .ok_or_else(|| anyhow::anyhow!("could not resolve cache directory"))?;
@@ -3076,7 +3347,7 @@ async fn run_refresh_cdn() -> anyhow::Result<()> {
     }
     let content = entries.join("\n") + "\n";
     fs::write(&path, &content)?;
-    println!("Wrote {} entries to {}", entries.len(), path.display());
+    println!("\nWrote {} unique entries across 24 providers to {}", entries.len(), path.display());
     println!("portwave will use this file on next scan. Delete it to revert to embedded.");
     Ok(())
 }
@@ -3320,18 +3591,72 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Merge targets from positional <CIDR_INPUT>, --input-file, and --asn.
+    // Target sources: positional <CIDR_INPUT>, --input-file, --asn, and
+    // (new in v0.14.0) --domain. Every token gets classified by
+    // domain::classify_input_line so a single --input-file can mix IPs,
+    // CIDRs, IP ranges, and domain names. Domains are collected into a
+    // separate Vec and resolved in parallel after all sources are loaded.
     let mut nets: Vec<IpNetwork> = Vec::new();
+    let mut domains: Vec<String> = Vec::new();
+    let mut invalid_lines: Vec<(String, &'static str)> = Vec::new();
+    let mut take_token = |tok: &str,
+                           nets: &mut Vec<IpNetwork>,
+                           domains: &mut Vec<String>,
+                           invalid_lines: &mut Vec<(String, &'static str)>| {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            return;
+        }
+        match domain::classify_input_line(tok) {
+            domain::InputKind::Ipv4(v) => {
+                if let Ok(n) = IpNetwork::new(IpAddr::V4(v), 32) {
+                    nets.push(n);
+                }
+            }
+            domain::InputKind::Ipv6(v) => {
+                if let Ok(n) = IpNetwork::new(IpAddr::V6(v), 128) {
+                    nets.push(n);
+                }
+            }
+            domain::InputKind::Cidr(n) => nets.push(n),
+            domain::InputKind::Ipv4Range(a, b) => {
+                nets.extend(ipv4_range_to_cidrs(u32::from(a), u32::from(b)));
+            }
+            domain::InputKind::Domain(d) => domains.push(d),
+            domain::InputKind::Invalid { raw, reason } => {
+                invalid_lines.push((raw, reason));
+            }
+        }
+    };
     if let Some(raw) = &args.cidr_input {
-        nets.extend(expand_targets(raw));
+        for tok in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+            take_token(tok, &mut nets, &mut domains, &mut invalid_lines);
+        }
     }
     if let Some(path) = &args.input_file {
-        match read_input_file(path) {
-            Ok(v) => {
-                println!("Loaded {} entries from {}", v.len(), path);
-                nets.extend(v);
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                let mut file_tokens = 0usize;
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    for tok in line.split(|c: char| c == ',' || c.is_whitespace()) {
+                        if !tok.trim().is_empty() {
+                            take_token(tok, &mut nets, &mut domains, &mut invalid_lines);
+                            file_tokens += 1;
+                        }
+                    }
+                }
+                println!("Loaded {} entries from {}", file_tokens, path);
             }
             Err(e) => eprintln!("Failed to read --input-file {}: {}", path, e),
+        }
+    }
+    if let Some(list) = &args.domain {
+        for tok in list.split(|c: char| c == ',' || c.is_whitespace()) {
+            take_token(tok, &mut nets, &mut domains, &mut invalid_lines);
         }
     }
     if let Some(list) = &args.asn {
@@ -3352,6 +3677,114 @@ async fn main() -> anyhow::Result<()> {
                 Ok(Err(e)) => println!("failed: {}", e),
                 Err(e) => println!("join error: {}", e),
             }
+        }
+    }
+
+    // Report invalid lines once, compactly.
+    if !invalid_lines.is_empty() {
+        eprintln!(
+            "[!] {} input line(s) were skipped — not a valid CIDR / IP / range / domain:",
+            invalid_lines.len()
+        );
+        for (raw, reason) in invalid_lines.iter().take(5) {
+            eprintln!("    {:?} — {}", raw, reason);
+        }
+        if invalid_lines.len() > 5 {
+            eprintln!("    ({} more hidden)", invalid_lines.len() - 5);
+        }
+    }
+
+    // Dedupe domains (handles overlap between --domain + --input-file).
+    domains.sort();
+    domains.dedup();
+
+    // ── Domain resolution phase (v0.14.0) ─────────────────────────
+    // For every domain collected above, resolve A/AAAA in parallel,
+    // check each resolved IP against the CDN table, and either:
+    //   - skip it with a summary line (default behavior — CDN-fronted)
+    //   - add its resolved IPs to `nets` and remember the domain label
+    //     in `domain_origin_map` for later output labeling
+    //
+    // Empty-after-skip guard: if every domain gets skipped AND there
+    // were no direct IPs, exit cleanly with a clear message.
+    let mut domain_origin_map: std::collections::HashMap<IpAddr, String> =
+        std::collections::HashMap::new();
+    if !domains.is_empty() {
+        let cdn_table = load_cdn_ranges();
+        let dns_timeout = Duration::from_secs(args.dns_timeout.max(1));
+        println!(
+            "Resolving {} domain(s) ({} concurrent, {}s timeout)…",
+            domains.len(),
+            args.dns_concurrency,
+            args.dns_timeout
+        );
+        let results = domain::resolve_many(
+            &domains,
+            args.dns_concurrency.max(1),
+            dns_timeout,
+            &cdn_table,
+        )
+        .await;
+
+        let mut origin_domains = 0usize;
+        let mut cdn_domains = 0usize;
+        let mut error_domains = 0usize;
+        let breakdown = domain::cdn_breakdown(&results);
+
+        for r in &results {
+            if let Some(err) = &r.error {
+                error_domains += 1;
+                eprintln!("  ✗ {} — {}", r.domain, err);
+                continue;
+            }
+            if r.ips.is_empty() {
+                error_domains += 1;
+                eprintln!("  ✗ {} — no usable A/AAAA records", r.domain);
+                continue;
+            }
+            if r.cdn.is_some() && !args.allow_cdn {
+                cdn_domains += 1;
+                continue;
+            }
+            origin_domains += 1;
+            for ip in &r.ips {
+                let prefix: u8 = if ip.is_ipv4() { 32 } else { 128 };
+                if let Ok(n) = IpNetwork::new(*ip, prefix) {
+                    nets.push(n);
+                }
+                // First domain wins if multiple domains resolve to the
+                // same IP (rare but possible with wildcard DNS setups).
+                domain_origin_map
+                    .entry(*ip)
+                    .or_insert_with(|| r.domain.clone());
+            }
+        }
+
+        println!(
+            "  ✓ {} domain(s) → {} origin IP(s)",
+            origin_domains,
+            domain_origin_map.len()
+        );
+        if cdn_domains > 0 {
+            let breakdown_str: Vec<String> = breakdown
+                .iter()
+                .map(|(tag, n)| format!("{}:{}", tag, n))
+                .collect();
+            println!(
+                "  ⚠ {} domain(s) → CDN edge ({}) — skipped",
+                cdn_domains,
+                breakdown_str.join(", ")
+            );
+        }
+        if error_domains > 0 {
+            println!("  ✗ {} domain(s) → DNS failure / no records — skipped", error_domains);
+        }
+
+        if origin_domains == 0 && nets.is_empty() {
+            eprintln!();
+            eprintln!("All domains are CDN-fronted or failed to resolve. Nothing to scan.");
+            eprintln!("  --allow-cdn   scan CDN edge IPs anyway (rarely useful)");
+            return Ok(());
         }
     }
 
@@ -3746,6 +4179,7 @@ async fn main() -> anyhow::Result<()> {
                         protocol: service_for_port(sa.port()).map(|s| s.to_string()),
                         banner: None,
                         cdn: None,
+                        source_label: None,
                     });
                     continue;
                 }
@@ -3910,6 +4344,7 @@ async fn main() -> anyhow::Result<()> {
                     protocol: service_for_port(sa.port()).map(|s| s.to_string()),
                     banner: Some("(Ctrl+C — enrichment skipped)".to_string()),
                     cdn: None,
+                    source_label: None,
                 });
                 backfilled += 1;
             }
@@ -3966,14 +4401,24 @@ async fn main() -> anyhow::Result<()> {
         )
     });
     // Tag each open port with its CDN/WAF provider if it falls in a known edge range.
+    // v0.14.0: also tag with the originating domain (if scan was seeded
+    // from --domain / --input-file domain entries). The domain label is
+    // used by the OPEN PORTS renderer to show "example.com → 1.2.3.4"
+    // grouping, and lands in the JSONL for downstream tooling.
     let cdn_table = load_cdn_ranges();
     for op in &mut open_records {
-        if op.cdn.is_some() {
-            continue;
+        if op.cdn.is_none() {
+            if let Ok(ip) = op.ip.parse::<IpAddr>() {
+                if let Some(tag) = cdn_tag_for(ip, &cdn_table) {
+                    op.cdn = Some(tag.to_string());
+                }
+            }
         }
-        if let Ok(ip) = op.ip.parse::<IpAddr>() {
-            if let Some(tag) = cdn_tag_for(ip, &cdn_table) {
-                op.cdn = Some(tag.to_string());
+        if op.source_label.is_none() {
+            if let Ok(ip) = op.ip.parse::<IpAddr>() {
+                if let Some(label) = domain_origin_map.get(&ip) {
+                    op.source_label = Some(label.clone());
+                }
             }
         }
     }
@@ -4201,12 +4646,27 @@ async fn main() -> anyhow::Result<()> {
         let proto = op.protocol.as_deref().unwrap_or("unknown");
         let banner = op.banner.as_deref().unwrap_or("");
 
-        // Emit a host header when the IP changes.
+        // Emit a host header when the IP changes. v0.14.0: when the scan
+        // came from a domain input, the header reads "example.com → 1.2.3.4"
+        // so the user's intent is preserved in the output; otherwise we
+        // keep the bare-IP header from v0.12.3+.
         if current_ip.as_ref() != Some(&op.ip) {
             if current_ip.is_some() {
                 println!();
             }
-            println!("  {}", cfmt("1", &host));
+            match &op.source_label {
+                Some(dom) => {
+                    println!(
+                        "  {} {} {}",
+                        cfmt("1", dom),
+                        cfmt("2", "→"),
+                        cfmt("1", &host),
+                    );
+                }
+                None => {
+                    println!("  {}", cfmt("1", &host));
+                }
+            }
             current_ip = Some(op.ip.clone());
         }
 

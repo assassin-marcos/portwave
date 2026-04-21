@@ -58,6 +58,9 @@ Every cell verified against the current source of each tool. **Legend**: ✅ nat
 | Smart IPv6 scanning (RFC 7707)      | ❌ | ❌ | ❌ | ✅ |
 | Scope safety net (huge-CIDR refuse) | ❌ | ❌ | ❌ | ✅ |
 | ASN expansion built-in              | ❌ | ❌ | ✅ | ✅ |
+| Domain / subdomain input            | ❌ | ✅ | ✅ | ✅ |
+| Auto-skip CDN-fronted domains (20+ providers) | ❌ | ❌ | ❌ | ✅ |
+| Mixed input (IP + CIDR + range + domain) auto-classify | ❌ | ❌ | ⚠️ | ✅ |
 | Exclude list / exclude-file         | ✅ | ✅ | ✅ | ✅ |
 
 ### Probing intelligence
@@ -123,6 +126,7 @@ Every cell verified against the current source of each tool. **Legend**: ✅ nat
 - *Banner grab*: uses `-nmap-cli` passthrough / `-sV` (via nmap); no native banner reader.
 - *TLS on non-443*: `netutil.DetectTLS` exists (`scan.go:465`) but gated behind undocumented `ENABLE_TLS_DETECTION` env, off by default.
 - *CDN tagging*: `-cdn` tags + `-exclude-cdn` skip, powered by `projectdiscovery/cdncheck` library.
+- *Mixed input*: supports domains + IPs but without line-by-line auto-classification in one file.
 - *`--top-ports N`*: only accepts preset `100`, `1000`, or `full` — not arbitrary N.
 - *UDP*: via `-p u:port` syntax; no dedicated `-sU` flag.
 - *Dynamic CDN refresh*: CDN list refreshes via upstream library release cycle, not at runtime.
@@ -152,6 +156,48 @@ Installers auto-detect `httpx` / `nuclei` across `$PATH`, `~/go/bin`, `~/.pdtm/g
 portwave -u          # install latest release + print What's-new changelog
 portwave -c          # check for updates (does not install)
 portwave -X          # uninstall (binary + share + cache); -Xy to skip the prompt
+```
+
+---
+
+## Domain & subdomain scanning
+
+**New in v0.14.0** — portwave accepts domains alongside IPs. Each domain resolves in parallel via hickory-resolver (direct queries to Cloudflare 1.1.1.1 / Google 8.8.8.8), and any domain whose A/AAAA records land on a known CDN edge (Cloudflare, Akamai, Fastly, CloudFront, Gcore, Imperva, and 18 others — 13,500+ CIDRs across 20 providers) is skipped by default. Only domains with exposed origin IPs get scanned.
+
+```bash
+portwave bb -d example.com                           # single domain
+portwave bb -d "site.com,api.site.com,mail.site.com" # multiple
+subfinder -d target.com -silent | portwave bb --input-file -
+```
+
+Mixed input files work automatically — each line is classified as IP, CIDR, IP range, IPv6, or domain and routed to the right resolver.
+
+**Example output:**
+```text
+Resolving 5 domain(s) (50 concurrent, 3s timeout)…
+  ✓ 3 domain(s) → 13 origin IP(s)
+  ⚠ 2 domain(s) → CDN edge (cloudflare:1, fastly:1) — skipped
+--- PHASE A: DISCOVERY ---
+...
+--- OPEN PORTS (17 total across 8 hosts) ---
+  scanme.nmap.org → 45.33.32.156
+      :22   [ssh]   SSH-2.0-OpenSSH_6.6.1p1 Ubuntu-2ubuntu2.13
+  github.com → 20.205.243.166
+      :22   [ssh]
+      :80   [http]  HTTP/1.1 301 Moved Permanently
+      :443  [https]
+```
+
+**Flags:**
+- `-d, --domain <LIST>` — comma-separated domains to resolve + scan
+- `--allow-cdn` — override the default skip and scan CDN edge IPs too (rarely useful; CDN only exposes 80/443)
+- `--dns-timeout <SECONDS>` — per-query timeout (default `3`)
+- `--dns-concurrency <N>` — parallel DNS lookups (default `50`)
+
+**Refresh the CDN list before a scan session** to pick up the latest provider announcements:
+
+```bash
+portwave --refresh-cdn    # ~20 s; writes to ~/.cache/portwave/cdn-ranges.txt
 ```
 
 ---
@@ -211,6 +257,9 @@ portwave acme 203.0.113.0/24 --webhook $SLACK_URL --webhook-on-diff-only # only 
 portwave acme 203.0.113.0/24 --json-out --no-httpx --no-nuclei | jq .   # NDJSON stream
 portwave acme 203.0.113.0/24 --max-pps 200                              # polite (200 pps cap)
 portwave big --asn AS99999 --max-scan-time 30m                          # hard time budget
+
+# Full bug-bounty chain — one command replaces subfinder → dnsx → cdncheck → naabu → httpx
+subfinder -d target.com -silent | portwave bb --input-file -
 ```
 
 ---
@@ -226,10 +275,14 @@ portwave --update | --check-update | --refresh-cdn
 
 | Flag | Accepts |
 |---|---|
-| `<CIDR_INPUT>` positional | `203.0.113.0/24`, `1.2.3.4`, `5.6.7.10-5.6.7.20`, `2001:db8::/112`, or comma-separated mix |
-| `-i, --input-file <FILE>` | One target per line, `#` for comments |
+| `<CIDR_INPUT>` positional | `203.0.113.0/24`, `1.2.3.4`, `5.6.7.10-5.6.7.20`, `2001:db8::/112`, `example.com`, or comma-separated mix |
+| `-i, --input-file <FILE>` | One target per line (IP / CIDR / range / domain), `#` for comments, auto-classified |
+| `-d, --domain <LIST>` | Comma-separated domains. CDN-fronted hosts skipped by default. |
 | `-a, --asn <LIST>` | `AS13335,AS15169` — expanded via RIPE stat (public, no API key) |
 | `-e, --exclude <LIST>` | Same format as `<CIDR_INPUT>`; skipped in the producer |
+| `--allow-cdn` | Scan a domain's origin IPs even when resolved to a known CDN edge |
+| `--dns-timeout <SECONDS>` | Per-domain DNS timeout (default `3`) |
+| `--dns-concurrency <N>` | Parallel DNS lookups (default `50`) |
 | `--ipv4-only` | Drop IPv6 ranges from the expanded scope |
 | `--ipv6-only` | Drop IPv4 ranges from the expanded scope |
 | `--smart-ipv6` | Replace huge IPv6 ranges (> /108) with ~450 RFC-7707 likely addresses |

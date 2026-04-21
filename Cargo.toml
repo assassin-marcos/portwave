@@ -1,6 +1,6 @@
 [package]
 name = "portwave"
-version = "0.13.5"
+version = "0.14.0"
 edition = "2021"
 description = "Ultra-fast, IP-focused IPv4/IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, CDN tagging, scan-diff, webhook, self-update, and a built-in httpx + nuclei recon pipeline."
 license = "MIT"
@@ -46,6 +46,13 @@ ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 # Fast non-DoS-resistant hasher for scan-state HashSets (skip / prior
 # sets). ~4× faster than the std SipHash on small keys like SocketAddr.
 rustc-hash = "1.1"
+# Pure-Rust async DNS resolver. Used by the v0.14.0 domain/subdomain
+# scanning feature to resolve hostnames → A/AAAA records in parallel
+# with predictable per-query timeouts. Connects directly to Cloudflare
+# 1.1.1.1 + Google 8.8.8.8 upstreams instead of the system resolver.
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
+# futures::stream::FuturesUnordered for bounded-concurrency DNS fan-out.
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 # Unix-only: setrlimit(RLIMIT_NOFILE) to raise the FD soft limit for large scans.
 [target.'cfg(unix)'.dependencies]
