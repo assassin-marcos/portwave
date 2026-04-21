@@ -26,116 +26,121 @@ mod domain;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "portwave",
-    about = "portwave — hybrid IPv4/IPv6 port scanner + httpx + nuclei recon pipeline",
+    about = "Fast IPv4/IPv6 port scanner + native HTTP(S) enrichment + nuclei",
     version
 )]
 struct Args {
+    // ── Positional ─────────────────────────────────────────
     #[arg(index = 1)]
     folder_name: Option<String>,
 
-    /// Comma-separated CIDRs, IPs, IP ranges, or domains (mixed freely)
+    /// IPs / CIDRs / ranges / domains, comma-separated (mixed ok)
     #[arg(index = 2)]
     cidr_input: Option<String>,
 
-    /// Targets file (one per line; IP / CIDR / range / domain auto-classified). Use "-" to read from stdin
+    // ── Targets ────────────────────────────────────────────
+    /// Targets file (one per line; "-" for stdin)
     #[arg(short = 'i', long)]
     input_file: Option<String>,
 
-    /// Comma-separated ASNs (e.g. "AS13335") — expanded via RIPE stat
+    /// Domains to resolve + scan, comma-separated
+    #[arg(short = 'd', long)]
+    domain: Option<String>,
+
+    /// ASNs (e.g. "AS13335,AS15169")
     #[arg(short = 'a', long)]
     asn: Option<String>,
 
-    /// Comma-separated CIDRs/IPs/ranges to exclude from scope
+    /// IPs / CIDRs / ranges to exclude from scope
     #[arg(short = 'e', long)]
     exclude: Option<String>,
 
-    /// Comma-separated ports/ranges (e.g. "22,80,443,8000-9000")
+    /// Scan CDN-fronted domains too (default: skip them)
+    #[arg(long, default_value_t = false)]
+    allow_cdn: bool,
+
+    /// DNS timeout per domain, seconds
+    #[arg(long, default_value_t = 3)]
+    dns_timeout: u64,
+
+    /// Concurrent DNS lookups
+    #[arg(long, default_value_t = 50)]
+    dns_concurrency: usize,
+
+    /// Scan only IPv4
+    #[arg(long, default_value_t = false)]
+    ipv4_only: bool,
+
+    /// Scan only IPv6
+    #[arg(long, default_value_t = false)]
+    ipv6_only: bool,
+
+    /// Smart IPv6 for huge ranges (RFC 7707 likely-addresses)
+    #[arg(long, default_value_t = false)]
+    smart_ipv6: bool,
+
+    /// Bypass 2^20-host scope safety net
+    #[arg(long, default_value_t = false)]
+    allow_huge_scope: bool,
+
+    // ── Ports ──────────────────────────────────────────────
+    /// Ports / ranges, e.g. "22,80,443,8000-9000"
     #[arg(short = 'p', long)]
     ports: Option<String>,
 
-    /// Path to a comma-separated port-list file
+    /// Port-list file (comma / whitespace separated)
     #[arg(short = 'f', long)]
     port_file: Option<String>,
 
+    /// Use only top-N ports from the bundled list
+    #[arg(long)]
+    top_ports: Option<usize>,
+
+    /// Enable UDP discovery on well-known ports
+    #[arg(short = 'U', long, default_value_t = false)]
+    udp: bool,
+
+    // ── Timing / concurrency ───────────────────────────────
     /// Max concurrent Phase-A probes
     #[arg(short = 't', long, default_value_t = 3000)]
     threads: usize,
 
-    /// Phase-A (discovery) connect timeout, ms
+    /// Phase-A connect timeout, ms
     #[arg(short = 'T', long, default_value_t = 800)]
     timeout_ms: u64,
 
-    /// Phase-B (banner) connect timeout, ms
+    /// Phase-B banner timeout, ms
     #[arg(long, default_value_t = 1500)]
     enrich_timeout_ms: u64,
 
-    /// Retries for Phase-A timeouts only
+    /// Retries on Phase-A timeouts
     #[arg(short = 'r', long, default_value_t = 1)]
     retries: u8,
 
-    /// Output directory (default: ./scans)
-    #[arg(short = 'o', long)]
-    output_dir: Option<String>,
+    /// Global packets-per-second cap
+    #[arg(long)]
+    max_pps: Option<u32>,
 
-    /// Concurrent HTTP probes (halved to 50 on --asn)
+    /// Wallclock cap, e.g. "10m", "1h"
+    #[arg(long)]
+    max_scan_time: Option<String>,
+
+    /// Print scan plan + exit (no probes)
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+
+    // ── Enrichment (HTTP / nuclei) ─────────────────────────
+    /// Concurrent HTTP probes
     #[arg(short = 'C', long, default_value_t = 100)]
     probe_concurrency: usize,
 
-    /// Follow HTTP redirects (up to 3 hops; auto-on with --asn)
+    /// Follow redirects up to 3 hops (auto-on with --asn)
     #[arg(long, default_value_t = false)]
     follow_redirects: bool,
 
-    /// Skip native HTTP(S) enrichment (title / status / redirects)
+    /// Skip native HTTP(S) enrichment
     #[arg(long, default_value_t = false)]
     no_enrich: bool,
-
-    /// nuclei -c (concurrency)
-    #[arg(long, default_value_t = 25)]
-    nuclei_concurrency: usize,
-
-    /// nuclei -rl (per-host rate limit)
-    #[arg(long, default_value_t = 200)]
-    nuclei_rate: usize,
-
-    /// nuclei -max-host-error
-    #[arg(long, default_value_t = 25)]
-    nuclei_max_host_error: usize,
-
-    /// Run nuclei against every open port (skip HTTP filter)
-    #[arg(long, default_value_t = false)]
-    nuclei_all_ports: bool,
-
-    /// POST scan summary to this URL on completion
-    #[arg(short = 'w', long)]
-    webhook: Option<String>,
-
-    /// Enable UDP discovery on well-known ports (opt-in)
-    #[arg(short = 'U', long, default_value_t = false)]
-    udp: bool,
-
-    /// Refresh CDN/WAF edge CIDRs from upstream sources
-    #[arg(long, default_value_t = false)]
-    refresh_cdn: bool,
-
-    /// Don't prompt to install nuclei if missing
-    #[arg(long, default_value_t = false)]
-    no_install_prompt: bool,
-
-    /// Uninstall portwave (binary + share + cache)
-    #[arg(short = 'X', long, default_value_t = false)]
-    uninstall: bool,
-
-    /// Skip the uninstall confirmation prompt
-    #[arg(short = 'y', long, default_value_t = false)]
-    yes: bool,
-
-    /// Skip the nuclei vulnerability-scan step
-    #[arg(long, default_value_t = false)]
-    no_nuclei: bool,
-
-    /// Disable resume from previous open_ports.jsonl
-    #[arg(long, default_value_t = false)]
-    no_resume: bool,
 
     /// Disable banner grab (Phase B)
     #[arg(long, default_value_t = false)]
@@ -145,105 +150,99 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_tls_sniff: bool,
 
-    /// Disable the adaptive concurrency controller
+    /// Disable adaptive concurrency controller
     #[arg(long, default_value_t = false)]
     no_adaptive: bool,
 
-    /// nuclei -severity filter. Default skips `info` (noise reduction on large scans).
-    /// Override with any nuclei-accepted value: "critical", "high,critical",
-    /// "medium,high,critical,info", etc.
+    /// Skip nuclei
+    #[arg(long, default_value_t = false)]
+    no_nuclei: bool,
+
+    /// nuclei concurrency
+    #[arg(long, default_value_t = 25)]
+    nuclei_concurrency: usize,
+
+    /// nuclei per-host rate limit
+    #[arg(long, default_value_t = 200)]
+    nuclei_rate: usize,
+
+    /// nuclei max-host-error
+    #[arg(long, default_value_t = 25)]
+    nuclei_max_host_error: usize,
+
+    /// Run nuclei on non-HTTP ports too
+    #[arg(long, default_value_t = false)]
+    nuclei_all_ports: bool,
+
+    /// nuclei severity filter (default skips `info`)
     #[arg(long, default_value = "low,medium,high,critical")]
     nuclei_severity: String,
 
-    /// Download + install the latest portwave release
-    #[arg(short = 'u', long, default_value_t = false)]
-    update: bool,
+    // ── Output / integrations ──────────────────────────────
+    /// Output directory (default ./scans)
+    #[arg(short = 'o', long)]
+    output_dir: Option<String>,
 
-    /// Check for a newer version, then exit
-    #[arg(short = 'c', long, default_value_t = false)]
-    check_update: bool,
-
-    /// Suppress the "update available" startup banner
-    #[arg(long, default_value_t = false)]
-    no_update_check: bool,
-
-    /// Suppress only the interactive update prompt
-    #[arg(long, default_value_t = false)]
-    no_update_prompt: bool,
-
-    /// Suppress the ASCII banner art
-    #[arg(long, default_value_t = false)]
-    no_art: bool,
-
-    /// Suppress banner + update notice (= --no-art --no-update-check)
-    #[arg(short, long, default_value_t = false)]
-    quiet: bool,
-
-    /// Use only the top N ports from the bundled list (nmap-compat)
-    #[arg(long)]
-    top_ports: Option<usize>,
-
-    /// Scan only IPv4 targets (filter after range expansion)
-    #[arg(long, default_value_t = false)]
-    ipv4_only: bool,
-
-    /// Scan only IPv6 targets (filter after range expansion)
-    #[arg(long, default_value_t = false)]
-    ipv6_only: bool,
-
-    /// Global packet-per-second rate cap (polite/slow-scan mode)
-    #[arg(long)]
-    max_pps: Option<u32>,
-
-    /// Emit each open port as a JSON line on stdout (in addition to files)
+    /// NDJSON to stdout (in addition to files)
     #[arg(long, default_value_t = false)]
     json_out: bool,
 
-    /// For large IPv6 ranges (/108+), probe only RFC-7707 likely addresses
-    /// (hexspeak, low-sequential, SLAAC patterns) instead of full expansion
+    /// Disable resume from previous open_ports.jsonl
     #[arg(long, default_value_t = false)]
-    smart_ipv6: bool,
+    no_resume: bool,
 
-    /// Bypass the 2^20-host scope safety net (huge CIDR expansion)
-    #[arg(long, default_value_t = false)]
-    allow_huge_scope: bool,
+    /// Webhook URL (POST summary on completion)
+    #[arg(short = 'w', long)]
+    webhook: Option<String>,
 
-    /// Hard wallclock cap on total scan time (e.g. "10m", "1h", "30s")
-    #[arg(long)]
-    max_scan_time: Option<String>,
-
-    /// Print the scan plan (targets, ports, estimated probes) and exit
-    #[arg(long, default_value_t = false)]
-    dry_run: bool,
-
-    /// Post the webhook only if the diff shows new opens or closes
+    /// Webhook only if diff shows changes
     #[arg(long, default_value_t = false)]
     webhook_on_diff_only: bool,
 
-    /// Suppress the real-time "[+] IP:PORT opened" stream during Phase A
+    /// Suppress "[+] IP:PORT opened" stream
     #[arg(long, default_value_t = false)]
     no_live_hits: bool,
 
-    /// Comma-separated domains to resolve + scan. CDN-fronted hosts are
-    /// skipped by default (see --allow-cdn). Accepts sub.example.com,
-    /// IDN / Unicode, anything hickory-resolver can parse.
-    #[arg(short = 'd', long)]
-    domain: Option<String>,
+    // ── Updates / uninstall / UX ───────────────────────────
+    /// Install latest release
+    #[arg(short = 'u', long, default_value_t = false)]
+    update: bool,
 
-    /// Scan origin IPs even if the domain resolves to a known CDN edge
-    /// range. Default behavior is to skip such domains with a summary
-    /// line, since CDN edges only expose 80/443 and anything you find
-    /// belongs to the CDN, not the customer.
+    /// Check for updates + exit
+    #[arg(short = 'c', long, default_value_t = false)]
+    check_update: bool,
+
+    /// Refresh CDN/WAF CIDR cache
     #[arg(long, default_value_t = false)]
-    allow_cdn: bool,
+    refresh_cdn: bool,
 
-    /// Per-domain DNS timeout, in seconds. Applies to each A/AAAA query.
-    #[arg(long, default_value_t = 3)]
-    dns_timeout: u64,
+    /// Uninstall portwave
+    #[arg(short = 'X', long, default_value_t = false)]
+    uninstall: bool,
 
-    /// Max concurrent DNS lookups for --input-file / --domain.
-    #[arg(long, default_value_t = 50)]
-    dns_concurrency: usize,
+    /// Skip uninstall confirmation
+    #[arg(short = 'y', long, default_value_t = false)]
+    yes: bool,
+
+    /// Don't prompt to install nuclei if missing
+    #[arg(long, default_value_t = false)]
+    no_install_prompt: bool,
+
+    /// Suppress "update available" banner
+    #[arg(long, default_value_t = false)]
+    no_update_check: bool,
+
+    /// Show update banner but skip [Y/n] prompt
+    #[arg(long, default_value_t = false)]
+    no_update_prompt: bool,
+
+    /// Suppress ASCII banner art
+    #[arg(long, default_value_t = false)]
+    no_art: bool,
+
+    /// Quiet mode (= --no-art --no-update-check)
+    #[arg(short, long, default_value_t = false)]
+    quiet: bool,
 }
 
 // ────────────────────────── Types ──────────────────────────
@@ -325,9 +324,11 @@ struct ScanSummary {
     /// UDP phase wall time. 0 unless --udp was passed.
     #[serde(default)]
     udp_ms: u128,
-    /// httpx subprocess wall time. 0 unless httpx ran to completion.
-    #[serde(default)]
-    httpx_ms: u128,
+    /// Native HTTP(S) enrichment wall time. 0 if skipped or no candidates.
+    /// Kept a serde alias `httpx_ms` so downstream JSON consumers reading
+    /// pre-v0.14.9 scan summaries still parse cleanly.
+    #[serde(default, alias = "httpx_ms")]
+    enrich_ms: u128,
     /// nuclei subprocess wall time. 0 unless nuclei ran to completion.
     #[serde(default)]
     nuclei_ms: u128,
@@ -3709,29 +3710,13 @@ async fn main() -> anyhow::Result<()> {
     // Checked once here so per-port-print loop skips the syscall.
     init_stdout_color();
 
-    // ASN scans touch much wider, noisier target sets than hand-picked
-    // CIDRs. Two auto-tweaks for that context:
-    //   --follow-redirects    → ASN hosts usually 30x to portals / WAFs;
-    //                           following gives meaningful status + title.
-    //   --probe-concurrency 50 → halve the default 100. Bursts of HTTP
-    //                           requests to adjacent IPs in a single /16
-    //                           trigger provider WAF rate-limits (see the
-    //                           AS10846 164.121.0.0/16 case where httpx
-    //                           only got 8/189). Pacing helps coverage.
-    // Both nudges only apply if the user didn't pass an explicit value.
-    if args.asn.is_some() {
-        let mut notes: Vec<&str> = Vec::new();
-        if !args.follow_redirects {
-            args.follow_redirects = true;
-            notes.push("--follow-redirects");
-        }
-        // Only halve if user left it at the default.
-        if args.probe_concurrency == 100 {
-            args.probe_concurrency = 50;
-            notes.push("--probe-concurrency=50");
-        }
-        if !notes.is_empty() && !args.quiet {
-            eprintln!("[asn] auto-enabled {}", notes.join(" + "));
+    // ASN scans typically 30x to portals / WAFs; following redirects gives
+    // meaningful status + title instead of "[302] [Moved]". Only auto-enable
+    // if the user didn't already pass it.
+    if args.asn.is_some() && !args.follow_redirects {
+        args.follow_redirects = true;
+        if !args.quiet {
+            eprintln!("[asn] auto-enabled --follow-redirects");
         }
     }
 
@@ -3823,7 +3808,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("examples:");
             eprintln!("  portwave bb 203.0.113.0/24                     # CIDR");
             eprintln!("  portwave bb -d adityasec.com                   # single domain");
-            eprintln!("  portwave bb -i subdomains.txt --no-httpx --no-nuclei");
+            eprintln!("  portwave bb -i subdomains.txt --no-enrich --no-nuclei");
             eprintln!("  portwave bb -a AS13335 -e 203.0.113.64/26      # ASN + exclude");
             eprintln!();
             eprintln!("see all flags with: portwave -h");
@@ -3863,7 +3848,7 @@ async fn main() -> anyhow::Result<()> {
     let jsonl_path = out_dir.join("open_ports.jsonl");
     let summary_path = out_dir.join("scan_summary.json");
     let diff_path = out_dir.join("scan_diff.json");
-    let httpx_out = out_dir.join("httpx_results.txt");
+    let enrich_out = out_dir.join("enrichment_results.txt");
     let nuclei_out = out_dir.join("nuclei_results.txt");
     // v0.14.2 — per-concern domain artefacts, written only when a scan
     // actually had domain input. Each is bare-per-line for trivial
@@ -5254,7 +5239,7 @@ async fn main() -> anyhow::Result<()> {
         phase_a_ms,
         phase_b_ms,
         udp_ms,
-        httpx_ms: 0,
+        enrich_ms: 0,
         nuclei_ms: 0,
         timed_out: timed_out_flag.load(Ordering::Relaxed),
     };
@@ -5551,7 +5536,7 @@ async fn main() -> anyhow::Result<()> {
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&httpx_out)
+            .open(&enrich_out)
             .ok()
             .map(BufWriter::new);
 
@@ -5661,11 +5646,11 @@ async fn main() -> anyhow::Result<()> {
                 cfmt("33", &c_3xx.to_string()),
                 cfmt("36", &c_4xx.to_string()),
                 cfmt("31", &c_5xx.to_string()),
-                cfmt("2", &httpx_out.display().to_string())
+                cfmt("2", &enrich_out.display().to_string())
             );
         }
     }
-    summary.httpx_ms = http_probe_ms;
+    summary.enrich_ms = http_probe_ms;
 
     // ── nuclei ──
     // Same guard as httpx: if the filtered nuclei target list is empty
@@ -5748,7 +5733,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Rewrite summary so final httpx_ms / nuclei_ms land on disk.
+    // Rewrite summary so final enrich_ms / nuclei_ms land on disk.
     let _ = fs::write(&summary_path, serde_json::to_string_pretty(&summary)?);
 
     // Optional webhook — POSTs summary JSON (with diff merged in) once
@@ -5797,7 +5782,7 @@ async fn main() -> anyhow::Result<()> {
     // Keeps the output folder focused on data that actually has content.
     let cleanup_candidates = [
         &http_targets_path,
-        &httpx_out,
+        &enrich_out,
         &nuclei_out,
         &jsonl_path,
         &diff_path,
@@ -5852,8 +5837,8 @@ async fn main() -> anyhow::Result<()> {
     let mut artefacts: Vec<(&PathBuf, &str)> = Vec::new();
     let candidates: &[(&PathBuf, &str)] = &[
         (&jsonl_path,           "open_ports.jsonl    — per-port JSON records (the canonical output; all enrichment here)"),
-        (&http_targets_path,    "http_targets.txt    — URL form, HTTP-candidate filter (httpx + nuclei read this)"),
-        (&httpx_out,            "httpx_results.txt   — httpx probe output"),
+        (&http_targets_path,    "http_targets.txt    — URL list of HTTP candidates (nuclei input)"),
+        (&enrich_out,            "enrichment_results.txt — URL / status / length / title per HTTP target"),
         (&nuclei_out,           "nuclei_results.txt  — nuclei scan findings"),
         (&summary_path,         "scan_summary.json   — totals + counts + timings"),
         (&diff_path,            "scan_diff.json      — opens/closes since last run"),
