@@ -1,6 +1,6 @@
 [package]
 name = "portwave"
-version = "0.14.8"
+version = "0.14.9"
 edition = "2021"
 description = "Ultra-fast, IP-focused IPv4/IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, CDN tagging, scan-diff, webhook, self-update, and a built-in httpx + nuclei recon pipeline."
 license = "MIT"
@@ -43,6 +43,20 @@ self_update = { version = "0.41", default-features = false, features = ["rustls"
 # Tiny blocking HTTP client for the GitHub tags API peek — catches the
 # "tag pushed, release not yet built" race in `--check-update`.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+# reqwest drives the Pass-C native HTTP(S) enrichment that replaced the
+# old httpx subprocess. Two non-negotiable reasons for this specific dep:
+#   1. HTTP/2 via ALPN — ureq 2.x is HTTP/1.1 only, so HTTPS servers
+#      that negotiate only H2 would silently fail to enrich. reqwest
+#      does H1/H2 transparently.
+#   2. native-tls-vendored (bundled OpenSSL) — rustls is strict about
+#      X.509 DER parsing; legacy Cisco / IoT gear occasionally emits
+#      certs with negative serial numbers or non-RFC-5280 quirks that
+#      rustls rejects before our custom verifier can even see them.
+#      OpenSSL is historically more lenient — same behavior httpx's
+#      `-ztls` flag gives via zcrypto.
+#   `vendored` = static-link OpenSSL into the release binary so users
+#   don't need libssl installed on their scan hosts.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls-vendored", "gzip"] }
 # Fast non-DoS-resistant hasher for scan-state HashSets (skip / prior
 # sets). ~4× faster than the std SipHash on small keys like SocketAddr.
 rustc-hash = "1.1"

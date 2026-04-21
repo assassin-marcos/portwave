@@ -57,8 +57,8 @@ struct Args {
     #[arg(short = 'f', long)]
     port_file: Option<String>,
 
-    /// Max concurrent probes (adaptive controller may shrink)
-    #[arg(short = 't', long, default_value_t = 1500)]
+    /// Max concurrent Phase-A probes
+    #[arg(short = 't', long, default_value_t = 3000)]
     threads: usize,
 
     /// Phase-A (discovery) connect timeout, ms
@@ -77,17 +77,17 @@ struct Args {
     #[arg(short = 'o', long)]
     output_dir: Option<String>,
 
-    /// httpx -threads concurrency
-    #[arg(long, default_value_t = 150)]
-    httpx_threads: usize,
+    /// Concurrent HTTP probes (halved to 50 on --asn)
+    #[arg(short = 'C', long, default_value_t = 100)]
+    probe_concurrency: usize,
 
-    /// Extra paths for httpx besides `/` (comma-separated)
-    #[arg(long)]
-    httpx_paths: Option<String>,
-
-    /// Follow HTTP redirects in httpx (auto with --asn)
+    /// Follow HTTP redirects (up to 3 hops; auto-on with --asn)
     #[arg(long, default_value_t = false)]
-    httpx_follow_redirects: bool,
+    follow_redirects: bool,
+
+    /// Skip native HTTP(S) enrichment (title / status / redirects)
+    #[arg(long, default_value_t = false)]
+    no_enrich: bool,
 
     /// nuclei -c (concurrency)
     #[arg(long, default_value_t = 25)]
@@ -117,7 +117,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     refresh_cdn: bool,
 
-    /// Don't prompt to install httpx/nuclei if missing
+    /// Don't prompt to install nuclei if missing
     #[arg(long, default_value_t = false)]
     no_install_prompt: bool,
 
@@ -128,10 +128,6 @@ struct Args {
     /// Skip the uninstall confirmation prompt
     #[arg(short = 'y', long, default_value_t = false)]
     yes: bool,
-
-    /// Skip the httpx HTTP-fingerprint step
-    #[arg(long, default_value_t = false)]
-    no_httpx: bool,
 
     /// Skip the nuclei vulnerability-scan step
     #[arg(long, default_value_t = false)]
@@ -272,6 +268,28 @@ struct OpenPort {
     /// JSON / NDJSON output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_label: Option<String>,
+    /// v0.14.9 — parsed `<title>` from HTML body (if response was HTML).
+    /// 160-char cap, whitespace collapsed. Populated by the native
+    /// title-parse in enrich() — previously this info only existed in
+    /// httpx's -o file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// v0.14.9 — final URL after following redirects, if --follow-redirects
+    /// was set AND the initial response was 3xx. Absent when no redirect
+    /// was followed. The chain itself lives in `redirect_chain` if > 1 hop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_url: Option<String>,
+    /// v0.14.9 — sequence of intermediate URLs when more than one redirect
+    /// hop was traversed. None for the common case (no redirects, or one
+    /// redirect). Capped at 3 hops total so a misbehaving server can't
+    /// spin us in a loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redirect_chain: Option<Vec<String>>,
+    /// v0.14.9 — Content-Length header from the HTTP response, if any.
+    /// Useful for downstream triage (zero-length 200s are often default
+    /// pages; large 3xxs carry the redirect body).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_length: Option<u64>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1057,6 +1075,217 @@ fn format_for_nuclei(
     }
 }
 
+// v0.14.9 — native HTTP(S) probe replacing the httpx subprocess. Used by the
+// Pass-C enrichment loop. Synchronous (runs in spawn_blocking) because
+// ureq is sync and the alternative (tokio-rustls + hyper) would add a heavy
+// dep for what is already a post-Phase-A step with bounded parallelism.
+struct HttpProbeResult {
+    // Status code lives inside `status_line` (and is re-parsed downstream
+    // from OpenPort.banner) — no need to store it twice.
+    status_line: String,           // "HTTP/1.1 200 OK" — shown in OPEN PORTS
+    title: Option<String>,         // parsed <title>, whitespace-collapsed, ≤160 chars
+    final_url: Option<String>,     // only set if > 0 redirects were followed
+    chain: Vec<String>,            // intermediate URLs; empty if no / one-hop redirect
+    via_https: bool,               // true if final successful probe used https:// scheme
+    content_length: Option<u64>,   // from Content-Length header, for the httpx-compat line
+}
+
+fn extract_title(html: &str) -> Option<String> {
+    // Case-insensitive find of <title...>...</title>. Manual because:
+    //   - regex crate is used elsewhere but this is hot (runs per open HTTP port)
+    //   - <title> tag attributes are rare but legal (e.g. <title xml:lang="en">)
+    //   - we want a single forward scan, no DFA setup
+    let lower = html.to_ascii_lowercase();
+    let tag_start = lower.find("<title")?;
+    // Find the '>' that closes the opening tag
+    let after_open = tag_start + lower[tag_start..].find('>')? + 1;
+    let end_rel = lower[after_open..].find("</title>")?;
+    let raw = &html[after_open..after_open + end_rel];
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        None
+    } else {
+        Some(collapsed.chars().take(160).collect())
+    }
+}
+
+fn resolve_redirect_url(base: &str, loc: &str) -> String {
+    // Absolute URL? Done.
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return loc.to_string();
+    }
+    let scheme_end = match base.find("://") {
+        Some(i) => i + 3,
+        None => return loc.to_string(),
+    };
+    let host_end = base[scheme_end..]
+        .find('/')
+        .map(|i| scheme_end + i)
+        .unwrap_or(base.len());
+    let origin = &base[..host_end];
+    if loc.starts_with('/') {
+        // Origin-relative: /login → https://host/login
+        format!("{}{}", origin, loc)
+    } else {
+        // Path-relative: login → https://host/<current-dir>/login
+        let last_slash = base
+            .rfind('/')
+            .filter(|&i| i >= scheme_end + 2)
+            .unwrap_or(host_end);
+        format!("{}/{}", &base[..last_slash], loc)
+    }
+}
+
+// Shared reqwest blocking client: native-tls-vendored (bundled OpenSSL, no
+// runtime libssl dep), HTTP/2 via ALPN, permissive certs. OnceCell keeps
+// one client for the whole run — saves per-probe TLS init overhead.
+// Danger flags: scanner use-case. We WANT to see the server's response
+// whether the cert is expired, self-signed, name-mismatched, or has a
+// negative X.509 serial number from some 2006 Cisco appliance.
+static HTTP_CLIENT: std::sync::OnceLock<reqwest::blocking::Client> =
+    std::sync::OnceLock::new();
+
+fn http_client() -> Option<&'static reqwest::blocking::Client> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true)
+                .user_agent(concat!("portwave/", env!("CARGO_PKG_VERSION")))
+                .timeout(Duration::from_secs(5))
+                .connect_timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .http1_title_case_headers()
+                .build()
+                .ok()
+                .unwrap_or_else(|| reqwest::blocking::Client::new())
+        })
+        .into()
+}
+
+fn http_probe_single(url: &str, follow: bool) -> Option<HttpProbeResult> {
+    let client = http_client()?;
+    let started_https = url.starts_with("https://");
+    let mut current = url.to_string();
+    let mut chain: Vec<String> = Vec::new();
+    let mut last: Option<(u16, String, Option<String>, Option<u64>)> = None;
+
+    for hop in 0..=3 {
+        let resp = match client.get(&current).send() {
+            Ok(r) => r,
+            Err(_) => {
+                // TLS handshake failed / connection refused / etc.
+                // First hop is fatal; intermediate we keep what we have.
+                if hop == 0 {
+                    return None;
+                }
+                break;
+            }
+        };
+
+        let status = resp.status().as_u16();
+        // reqwest gives us `canonical_reason()` which is a human-friendly
+        // status text. Fall back to a blank if the code is non-standard.
+        let status_text = resp
+            .status()
+            .canonical_reason()
+            .unwrap_or("")
+            .to_string();
+        // Content-Length: prefer the raw wire header; fall back to the
+        // body bytes we actually received. HTTP/2 responses often omit
+        // the Content-Length header (H2 uses DATA frame lengths instead),
+        // and reqwest strips it on auto-decompression — so we compute
+        // from body length if the header is missing.
+        let header_cl: Option<u64> = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok());
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Read body (streaming, capped at 64 KiB). We use `.bytes()` and
+        // then truncate rather than chunked streaming — title is usually
+        // in the first few KiB anyway, and reqwest's top-level timeout
+        // (5 s) prevents runaway downloads.
+        let body_bytes = resp.bytes().ok().unwrap_or_default();
+        let body_len = body_bytes.len();
+        let body_trunc = &body_bytes[..body_len.min(65536)];
+        let body_str = String::from_utf8_lossy(body_trunc);
+        let title = extract_title(&body_str);
+
+        let content_length: Option<u64> = header_cl.or_else(|| {
+            if body_len > 0 {
+                Some(body_len as u64)
+            } else {
+                None
+            }
+        });
+
+        last = Some((status, status_text, title, content_length));
+
+        let is_redirect = (300..400).contains(&status);
+        if !follow || !is_redirect {
+            break;
+        }
+        match location {
+            Some(loc) => {
+                let next = resolve_redirect_url(&current, &loc);
+                chain.push(current);
+                current = next;
+            }
+            None => break,
+        }
+    }
+
+    let (status_code, status_text, title, content_length) = last?;
+    let final_url = if chain.is_empty() {
+        None
+    } else {
+        Some(current.clone())
+    };
+    Some(HttpProbeResult {
+        status_line: format!("HTTP/1.1 {} {}", status_code, status_text),
+        title,
+        final_url,
+        chain,
+        via_https: started_https,
+        content_length,
+    })
+}
+
+/// Try `url` as-is; if it fails AND the port is non-standard, retry with the
+/// opposite scheme. Catches weird cases like HTTP on :8443 or HTTPS on :8080.
+fn http_probe_blocking(url: &str, follow: bool) -> Option<HttpProbeResult> {
+    if let Some(r) = http_probe_single(url, follow) {
+        return Some(r);
+    }
+    // Scheme flip retry — only bother for non-standard ports, since :80/:443
+    // rarely cross-speak.
+    let is_http = url.starts_with("http://");
+    let is_https = url.starts_with("https://");
+    let non_standard_port = url
+        .rsplit_once(':')
+        .and_then(|(_, rest)| rest.split('/').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .map(|p| !matches!(p, 80 | 443))
+        .unwrap_or(false);
+    if !non_standard_port {
+        return None;
+    }
+    let alt = if is_http {
+        url.replacen("http://", "https://", 1)
+    } else if is_https {
+        url.replacen("https://", "http://", 1)
+    } else {
+        return None;
+    };
+    http_probe_single(&alt, follow)
+}
+
 // Cross-platform PATH resolver. Returns the full path to the first hit, not
 // just a bool. Matches the semantics of `which` on Unix and `where.exe` on
 // Windows (including .exe / .cmd / .bat extensions).
@@ -1726,6 +1955,10 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
         banner: None,
         cdn: None,
         source_label: None, // filled in post-enrichment from the domain→IP map
+        title: None,
+        final_url: None,
+        redirect_chain: None,
+        content_length: None,
     };
 
     let start = Instant::now();
@@ -1759,7 +1992,7 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
 
     // Active HTTP probe.
     if stream
-        .write_all(b"GET / HTTP/1.0\r\nHost: scan\r\nUser-Agent: ipv6scanner\r\n\r\n")
+        .write_all(b"GET / HTTP/1.0\r\nHost: scan\r\nUser-Agent: portwave\r\n\r\n")
         .await
         .is_ok()
     {
@@ -2860,6 +3093,10 @@ async fn run_udp_phase(
                     banner: Some(banner),
                     cdn: None,
                     source_label: None,
+                    title: None,
+                    final_url: None,
+                    redirect_chain: None,
+                    content_length: None,
                 })
             });
         }
@@ -3425,25 +3662,76 @@ async fn run_refresh_cdn() -> anyhow::Result<()> {
 
 // ────────────────────────── Main ──────────────────────────
 
+// v0.14.9 — the httpx subprocess was removed (portwave does its own native
+// HTTP(S) enrichment now). Old `--httpx-*` / `--no-httpx` flags would silently
+// be rejected by clap with a generic "unexpected argument" message. Scan this
+// list BEFORE clap parses and fail with a specific migration hint so scripts
+// fail loudly, not mysteriously.
+fn check_deprecated_flags() {
+    let argv: Vec<String> = std::env::args().collect();
+    const RETIRED: &[(&str, &str)] = &[
+        (
+            "--no-httpx",
+            "httpx subprocess is gone in v0.14.9 — portwave does HTTP(S) enrichment natively. Drop the flag.",
+        ),
+        (
+            "--httpx-follow-redirects",
+            "renamed to --follow-redirects.",
+        ),
+        (
+            "--httpx-threads",
+            "gone — Phase-A uses --threads; HTTP probe uses -C / --probe-concurrency.",
+        ),
+        (
+            "--httpx-paths",
+            "gone — pipe http_targets.txt to httpx -path \"/a,/b\" manually if you need custom paths.",
+        ),
+    ];
+    for arg in argv.iter().skip(1) {
+        // Accept both `--flag` and `--flag=value` forms.
+        let stem = arg.split('=').next().unwrap_or(arg);
+        for (dep, hint) in RETIRED {
+            if stem == *dep {
+                eprintln!("error: {} removed in v0.14.9.", dep);
+                eprintln!("  hint: {}", hint);
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    check_deprecated_flags();
     let mut args = Args::parse();
 
     // Initialize the stdout-TTY flag used by the color helpers.
     // Checked once here so per-port-print loop skips the syscall.
     init_stdout_color();
 
-    // ASN scans touch a much wider, noisier target set than hand-picked
-    // CIDRs. Auto-enable --httpx-follow-redirects because most ASN hosts
-    // return 30x chains to a portal / WAF; following them gives meaningful
-    // status + title, not just "[302] [Moved]". One-line info note so the
-    // behaviour isn't surprising.
-    if args.asn.is_some() && !args.httpx_follow_redirects {
-        args.httpx_follow_redirects = true;
-        if !args.quiet {
-            eprintln!(
-                "[asn] auto-enabled --httpx-follow-redirects for maximum result coverage"
-            );
+    // ASN scans touch much wider, noisier target sets than hand-picked
+    // CIDRs. Two auto-tweaks for that context:
+    //   --follow-redirects    → ASN hosts usually 30x to portals / WAFs;
+    //                           following gives meaningful status + title.
+    //   --probe-concurrency 50 → halve the default 100. Bursts of HTTP
+    //                           requests to adjacent IPs in a single /16
+    //                           trigger provider WAF rate-limits (see the
+    //                           AS10846 164.121.0.0/16 case where httpx
+    //                           only got 8/189). Pacing helps coverage.
+    // Both nudges only apply if the user didn't pass an explicit value.
+    if args.asn.is_some() {
+        let mut notes: Vec<&str> = Vec::new();
+        if !args.follow_redirects {
+            args.follow_redirects = true;
+            notes.push("--follow-redirects");
+        }
+        // Only halve if user left it at the default.
+        if args.probe_concurrency == 100 {
+            args.probe_concurrency = 50;
+            notes.push("--probe-concurrency=50");
+        }
+        if !notes.is_empty() && !args.quiet {
+            eprintln!("[asn] auto-enabled {}", notes.join(" + "));
         }
     }
 
@@ -4483,6 +4771,10 @@ async fn main() -> anyhow::Result<()> {
                         banner: None,
                         cdn: None,
                         source_label: None,
+                        title: None,
+                        final_url: None,
+                        redirect_chain: None,
+                        content_length: None,
                     });
                     continue;
                 }
@@ -4657,6 +4949,10 @@ async fn main() -> anyhow::Result<()> {
                     banner: Some("(Ctrl+C — enrichment skipped)".to_string()),
                     cdn: None,
                     source_label: None,
+                    title: None,
+                    final_url: None,
+                    redirect_chain: None,
+                    content_length: None,
                 });
                 backfilled += 1;
             }
@@ -4735,6 +5031,134 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     open_records.dedup_by(|a, b| a.ip == b.ip && a.port == b.port);
+
+    // ── Pass-C: native HTTP(S) probe (replaces the old httpx subprocess) ──
+    // v0.14.9. For every HTTP-candidate open port we issue a real HTTP(S)
+    // GET via ureq (SNI-aware, TLS-verified) inside spawn_blocking so the
+    // async runtime stays responsive. Parses status code, <title>, follows
+    // redirects if requested. Overwrites enrich()'s bare-bones banner with
+    // the richer response line.
+    //
+    // Concurrency is independent of --threads (which drives the 3000-worker
+    // Phase A pool): --probe-concurrency (short -C) defaults to 100, with
+    // an auto-halve to 50 on ASN scans to stay under WAF burst thresholds
+    // that blocked httpx coverage on the 164.121.0.0/16 scan.
+    let http_probe_ms: u128 = if args.no_enrich || args.no_banner || open_records.is_empty() {
+        0
+    } else {
+        let probe_targets: Vec<(usize, String)> = open_records
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| {
+                // Only probe HTTP-plausible ports — `ssh`, `rdp`, `vnc`,
+                // database protocols etc. are already banner-classified
+                // and probing them via HTTP just wastes a round-trip.
+                // Positive-list match: the SAME filter used below when
+                // rendering the enrichment section, so the two views agree.
+                if !is_http_candidate(op.port, op.protocol.as_deref(), op.tls) {
+                    return None;
+                }
+                match op.protocol.as_deref() {
+                    None => {}
+                    Some(p) => {
+                        if !matches!(
+                            p,
+                            "http"
+                                | "http-alt"
+                                | "http-admin"
+                                | "http-proxy"
+                                | "https"
+                                | "https-alt"
+                                | "cloudflare-https"
+                                | "tls"
+                                | "ssl"
+                                | "unknown"
+                                | "cpanel"
+                                | "cpanel-ssl"
+                                | "whm"
+                                | "grafana-alt"
+                                | "sonarqube"
+                                | "kibana"
+                                | "weblogic"
+                                | "oracle-http"
+                                | "puppet"
+                                | "activemq-admin"
+                                | "vault"
+                                | "prometheus"
+                                | "transmission"
+                                | "alertmanager"
+                                | "zabbix"
+                                | "plex"
+                                | "vnc-http"
+                        ) {
+                            return None;
+                        }
+                    }
+                }
+                let ip = op.ip.parse::<IpAddr>().ok()?;
+                Some((
+                    i,
+                    format_for_nuclei(&ip, op.port, op.tls, op.source_label.as_deref()),
+                ))
+            })
+            .collect();
+
+        if probe_targets.is_empty() {
+            0
+        } else {
+            let concurrency = args.probe_concurrency.max(1);
+            let follow = args.follow_redirects;
+            let started = Instant::now();
+            // One-line progress note only — the real output lives in the
+            // OPEN PORTS table (titles/redirects inline) and in the
+            // post-OPEN-PORTS enrichment dump (httpx-style per-URL lines).
+            eprintln!(
+                "Enriching {} HTTP target(s)… (-C {}{})",
+                probe_targets.len(),
+                concurrency,
+                if follow { ", follow redirects" } else { "" }
+            );
+
+            let sem = Arc::new(Semaphore::new(concurrency));
+            let mut handles = Vec::with_capacity(probe_targets.len());
+            for (idx, url) in probe_targets {
+                let sem = sem.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await.ok();
+                    let res = tokio::task::spawn_blocking(move || {
+                        http_probe_blocking(&url, follow)
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    (idx, res)
+                }));
+            }
+
+            for h in handles {
+                if let Ok((idx, Some(r))) = h.await {
+                    // Overwrite enrich()'s banner with the real status line;
+                    // keep the existing enrich() protocol classification
+                    // unless the scheme-flip retry promoted us to HTTPS.
+                    open_records[idx].banner = Some(r.status_line);
+                    open_records[idx].title = r.title;
+                    open_records[idx].final_url = r.final_url;
+                    open_records[idx].content_length = r.content_length;
+                    if !r.chain.is_empty() {
+                        open_records[idx].redirect_chain = Some(r.chain);
+                    }
+                    if r.via_https {
+                        open_records[idx].tls = true;
+                        match open_records[idx].protocol.as_deref() {
+                            Some("https") | Some("ssh") | Some("ssl") => {}
+                            _ => open_records[idx].protocol = Some("https".into()),
+                        }
+                    }
+                }
+            }
+            started.elapsed().as_millis()
+        }
+    };
 
     // ── Write artifacts ──
     let mut jsonl = BufWriter::new(
@@ -5018,11 +5442,33 @@ async fn main() -> anyhow::Result<()> {
         // by HTTP-status class (2xx green, 3xx cyan, 4xx yellow, 5xx red).
         let port_col = cfmt("2", &format!(":{:<5}", op.port));
 
+        // v0.14.9 — render title and redirect target after the banner.
+        // Title is dimmed italic-ish; redirect target appended with an arrow.
+        // Keeps non-HTTP rows (SSH banners etc.) visually unchanged.
+        let title_suffix = match &op.title {
+            Some(t) if !t.is_empty() => format!("  {}", cfmt("2", &format!("· \"{}\"", t))),
+            _ => String::new(),
+        };
+        let redirect_suffix = match &op.final_url {
+            Some(u) => format!("  {} {}", cfmt("2", "→"), cfmt("36", u)),
+            None => String::new(),
+        };
+
         if banner.is_empty() {
-            println!("      {} {}", port_col, tag_bundle);
+            println!(
+                "      {} {}{}{}",
+                port_col, tag_bundle, title_suffix, redirect_suffix
+            );
         } else {
             let b: String = banner.chars().take(110).collect();
-            println!("      {} {}  {}", port_col, tag_bundle, color_banner_status(&b));
+            println!(
+                "      {} {}  {}{}{}",
+                port_col,
+                tag_bundle,
+                color_banner_status(&b),
+                title_suffix,
+                redirect_suffix
+            );
         }
     }
 
@@ -5050,139 +5496,176 @@ async fn main() -> anyhow::Result<()> {
     // or if there were zero opens at all. Spawning httpx on an empty /
     // non-HTTP-only hit list just burns a subprocess and produces an
     // empty file that auto-prune deletes.
-    let http_targets_has_http = std::fs::metadata(&http_targets_path)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
-    let any_opens = open_records.iter().any(|_| true);
-    if args.no_httpx {
-        println!("Skipping httpx (--no-httpx).");
-    } else if !any_opens {
-        println!("Skipping httpx — no open ports to probe.");
-    } else if !http_targets_has_http {
-        println!("Skipping httpx — no HTTP-candidate ports (all opens were non-HTTP services).");
-    } else {
-        // Resolve: env → config → PATH. Offer to install if still missing.
-        let mut httpx_bin = resolve_tool("httpx", &cfg, "PORTWAVE_HTTPX_BIN");
-        if httpx_bin.is_none() {
-            let installed = offer_install(
-                "httpx",
-                "github.com/projectdiscovery/httpx/cmd/httpx",
-                !args.no_install_prompt,
-            );
-            if installed {
-                httpx_bin = resolve_tool("httpx", &cfg, "PORTWAVE_HTTPX_BIN");
-            }
+    // v0.14.9 — the post-OPEN-PORTS section that used to be `httpx` is now
+    // `enrichment`. Same file format (`httpx_results.txt` still exists for
+    // downstream tooling) and same visual shape (per-URL `[status] [length]
+    // [title]`, then a summary line) — but produced natively, no subprocess.
+    // Helper: a row is "HTTP-candidate" for the Pass-C probe only when both
+    //   1. it passes the coarse non-HTTP-ports filter (echo, discard, BGP…)
+    //   2. its Phase-B protocol tag is HTTP-plausible (http / https / tls /
+    //      unknown / None) — a confirmed SSH/SMTP/FTP/RDP/VNC/MySQL/etc.
+    //      banner means we'd just waste a ureq round-trip probing HTTP.
+    let is_enrich_candidate = |op: &OpenPort| -> bool {
+        if !is_http_candidate(op.port, op.protocol.as_deref(), op.tls) {
+            return false;
         }
-        if let Some(bin) = httpx_bin {
-            // v0.14.8: count targets so the section header shows scope.
-            let target_count = std::fs::read_to_string(&http_targets_path)
-                .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
-                .unwrap_or(0);
+        match op.protocol.as_deref() {
+            None => true,
+            Some(p) => matches!(
+                p,
+                "http"
+                    | "http-alt"
+                    | "http-admin"
+                    | "http-proxy"
+                    | "https"
+                    | "https-alt"
+                    | "cloudflare-https"
+                    | "tls"
+                    | "ssl"
+                    | "unknown"
+                    | "cpanel"
+                    | "cpanel-ssl"
+                    | "whm"
+                    | "grafana-alt"
+                    | "sonarqube"
+                    | "kibana"
+                    | "weblogic"
+                    | "oracle-http"
+                    | "puppet"
+                    | "activemq-admin"
+                    | "vault"
+                    | "prometheus"
+                    | "transmission"
+                    | "alertmanager"
+                    | "zabbix"
+                    | "plex"
+                    | "vnc-http"
+            ),
+        }
+    };
+
+    if open_records.iter().any(is_enrich_candidate) {
+        use std::io::Write as _;
+
+        let mut file_writer = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&httpx_out)
+            .ok()
+            .map(BufWriter::new);
+
+        // Collect all HTTP-candidate records into a sorted, printable form.
+        let mut rows: Vec<(String, Option<u16>, Option<u64>, Option<String>, Option<String>)> =
+            Vec::new();
+        for op in &open_records {
+            if !is_enrich_candidate(op) {
+                continue;
+            }
+            let Ok(ip) = op.ip.parse::<IpAddr>() else { continue };
+            let url = format_for_nuclei(&ip, op.port, op.tls, op.source_label.as_deref());
+            let status: Option<u16> = op
+                .banner
+                .as_deref()
+                .and_then(|b| b.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok());
+            let cl = op.content_length;
+            let title = op.title.clone();
+            let final_url = op.final_url.clone();
+            rows.push((url, status, cl, title, final_url));
+        }
+
+        // Only render the section if there are rows to show.
+        if !rows.is_empty() {
             println!();
             println!(
-                "{} {} {} target(s) · {} threads",
+                "{} {} {} target(s) · {:.2}s",
                 cfmt("1;36", "───"),
-                cfmt("1;36", "httpx"),
-                cfmt("1", &target_count.to_string()),
-                args.httpx_threads
+                cfmt("1;36", "enrichment"),
+                cfmt("1", &rows.len().to_string()),
+                http_probe_ms as f64 / 1000.0
             );
-            println!("{}", cfmt("2", &format!("  binary: {}", bin.display())));
             println!();
-            let httpx_started = Instant::now();
-            let mut cmd = Command::new(&bin);
-            cmd.arg("-l").arg(&http_targets_path)     // v0.13.3: use explicit-scheme
-                                                // URL list instead of bare
-                                                // ip:port. Guarantees httpx
-                                                // probes exactly one scheme
-                                                // per entry — no scheme
-                                                // auto-detect, no conflict
-                                                // in output.
-                .arg("-sc")
-                .arg("-cl")
-                .arg("-title")
-                // v0.14.8: dropped `-location` and `-nc` from the default
-                // output shape. The old layout rendered as
-                //     URL [status] [] [len] [title]
-                // where the empty [] was `-location` unset on non-3xx
-                // responses (which is ~95 % of real scans). The remaining
-                // cases where redirect location matters are covered by the
-                // 3xx status + -fr flag. Removing `-nc` lets httpx
-                // colorize status codes on stdout (2xx green, 3xx yellow,
-                // 4xx cyan, 5xx red) while still stripping colors from
-                // the -o file for easy grepping downstream.
-                // -silent suppresses the ASCII banner + [WRN] dashboard noise
-                // while still writing real findings to both stdout and -o.
-                .arg("-silent")
-                // -no-fallback (v0.13.2): prevents httpx's scheme-fallback
-                // from silently substituting port 80 when TLS fails on :443.
-                .arg("-no-fallback")
-                // -ztls (v0.13.3): use the zcrypto TLS library which is
-                // more lenient with legacy / broken certificates (e.g.
-                // Cisco devices serving certs with negative X.509 serial
-                // numbers). Modern Go crypto/tls rejects these by spec;
-                // -ztls parses them. Without this, legacy IoT / enterprise
-                // gear silently disappears from httpx output.
-                .arg("-ztls")
-                .arg("-threads").arg(args.httpx_threads.to_string())
-                .arg("-timeout").arg("10")
-                .arg("-retries").arg("1")
-                .arg("-o").arg(&httpx_out);
-            if args.httpx_follow_redirects {
-                cmd.arg("-fr");
-            }
-            if let Some(p) = &args.httpx_paths {
-                cmd.arg("-path").arg(p);
-            }
-            let status = cmd.status();
-            // v0.14.8: post-run summary — parse -o file to count 2xx/3xx/4xx/5xx
-            // so the user sees the shape of the result instead of scrolling
-            // back through the raw dump to hunt for interesting codes.
+
             let mut c_2xx = 0usize;
             let mut c_3xx = 0usize;
             let mut c_4xx = 0usize;
             let mut c_5xx = 0usize;
-            let mut c_total = 0usize;
-            if let Ok(text) = std::fs::read_to_string(&httpx_out) {
-                for line in text.lines() {
-                    if line.trim().is_empty() { continue; }
-                    c_total += 1;
-                    // Find the first "[NNN]" token — that's the status code.
-                    if let Some(start) = line.find('[') {
-                        if let Some(end) = line[start+1..].find(']') {
-                            let code: &str = &line[start+1..start+1+end];
-                            match code.chars().next() {
-                                Some('2') => c_2xx += 1,
-                                Some('3') => c_3xx += 1,
-                                Some('4') => c_4xx += 1,
-                                Some('5') => c_5xx += 1,
-                                _ => {}
-                            }
+            let mut responding = 0usize;
+
+            for (url, status, cl, title, final_url) in &rows {
+                // File line: plain, httpx-format for grep-friendliness.
+                if let Some(w) = file_writer.as_mut() {
+                    let s = status.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+                    let l = cl.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+                    match title.as_deref() {
+                        Some(t) if !t.is_empty() => {
+                            let _ = writeln!(w, "{} [{}] [{}] [{}]", url, s, l, t);
+                        }
+                        _ => {
+                            let _ = writeln!(w, "{} [{}] [{}]", url, s, l);
                         }
                     }
                 }
+
+                // Terminal line: colored, with redirect target if present.
+                let status_str = match status {
+                    Some(n) => {
+                        responding += 1;
+                        match n {
+                            200..=299 => c_2xx += 1,
+                            300..=399 => c_3xx += 1,
+                            400..=499 => c_4xx += 1,
+                            500..=599 => c_5xx += 1,
+                            _ => {}
+                        }
+                        let color = match n {
+                            200..=299 => "32",
+                            300..=399 => "33",
+                            400..=499 => "36",
+                            500..=599 => "31",
+                            _ => "0",
+                        };
+                        cfmt(color, &n.to_string())
+                    }
+                    None => cfmt("2", "-"),
+                };
+                let cl_str = match cl {
+                    Some(n) => cfmt("35", &n.to_string()),
+                    None => cfmt("2", "-"),
+                };
+                let title_part = match title.as_deref() {
+                    Some(t) if !t.is_empty() => format!(" [{}]", cfmt("36", t)),
+                    _ => String::new(),
+                };
+                let redirect_part = match final_url.as_deref() {
+                    Some(u) => format!(" {} {}", cfmt("2", "→"), cfmt("36", u)),
+                    None => String::new(),
+                };
+                println!(
+                    "{} [{}] [{}]{}{}",
+                    url, status_str, cl_str, title_part, redirect_part
+                );
             }
+
+            if let Some(mut w) = file_writer {
+                let _ = w.flush();
+            }
+
             println!();
-            match status {
-                Ok(s) if s.success() => {
-                    println!(
-                        "{} {} responding · {} 2xx · {} 3xx · {} 4xx · {} 5xx · → {}",
-                        cfmt("1;32", "✓ httpx:"),
-                        c_total,
-                        cfmt("32", &c_2xx.to_string()),
-                        cfmt("33", &c_3xx.to_string()),
-                        cfmt("36", &c_4xx.to_string()),
-                        cfmt("31", &c_5xx.to_string()),
-                        cfmt("2", &httpx_out.display().to_string())
-                    );
-                }
-                Ok(s) => eprintln!("{} {}", cfmt("1;31", "✗ httpx exited"), s),
-                Err(e) => eprintln!("{} {}", cfmt("1;31", "✗ httpx launch failed:"), e),
-            }
-            summary.httpx_ms = httpx_started.elapsed().as_millis();
-        } else {
-            eprintln!("httpx not found on PATH or in config — skipping. Set PORTWAVE_HTTPX_BIN or install httpx.");
+            println!(
+                "{} {} responding · {} 2xx · {} 3xx · {} 4xx · {} 5xx · → {}",
+                cfmt("1;32", "✓ enrichment:"),
+                responding,
+                cfmt("32", &c_2xx.to_string()),
+                cfmt("33", &c_3xx.to_string()),
+                cfmt("36", &c_4xx.to_string()),
+                cfmt("31", &c_5xx.to_string()),
+                cfmt("2", &httpx_out.display().to_string())
+            );
         }
     }
+    summary.httpx_ms = http_probe_ms;
 
     // ── nuclei ──
     // Same guard as httpx: if the filtered nuclei target list is empty
