@@ -134,9 +134,9 @@ struct Args {
     #[arg(short = 'C', long, default_value_t = 100)]
     probe_concurrency: usize,
 
-    /// Follow redirects up to 3 hops (auto-on with --asn)
+    /// Don't follow redirects (default: follow up to 3 hops)
     #[arg(long, default_value_t = false)]
-    follow_redirects: bool,
+    no_follow_redirects: bool,
 
     /// Skip native HTTP(S) enrichment
     #[arg(long, default_value_t = false)]
@@ -1010,18 +1010,53 @@ const NON_HTTP_PORTS: &[u16] = &[
     13,      // daytime
     17,      // qotd
     19,      // chargen
+    21,      // FTP control
+    22,      // SSH
+    23,      // Telnet
+    25,      // SMTP
     37,      // time
-    53,      // DNS (TCP fallback — nuclei has almost no TCP-DNS templates)
+    53,      // DNS (TCP fallback)
     67, 68,  // DHCP
     69,      // TFTP
     109,     // POP2 (not POP3)
+    110,     // POP3
     111,     // portmap / RPC
+    119,     // NNTP
     123,     // NTP
-    137, 138, // NetBIOS name / datagram (139 NetBIOS-SSN stays in)
+    135,     // MS-RPC (endpoint mapper)
+    137, 138,// NetBIOS name / datagram
+    143,     // IMAP
+    161, 162,// SNMP
     179,     // BGP
+    389,     // LDAP
+    445,     // SMB
+    465,     // SMTPS
+    500,     // IKE
     514,     // syslog
-    543, 544, // klogin / kshell
+    515,     // LPD
+    543, 544,// klogin / kshell
+    587,     // SMTP submission
+    636,     // LDAPS
+    993,     // IMAPS
+    995,     // POP3S
+    1433,    // MSSQL
+    1521,    // Oracle
+    1812, 1813, // RADIUS
+    1883,    // MQTT
+    2049,    // NFS
+    3306,    // MySQL
+    3389,    // RDP
     4789,    // VXLAN
+    5060, 5061, // SIP
+    5432,    // PostgreSQL
+    5900, 5901, 5902, 5903, 5904, 5905, 5906, 5907, 5908, 5909, 5910, // VNC
+    5938,    // TeamViewer
+    6000, 6001, 6002, 6003, 6004, 6005, 6006, 6007, 6008, 6009, // X11
+    6379,    // Redis
+    11211,   // Memcached
+    27017,   // MongoDB
+    // NOTE: 9200 (Elasticsearch) stays HTTP-candidate — the ES REST API
+    // is genuinely HTTP, nuclei has ES-specific templates that target it.
 ];
 
 // Should this open port get a URL in nuclei_targets.txt?
@@ -1258,14 +1293,26 @@ fn http_probe_single(url: &str, follow: bool) -> Option<HttpProbeResult> {
     })
 }
 
-/// Try `url` as-is; if it fails AND the port is non-standard, retry with the
-/// opposite scheme. Catches weird cases like HTTP on :8443 or HTTPS on :8080.
+/// Try `url` as-is; on failure, retry once (transient TLS/connect errors at
+/// high concurrency are common against BIG-IP / WAF / rate-limited edges);
+/// if still failing AND the port is non-standard, flip scheme and try again.
+/// Covers: HTTP on :8443, HTTPS on :8080, server SSL-handshake rate limits.
 fn http_probe_blocking(url: &str, follow: bool) -> Option<HttpProbeResult> {
+    // Primary attempt.
     if let Some(r) = http_probe_single(url, follow) {
         return Some(r);
     }
-    // Scheme flip retry — only bother for non-standard ports, since :80/:443
-    // rarely cross-speak.
+    // v0.14.11 — retry once on transient failure. Servers applying SYN / TLS
+    // rate-limits against parallel probes (BIG-IP, F5, CloudFront origin
+    // shields) drop a subset of the first wave's handshakes; a simple second
+    // attempt ~200 ms later usually succeeds. No backoff — reqwest's own
+    // 5 s connect timeout already sets the pacing ceiling.
+    std::thread::sleep(Duration::from_millis(200));
+    if let Some(r) = http_probe_single(url, follow) {
+        return Some(r);
+    }
+    // Scheme flip — only for non-standard ports, since :80/:443 rarely
+    // cross-speak.
     let is_http = url.starts_with("http://");
     let is_https = url.starts_with("https://");
     let non_standard_port = url
@@ -3704,21 +3751,15 @@ fn check_deprecated_flags() {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     check_deprecated_flags();
-    let mut args = Args::parse();
+    let args = Args::parse();
 
     // Initialize the stdout-TTY flag used by the color helpers.
     // Checked once here so per-port-print loop skips the syscall.
     init_stdout_color();
 
-    // ASN scans typically 30x to portals / WAFs; following redirects gives
-    // meaningful status + title instead of "[302] [Moved]". Only auto-enable
-    // if the user didn't already pass it.
-    if args.asn.is_some() && !args.follow_redirects {
-        args.follow_redirects = true;
-        if !args.quiet {
-            eprintln!("[asn] auto-enabled --follow-redirects");
-        }
-    }
+    // v0.14.11: follow redirects is now default-on; `--no-follow-redirects`
+    // disables it. Removed the ASN auto-enable path since the default
+    // already covers it. (User preference: don't special-case ASN.)
 
     // ────────────── Early input validation (fail fast, helpful messages) ──────────────
     // Check every new-flag value for validity *before* we start building
@@ -5092,11 +5133,11 @@ async fn main() -> anyhow::Result<()> {
             0
         } else {
             let concurrency = args.probe_concurrency.max(1);
-            let follow = args.follow_redirects;
+            let follow = !args.no_follow_redirects;
             let started = Instant::now();
             // One-line progress note only — the real output lives in the
             // OPEN PORTS table (titles/redirects inline) and in the
-            // post-OPEN-PORTS enrichment dump (httpx-style per-URL lines).
+            // post-OPEN-PORTS enrichment dump.
             eprintln!(
                 "Enriching {} HTTP target(s)… (-C {}{})",
                 probe_targets.len(),
