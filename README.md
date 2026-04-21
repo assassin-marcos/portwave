@@ -1,6 +1,6 @@
 # portwave
 
-**Ultra-fast, IP-focused IPv4/IPv6 port scanner with a built-in httpx + nuclei recon pipeline — written in async Rust.**
+**Ultra-fast IPv4/IPv6 port scanner with domain + subdomain support, automatic CDN filtering, and a built-in httpx + nuclei recon pipeline — written in async Rust.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
@@ -16,7 +16,7 @@
  |_|     portwave · by assassin_marcos
 ```
 
-Takes CIDRs, IPs, IP ranges, or an ASN. Finds open TCP (and optional UDP) ports, enriches hits with banner grabs + TLS sniff, tags CDN/WAF edges, diffs against the last run, optionally POSTs to a webhook, then chains **httpx** + **nuclei** — all in a single binary.
+Takes CIDRs, IPs, IP ranges, domains, subdomains, or an ASN — mixed freely in one input. Finds open TCP (and optional UDP) ports, enriches hits with banner grabs + TLS sniff, tags CDN/WAF edges (auto-skips them by default), diffs against the last run, optionally POSTs to a webhook, then chains **httpx** + **nuclei** — all in a single binary.
 
 ---
 
@@ -157,6 +157,22 @@ portwave -u          # install latest release + print What's-new changelog
 portwave -c          # check for updates (does not install)
 portwave -X          # uninstall (binary + share + cache); -Xy to skip the prompt
 ```
+
+---
+
+## Quickstart
+
+The first positional argument is just a **folder name** for results — pick anything (examples below use `acme`, `bb`, etc.); outputs land in `./scans/<folder>/`.
+
+```bash
+portwave acme 1.2.3.4                                 # one IP
+portwave acme 203.0.113.0/24                          # a CIDR
+portwave acme -d example.com                          # one domain
+portwave bb -d "site.com,api.site.com,mail.site.com"  # multiple domains
+subfinder -d target.com -silent | portwave bb -i -    # subdomain list via stdin
+```
+
+That's it — defaults are tuned for fast + accurate. Skip to [Recommended commands](#recommended-commands) for flags that squeeze out the last 5 %.
 
 ---
 
@@ -344,14 +360,14 @@ Top-20 priority ports (`80, 443, 22, 21, 25, 53, 8080, 8443, 3389, 110, 143, 445
 | `-c, --check-update` | Report whether a newer release exists (peeks both releases + tags API) |
 | `-X, --uninstall` | Remove portwave (binary + share + cache + optional config), interactive `[y/N]` |
 | `-y, --yes` | Skip the uninstall confirmation (for scripted removal) |
-| `--refresh-cdn` | Re-fetch Cloudflare + Fastly edge ranges live, merge with embedded non-API providers, cache to `~/.cache/portwave/cdn-ranges.txt` |
+| `--refresh-cdn` | Re-fetch all 20 CDN providers live (11 direct URLs + 13 via RIPE stat ASN lookup — Cloudflare, Akamai, Fastly, CloudFront, Gcore, Imperva, and 14 others; ~13,500 CIDRs). Cache written to `~/.cache/portwave/cdn-ranges.txt` |
 | `--no-update-check` | Suppress startup "update available" banner |
 | `--no-update-prompt` | Show the update banner + changelog but skip the `[Y/n]` prompt |
 | `--no-install-prompt` | Don't prompt to install httpx/nuclei if missing (for CI) |
 | `--no-art` / `-q, --quiet` | Suppress banner art / all banner output |
 | `--no-banner` / `--no-tls-sniff` / `--no-adaptive` | Turn off individual Phase-B features |
 
-The startup banner prints `(latest)` in green or `(outdated → vX.Y.Z)` in red next to the version — the cache is refreshed against GitHub on every startup (1 s budget, 5 min cache-hit fast path) so the tag is always accurate.
+The startup banner prints `(latest)` in green or `(outdated → vX.Y.Z)` in red next to the version — the cache is refreshed against GitHub on every startup (1 s budget, 2 min cache-hit fast path) so the tag stays accurate within ~2 min of a new release.
 
 ---
 
@@ -481,7 +497,7 @@ What portwave deliberately doesn't do (by design or deferred):
 - **No exhaustive IPv6 `/64` enumeration.** Physically impossible at any speed; `--smart-ipv6` covers the ~450 addresses real admins actually use (RFC 7707 patterns). Anything beyond that wants passive enumeration (CT logs, DNS brute-force, Shodan).
 - **No ICMP host discovery pre-flight.** Every target gets TCP probes whether it's alive or not. On sparse ranges this wastes probes; on dense ranges it doesn't matter. `--max-scan-time` is the mitigation for huge sparse scopes.
 - **HTTP/2 + HTTP/3 banners not parsed.** The HTTP probe speaks HTTP/1.1; h2/h3-only services show up as open ports with empty banners. httpx in Phase B handles h2/h3 via ALPN, so hits still surface in `httpx_results.txt`.
-- **No passive subdomain enumeration** (CT logs / Shodan lookups). Pair with `subfinder -silent | portwave -i -` for full bug-bounty scope expansion. DNS resolution of domains you hand portwave IS built-in since v0.14.0.
+- **No passive subdomain enumeration** (CT logs / Shodan lookups). Pair with `subfinder -d target.com -silent | portwave bb -i -` for the full bug-bounty scope expansion. DNS resolution of domains you hand portwave IS built-in since v0.14.0.
 
 ## Input validation
 
@@ -509,8 +525,8 @@ Exit code is **`2`** for every validation error so scripts can distinguish "user
 
 ## FAQ
 
-**Why IP-only?**
-Hostnames behind CDNs/WAFs all resolve to the same edge IPs, which don't reveal origin ports. portwave stays IP-focused so results are grounded in real infrastructure. Feed IPs from your enum tool or use `--asn`.
+**Does portwave accept domains / subdomains?**
+Yes. Pass them via `-d example.com,sub.example.com` or mix them into an `-i` input file. Each domain is resolved in parallel (hickory DNS → Cloudflare / Google), and any host whose A/AAAA records land on a known CDN edge (Cloudflare, Akamai, Fastly, CloudFront, and 16 others) is auto-skipped, since a CDN IP only exposes 80/443 shared across thousands of tenants. Use `--allow-cdn` to override. Output labels hits as `domain → IP` so you can tell which subdomain each open port belongs to.
 
 **What does `cdn:fastly` next to an open port mean?**
 The IP is in a published CDN edge range. Anything open there is the CDN's edge, not the origin — useful triage signal.
