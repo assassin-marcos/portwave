@@ -5783,7 +5783,6 @@ async fn main() -> anyhow::Result<()> {
                 args.nuclei_concurrency
             );
             println!("{}", cfmt("2", &format!("  binary: {}", bin.display())));
-            println!();
             let nuclei_started = Instant::now();
             let mut cmd = Command::new(&bin);
             cmd.arg("-l").arg(&http_targets_path)
@@ -5792,15 +5791,23 @@ async fn main() -> anyhow::Result<()> {
                 .arg("-mhe").arg(args.nuclei_max_host_error.to_string())
                 // -severity (v0.14.7): default "low,medium,high,critical"
                 // deliberately drops `info` — on ASN / 5K-subdomain scans
-                // info-tier templates produce 90%+ of the noise and almost
-                // none of the actionable findings. User can override with
-                // --nuclei-severity (e.g. pass "critical" for triage-only
-                // runs, or "info,low,medium,high,critical" to get everything).
+                // info-tier templates dominate noise with no actionable
+                // findings. User overrides via --nuclei-severity.
                 .arg("-severity").arg(&args.nuclei_severity)
-                // -silent suppresses nuclei's ASCII banner + progress spam
-                // while still writing findings to stdout + -o.
-                .arg("-silent")
+                // v0.14.14: `-silent` removed from nuclei's invocation so
+                // its own progress + per-match output is visible inline.
+                // Users debugging "did nuclei actually run?" couldn't see
+                // anything before. Our `✓ nuclei:` summary line still
+                // fires afterward with the finding count.
                 .arg("-o").arg(&nuclei_out);
+            // v0.14.14: print the exact command we're about to run so
+            // users can copy-paste / reproduce / debug without guessing.
+            let cmdline = std::iter::once(bin.display().to_string())
+                .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("{}", cfmt("2", &format!("  exec:   {}", cmdline)));
+            println!();
             let status = cmd.status();
             // Count findings in the -o file for the post-run summary.
             let finding_count = std::fs::read_to_string(&nuclei_out)
