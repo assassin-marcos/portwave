@@ -332,6 +332,16 @@ struct Stats {
     /// target dropping SYNs (where shrinking would only slow the
     /// scan without any benefit).
     local_errors: AtomicU64,
+    /// v0.14.8: count of probes that failed with ENETUNREACH (network
+    /// unreachable, errno 101 on Linux / 51 on macOS / 10051 on Windows).
+    /// Unlike EHOSTUNREACH (which fires legitimately on sparse IPv6 scans)
+    /// or timeouts (firewalled targets), ENETUNREACH means the local
+    /// routing table itself can't reach the destination network — the
+    /// only honest signal that "your WiFi dropped." When this passes a
+    /// threshold the network-down monitor flips `shutdown`, triggering
+    /// the same graceful save-and-exit flow as Ctrl+C. Resume works
+    /// against whatever was flushed to disk.
+    net_unreach: AtomicU64,
     /// Flips to true after the top-20 priority sweep completes.
     /// Lets phase_a workers print an interim summary before Pass 2
     /// starts chewing through the full port list.
@@ -1566,6 +1576,25 @@ fn is_local_resource_error(e: &std::io::Error) -> bool {
     }
 }
 
+// v0.14.8: ENETUNREACH detection. Unlike timeouts (firewalled targets) or
+// EHOSTUNREACH (legitimate on sparse IPv6), ENETUNREACH means the local
+// routing table itself can't reach the destination network — the only
+// clean signal that "your WiFi just dropped". Counts feed the network-
+// down monitor, which flips `stats.shutdown` to save progress and exit
+// gracefully when a burst of these shows up.
+//
+// Platform errnos:
+//   Linux:   ENETUNREACH = 101
+//   macOS:   ENETUNREACH = 51
+//   Windows: WSAENETUNREACH = 10051
+fn is_net_unreachable_error(e: &std::io::Error) -> bool {
+    if let Some(code) = e.raw_os_error() {
+        matches!(code, 101 | 51 | 10051)
+    } else {
+        false
+    }
+}
+
 async fn tcp_probe(sa: SocketAddr) -> std::io::Result<TcpStream> {
     let socket = match sa {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
@@ -1644,6 +1673,10 @@ async fn phase_a(
                 Ok(Err(e)) => {
                     if is_local_resource_error(&e) {
                         stats.local_errors.fetch_add(1, Ordering::Relaxed);
+                    } else if is_net_unreachable_error(&e) {
+                        // v0.14.8: feeds the network-down monitor. Single
+                        // relaxed atomic add, negligible on the hot path.
+                        stats.net_unreach.fetch_add(1, Ordering::Relaxed);
                     }
                     break;
                 }
@@ -4226,6 +4259,7 @@ async fn main() -> anyhow::Result<()> {
         timeouts: AtomicU64::new(0),
         opens: AtomicU64::new(0),
         local_errors: AtomicU64::new(0),
+        net_unreach: AtomicU64::new(0),
         priority_done: AtomicBool::new(false),
         adaptive_shrunk: AtomicBool::new(false),
     });
@@ -4309,6 +4343,91 @@ async fn main() -> anyhow::Result<()> {
     let t_b = Duration::from_millis(args.enrich_timeout_ms);
     let want_banner = !args.no_banner;
     let sniff = !args.no_tls_sniff;
+
+    // v0.14.8: network-down monitor. Polls `stats.net_unreach` every second
+    // and flips `stats.shutdown` if it crosses a threshold, triggering the
+    // same graceful drain + save-and-exit path as Ctrl+C / --max-scan-time.
+    // Threshold is conservative (500) because a healthy scan should see
+    // zero ENETUNREACH errors — hosts timeout or RST, they don't produce
+    // "no route to destination network". Zero perf impact on workers (the
+    // error path already does an atomic add; the monitor is a 1 Hz ticker).
+    let net_monitor = {
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            const NET_UNREACH_THRESHOLD: u64 = 500;
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.tick().await; // consume the immediate tick
+            loop {
+                ticker.tick().await;
+                if stats.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                let n = stats.net_unreach.load(Ordering::Relaxed);
+                if n >= NET_UNREACH_THRESHOLD {
+                    eprintln!(
+                        "\n[!] Network looks unreachable — {} probes failed with \
+                         ENETUNREACH. Saving progress and exiting gracefully. \
+                         Re-run the same command to resume from where this stopped.",
+                        n
+                    );
+                    stats.shutdown.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        })
+    };
+
+    // v0.14.8: periodic partial-results flush. Every 15 s we snapshot the
+    // shared open_records vec and rewrite open_ports.jsonl — so a hard crash
+    // (kill -9, power loss, OOM) loses at most 15 s of discoveries instead
+    // of everything since scan start. The final writer later does the same
+    // truncate+rewrite with the complete state, so no file-content drift.
+    //
+    // Design: we abort this task BEFORE the final writer opens the file,
+    // so there's no race with it. The `truncate+rewrite` order means even
+    // if the abort catches the task mid-write, the half-written file gets
+    // immediately overwritten by the final writer.
+    let flush_task = {
+        let records = open_records_shared.clone();
+        let path = jsonl_path.clone();
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.tick().await; // consume the immediate tick
+            loop {
+                ticker.tick().await;
+                if stats.shutdown.load(Ordering::Relaxed) {
+                    // Shutdown in progress — main thread will do the final
+                    // write. Bail out to avoid racing it.
+                    return;
+                }
+                // Clone under lock (fast), write without lock held (slow).
+                let snapshot: Vec<OpenPort> = {
+                    match records.lock() {
+                        Ok(g) => g.clone(),
+                        Err(_) => return, // poisoned — main task died; bail
+                    }
+                };
+                if snapshot.is_empty() {
+                    continue;
+                }
+                if let Ok(f) = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&path)
+                {
+                    let mut w = BufWriter::new(f);
+                    for r in &snapshot {
+                        if let Ok(s) = serde_json::to_string(r) {
+                            let _ = writeln!(w, "{}", s);
+                        }
+                    }
+                    let _ = w.flush();
+                }
+            }
+        })
+    };
 
     let collector = {
         let sink_hits = phase_a_hits.clone();
@@ -4487,6 +4606,15 @@ async fn main() -> anyhow::Result<()> {
     // Pull out the final open_records + report Phase A count.
     let pa_hits_final = phase_a_hits.lock().unwrap().len();
     println!("Phase A done: {} new open ports.", pa_hits_final);
+
+    // v0.14.8: stop the net-monitor + periodic-flush tasks BEFORE the final
+    // writer opens open_ports.jsonl, to avoid a file-open race with the
+    // 15 s flush tick. `abort()` cancels at the next await point; we then
+    // await the JoinHandle to make the cancellation synchronous with us.
+    net_monitor.abort();
+    flush_task.abort();
+    let _ = net_monitor.await;
+    let _ = flush_task.await;
 
     // Unwrap the shared open_records. If the dispatcher future is still
     // holding its Arc (shouldn't happen post-await but be safe), fall back
@@ -4946,7 +5074,20 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         if let Some(bin) = httpx_bin {
-            println!("\n--- httpx ({}) ---", bin.display());
+            // v0.14.8: count targets so the section header shows scope.
+            let target_count = std::fs::read_to_string(&http_targets_path)
+                .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                .unwrap_or(0);
+            println!();
+            println!(
+                "{} {} {} target(s) · {} threads",
+                cfmt("1;36", "───"),
+                cfmt("1;36", "httpx"),
+                cfmt("1", &target_count.to_string()),
+                args.httpx_threads
+            );
+            println!("{}", cfmt("2", &format!("  binary: {}", bin.display())));
+            println!();
             let httpx_started = Instant::now();
             let mut cmd = Command::new(&bin);
             cmd.arg("-l").arg(&http_targets_path)     // v0.13.3: use explicit-scheme
@@ -4958,9 +5099,17 @@ async fn main() -> anyhow::Result<()> {
                                                 // in output.
                 .arg("-sc")
                 .arg("-cl")
-                .arg("-location")
                 .arg("-title")
-                .arg("-nc")
+                // v0.14.8: dropped `-location` and `-nc` from the default
+                // output shape. The old layout rendered as
+                //     URL [status] [] [len] [title]
+                // where the empty [] was `-location` unset on non-3xx
+                // responses (which is ~95 % of real scans). The remaining
+                // cases where redirect location matters are covered by the
+                // 3xx status + -fr flag. Removing `-nc` lets httpx
+                // colorize status codes on stdout (2xx green, 3xx yellow,
+                // 4xx cyan, 5xx red) while still stripping colors from
+                // the -o file for easy grepping downstream.
                 // -silent suppresses the ASCII banner + [WRN] dashboard noise
                 // while still writing real findings to both stdout and -o.
                 .arg("-silent")
@@ -4984,10 +5133,50 @@ async fn main() -> anyhow::Result<()> {
             if let Some(p) = &args.httpx_paths {
                 cmd.arg("-path").arg(p);
             }
-            match cmd.status() {
-                Ok(s) if s.success() => println!("httpx OK -> {:?}", httpx_out),
-                Ok(s) => eprintln!("httpx exited {}", s),
-                Err(e) => eprintln!("httpx launch failed: {}", e),
+            let status = cmd.status();
+            // v0.14.8: post-run summary — parse -o file to count 2xx/3xx/4xx/5xx
+            // so the user sees the shape of the result instead of scrolling
+            // back through the raw dump to hunt for interesting codes.
+            let mut c_2xx = 0usize;
+            let mut c_3xx = 0usize;
+            let mut c_4xx = 0usize;
+            let mut c_5xx = 0usize;
+            let mut c_total = 0usize;
+            if let Ok(text) = std::fs::read_to_string(&httpx_out) {
+                for line in text.lines() {
+                    if line.trim().is_empty() { continue; }
+                    c_total += 1;
+                    // Find the first "[NNN]" token — that's the status code.
+                    if let Some(start) = line.find('[') {
+                        if let Some(end) = line[start+1..].find(']') {
+                            let code: &str = &line[start+1..start+1+end];
+                            match code.chars().next() {
+                                Some('2') => c_2xx += 1,
+                                Some('3') => c_3xx += 1,
+                                Some('4') => c_4xx += 1,
+                                Some('5') => c_5xx += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            println!();
+            match status {
+                Ok(s) if s.success() => {
+                    println!(
+                        "{} {} responding · {} 2xx · {} 3xx · {} 4xx · {} 5xx · → {}",
+                        cfmt("1;32", "✓ httpx:"),
+                        c_total,
+                        cfmt("32", &c_2xx.to_string()),
+                        cfmt("33", &c_3xx.to_string()),
+                        cfmt("36", &c_4xx.to_string()),
+                        cfmt("31", &c_5xx.to_string()),
+                        cfmt("2", &httpx_out.display().to_string())
+                    );
+                }
+                Ok(s) => eprintln!("{} {}", cfmt("1;31", "✗ httpx exited"), s),
+                Err(e) => eprintln!("{} {}", cfmt("1;31", "✗ httpx launch failed:"), e),
             }
             summary.httpx_ms = httpx_started.elapsed().as_millis();
         } else {
@@ -5021,7 +5210,20 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         if let Some(bin) = nuclei_bin {
-            println!("\n--- nuclei ({}) ---", bin.display());
+            let target_count = std::fs::read_to_string(&http_targets_path)
+                .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                .unwrap_or(0);
+            println!();
+            println!(
+                "{} {} {} target(s) · severity={} · {} threads",
+                cfmt("1;35", "───"),
+                cfmt("1;35", "nuclei"),
+                cfmt("1", &target_count.to_string()),
+                cfmt("35", &args.nuclei_severity),
+                args.nuclei_concurrency
+            );
+            println!("{}", cfmt("2", &format!("  binary: {}", bin.display())));
+            println!();
             let nuclei_started = Instant::now();
             let mut cmd = Command::new(&bin);
             cmd.arg("-l").arg(&http_targets_path)
@@ -5039,11 +5241,23 @@ async fn main() -> anyhow::Result<()> {
                 // while still writing findings to stdout + -o.
                 .arg("-silent")
                 .arg("-o").arg(&nuclei_out);
-            println!("Nuclei severity: {}", args.nuclei_severity);
-            match cmd.status() {
-                Ok(s) if s.success() => println!("nuclei OK -> {:?}", nuclei_out),
-                Ok(s) => eprintln!("nuclei exited {}", s),
-                Err(e) => eprintln!("nuclei launch failed: {}", e),
+            let status = cmd.status();
+            // Count findings in the -o file for the post-run summary.
+            let finding_count = std::fs::read_to_string(&nuclei_out)
+                .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                .unwrap_or(0);
+            println!();
+            match status {
+                Ok(s) if s.success() => {
+                    println!(
+                        "{} {} finding(s) · → {}",
+                        cfmt("1;35", "✓ nuclei:"),
+                        finding_count,
+                        cfmt("2", &nuclei_out.display().to_string())
+                    );
+                }
+                Ok(s) => eprintln!("{} {}", cfmt("1;31", "✗ nuclei exited"), s),
+                Err(e) => eprintln!("{} {}", cfmt("1;31", "✗ nuclei launch failed:"), e),
             }
             summary.nuclei_ms = nuclei_started.elapsed().as_millis();
         } else {
