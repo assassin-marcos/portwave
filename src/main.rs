@@ -33,11 +33,11 @@ struct Args {
     #[arg(index = 1)]
     folder_name: Option<String>,
 
-    /// Comma-separated CIDRs, IPs, or IP ranges
+    /// Comma-separated CIDRs, IPs, IP ranges, or domains (mixed freely)
     #[arg(index = 2)]
     cidr_input: Option<String>,
 
-    /// Targets file (one per line); merges with <CIDR_INPUT>
+    /// Targets file (one per line; IP / CIDR / range / domain auto-classified). Use "-" to read from stdin
     #[arg(short = 'i', long)]
     input_file: Option<String>,
 
@@ -153,9 +153,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_adaptive: bool,
 
-    /// Filter nuclei templates by detected protocol (auto with --asn)
-    #[arg(long, default_value_t = false)]
-    tags_from_banner: bool,
+    /// nuclei -severity filter. Default skips `info` (noise reduction on large scans).
+    /// Override with any nuclei-accepted value: "critical", "high,critical",
+    /// "medium,high,critical,info", etc.
+    #[arg(long, default_value = "low,medium,high,critical")]
+    nuclei_severity: String,
 
     /// Download + install the latest portwave release
     #[arg(short = 'u', long, default_value_t = false)]
@@ -3399,33 +3401,15 @@ async fn main() -> anyhow::Result<()> {
     init_stdout_color();
 
     // ASN scans touch a much wider, noisier target set than hand-picked
-    // CIDRs. Auto-enable the two flags that give the most useful results
-    // in that context:
-    //   --tags-from-banner      → nuclei only runs templates matching
-    //                             detected protocols, avoiding template
-    //                             floods against 10 K+ random hosts.
-    //   --httpx-follow-redirects → most ASN hosts return 30x chains to
-    //                             a portal / WAF; following them gives
-    //                             meaningful status + title, not just
-    //                             "[302] [Moved]".
-    // The user can still disable these by editing their invocation; the
-    // clap default_value_t means they don't need to be passed manually
-    // under --asn. We print a one-line info note so the behaviour is
-    // not surprising.
-    if args.asn.is_some() {
-        let mut notes: Vec<&str> = Vec::new();
-        if !args.tags_from_banner {
-            args.tags_from_banner = true;
-            notes.push("--tags-from-banner");
-        }
-        if !args.httpx_follow_redirects {
-            args.httpx_follow_redirects = true;
-            notes.push("--httpx-follow-redirects");
-        }
-        if !notes.is_empty() && !args.quiet {
+    // CIDRs. Auto-enable --httpx-follow-redirects because most ASN hosts
+    // return 30x chains to a portal / WAF; following them gives meaningful
+    // status + title, not just "[302] [Moved]". One-line info note so the
+    // behaviour isn't surprising.
+    if args.asn.is_some() && !args.httpx_follow_redirects {
+        args.httpx_follow_redirects = true;
+        if !args.quiet {
             eprintln!(
-                "[asn] auto-enabled {} for maximum result coverage",
-                notes.join(" + ")
+                "[asn] auto-enabled --httpx-follow-redirects for maximum result coverage"
             );
         }
     }
@@ -5044,49 +5028,18 @@ async fn main() -> anyhow::Result<()> {
                 .arg("-c").arg(args.nuclei_concurrency.to_string())
                 .arg("-rl").arg(args.nuclei_rate.to_string())
                 .arg("-mhe").arg(args.nuclei_max_host_error.to_string())
+                // -severity (v0.14.7): default "low,medium,high,critical"
+                // deliberately drops `info` — on ASN / 5K-subdomain scans
+                // info-tier templates produce 90%+ of the noise and almost
+                // none of the actionable findings. User can override with
+                // --nuclei-severity (e.g. pass "critical" for triage-only
+                // runs, or "info,low,medium,high,critical" to get everything).
+                .arg("-severity").arg(&args.nuclei_severity)
                 // -silent suppresses nuclei's ASCII banner + progress spam
                 // while still writing findings to stdout + -o.
                 .arg("-silent")
                 .arg("-o").arg(&nuclei_out);
-            if args.tags_from_banner && !by_proto.is_empty() {
-            // Cover every protocol the banner classifier can emit (see
-            // classify() in src/main.rs). Previously missed pop3 / imap /
-            // smtp_or_ftp / udp/* and silently sent fewer tags than
-            // warranted. Now we map or split each explicit protocol into
-            // one or more nuclei `-tags` values.
-            let mut tag_set: std::collections::BTreeSet<&'static str> =
-                std::collections::BTreeSet::new();
-            for p in by_proto.keys() {
-                match p.as_str() {
-                    "http" => { tag_set.insert("http"); }
-                    "ssh"  => { tag_set.insert("ssh"); }
-                    "smtp" => { tag_set.insert("smtp"); }
-                    "ftp"  => { tag_set.insert("ftp"); }
-                    "pop3" => { tag_set.insert("pop3"); }
-                    "imap" => { tag_set.insert("imap"); }
-                    "smtp_or_ftp" => {
-                        tag_set.insert("smtp");
-                        tag_set.insert("ftp");
-                    }
-                    "tls" => {
-                        tag_set.insert("ssl");
-                        // TLS on an open port very often fronts HTTPS,
-                        // so include http templates too.
-                        tag_set.insert("http");
-                    }
-                    _ => {
-                        // "unknown", "udp/dns", "udp/*" etc. Don't add
-                        // a tag — nuclei will still probe these targets
-                        // but no extra filter from us.
-                    }
-                }
-            }
-            let tags: Vec<&str> = tag_set.into_iter().collect();
-            if !tags.is_empty() {
-                cmd.arg("-tags").arg(tags.join(","));
-                println!("Nuclei tags: {}", tags.join(","));
-            }
-        }
+            println!("Nuclei severity: {}", args.nuclei_severity);
             match cmd.status() {
                 Ok(s) if s.success() => println!("nuclei OK -> {:?}", nuclei_out),
                 Ok(s) => eprintln!("nuclei exited {}", s),

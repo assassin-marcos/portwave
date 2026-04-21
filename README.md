@@ -225,7 +225,7 @@ portwave --refresh-cdn    # ~20 s; writes to ~/.cache/portwave/cdn-ranges.txt
 ```bash
 portwave acme 203.0.113.0/24 \
     -t 1000 -T 1500 -r 2 --enrich-timeout-ms 3000 \
-    --tags-from-banner --httpx-follow-redirects \
+    --httpx-follow-redirects \
     --httpx-paths "/actuator,/.git/HEAD,/server-status,/robots.txt,/.env,/swagger-ui,/admin,/api/v1"
 ```
 
@@ -235,7 +235,7 @@ portwave acme 203.0.113.0/24 \
 portwave acme --asn AS13335 \
     -t 800 -T 1500 -r 2 --enrich-timeout-ms 3000 \
     --httpx-paths "/actuator,/.git/HEAD,/server-status,/robots.txt,/.env,/swagger-ui,/admin,/api/v1"
-# --tags-from-banner + --httpx-follow-redirects auto-enable under --asn
+# --httpx-follow-redirects auto-enables under --asn
 ```
 
 **Why these flags?**
@@ -246,9 +246,10 @@ portwave acme --asn AS13335 \
 | `-T 1500` | 1.5 s discovery timeout | Catches slow / firewalled hosts that default 800 ms misses — common on gov / enterprise IPs |
 | `-r 2` | 2 retries | Catches transient SYN drops (ISP rate-limits, router buffer overflow). Default 1 is fine for clean LAN; bump to 2 over internet |
 | `--enrich-timeout-ms 3000` | 3 s enrichment timeout | Slow HTTP servers + TLS handshakes that default 1.5 s cuts off (gov / old embedded gear) |
-| `--tags-from-banner` | — | Feeds nuclei only templates matching detected protocols → 30–60 % faster nuclei runs, no coverage loss |
 | `--httpx-follow-redirects` | — | Most hosts 30x to login pages / WAFs; following gives meaningful status + title |
 | `--httpx-paths` | list | Probes common leak / config / admin endpoints beyond `/` |
+
+Nuclei severity defaults to `low,medium,high,critical` — `info` is filtered out because info-tier templates dominate noise on large scans. Override with `--nuclei-severity "critical"` for triage-only runs, or `--nuclei-severity "info,low,medium,high,critical"` to include everything.
 
 ### ⚡ Quick scan — defaults are already tuned for "fast + accurate"
 
@@ -349,7 +350,7 @@ Top-20 priority ports (`80, 443, 22, 21, 25, 53, 8080, 8443, 3389, 110, 143, 445
 | `--nuclei-max-host-error <N>` | `25` | Fail host after N nuclei errors |
 | `--nuclei-rate <N>` | `200` | nuclei rate-limit |
 | `--nuclei-all-ports` | off | Keep non-HTTP ports in nuclei list (default: filtered) |
-| `--tags-from-banner` | off | Restrict nuclei to template tags matching detected protocols |
+| `--nuclei-severity <LIST>` | `low,medium,high,critical` | nuclei `-severity` filter. Default drops `info`-tier templates (noise reduction on large scans). Override with any nuclei-accepted value, e.g. `"critical"` or `"info,low,medium,high,critical"` |
 | `--no-httpx` / `--no-nuclei` | — | Skip either step |
 
 ### Update / CDN / UX
