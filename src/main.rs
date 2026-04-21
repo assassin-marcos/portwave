@@ -2247,7 +2247,13 @@ fn cached_latest_version() -> Option<String> {
     let p = update_cache_path()?;
     let meta = fs::metadata(&p).ok()?;
     let age = meta.modified().ok()?.elapsed().ok()?;
-    if age > Duration::from_secs(3_600) {
+    // v0.14.6: TTL widened 1 h → 24 h. The previous 1 h cap, combined
+    // with a too-tight banner-fetch budget on slow networks, left users
+    // with no (outdated)/(latest) tag at all once the cache expired.
+    // 24 h is still short enough that a day-old answer is only shown
+    // until `refresh_update_cache_best_effort()` re-writes the cache,
+    // which happens on every startup outside the 120 s fast path.
+    if age > Duration::from_secs(24 * 3_600) {
         return None;
     }
     let s = fs::read_to_string(&p).ok()?.trim().to_string();
@@ -2286,10 +2292,15 @@ async fn refresh_update_cache_best_effort() {
             }
         }
     }
-    // Slow path: GitHub round-trip. 1 s is enough for typical latencies
-    // (~200-400 ms) and doesn't make the banner feel laggy.
+    // Slow path: GitHub round-trip. v0.14.6 bumped 1s → 2500ms. 1s was
+    // too tight on real-world Mac WiFi / hotel networks where the TLS
+    // handshake + releases-API response routinely landed at 800-1500 ms;
+    // the fetch would time out, no cache write, and after the 1 h TTL
+    // lapsed the banner rendered with no (outdated)/(latest) tag at all.
+    // 2500ms still feels instant on a fast link (fetch completes in
+    // ~300 ms) but has enough headroom to actually complete on slow ones.
     let res = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_millis(2500),
         tokio::task::spawn_blocking(fetch_latest_version),
     )
     .await;
