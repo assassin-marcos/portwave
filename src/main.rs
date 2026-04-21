@@ -3510,6 +3510,13 @@ async fn main() -> anyhow::Result<()> {
     let diff_path = out_dir.join("scan_diff.json");
     let httpx_out = out_dir.join("httpx_results.txt");
     let nuclei_out = out_dir.join("nuclei_results.txt");
+    // v0.14.2 — per-concern domain artefacts, written only when a scan
+    // actually had domain input. Each is bare-per-line for trivial
+    // piping into jq / grep / another tool — the classic Unix shape.
+    let domains_json_path = out_dir.join("domains.json");      // full structured dump
+    let origin_domains_path = out_dir.join("origin_domains.txt"); // resolved, not-CDN, scanned
+    let cdn_skipped_path = out_dir.join("cdn_skipped.txt");    // CDN-fronted, skipped
+    let dns_failed_path = out_dir.join("dns_failed.txt");      // NXDOMAIN / timeout / no records
 
     // Always capture prior opens (independent of --no-resume) so scan_diff
     // can compare this run against the last one.
@@ -3814,10 +3821,76 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Persist the domain-resolution outcome to disk in forms that
+        // are easy to pipe into other tools (subfinder → portwave →
+        // curl / ffuf / etc.). Each file is bare-per-line so `cat file
+        // | other-tool` works without jq. The structured `domains.json`
+        // carries the full record for programmatic use.
+        {
+            // origin_domains.txt — still-in-scope after CDN filter
+            let live: Vec<String> = results
+                .iter()
+                .filter(|r| r.error.is_none() && !r.ips.is_empty() && (r.cdn.is_none() || args.allow_cdn))
+                .map(|r| r.domain.clone())
+                .collect();
+            if !live.is_empty() {
+                let _ = fs::write(&origin_domains_path, live.join("\n") + "\n");
+            }
+            // cdn_skipped.txt — domains that got CDN-skipped (not
+            // written when --allow-cdn overrode the skip, since nothing
+            // was actually skipped in that case)
+            if !args.allow_cdn {
+                let cdn_lines: Vec<String> = cdn_skipped
+                    .iter()
+                    .map(|(d, tag)| format!("{}\t{}", d, tag))
+                    .collect();
+                if !cdn_lines.is_empty() {
+                    let _ = fs::write(&cdn_skipped_path, cdn_lines.join("\n") + "\n");
+                }
+            }
+            // dns_failed.txt — NXDOMAIN / timeout / no records
+            if !error_list.is_empty() {
+                let err_lines: Vec<String> = error_list
+                    .iter()
+                    .map(|(d, reason)| format!("{}\t{}", d, reason))
+                    .collect();
+                let _ = fs::write(&dns_failed_path, err_lines.join("\n") + "\n");
+            }
+            // domains.json — complete structured record: [{domain, ips,
+            // cdn, scanned, error}, ...] — consumers can jq this.
+            let full: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    let scanned = r.error.is_none()
+                        && !r.ips.is_empty()
+                        && (r.cdn.is_none() || args.allow_cdn);
+                    serde_json::json!({
+                        "domain": r.domain,
+                        "ips": r.ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+                        "cdn": r.cdn,
+                        "scanned": scanned,
+                        "error": r.error,
+                    })
+                })
+                .collect();
+            if let Ok(txt) = serde_json::to_string_pretty(&full) {
+                let _ = fs::write(&domains_json_path, txt);
+            }
+        }
+
         if origin_domains == 0 && nets.is_empty() {
             eprintln!();
             eprintln!("All domains are CDN-fronted or failed to resolve. Nothing to scan.");
             eprintln!("  --allow-cdn   scan CDN edge IPs anyway (rarely useful)");
+            eprintln!();
+            eprintln!("Domain artefacts written:");
+            eprintln!("  {}", domains_json_path.display());
+            if !args.allow_cdn && cdn_skipped_path.exists() {
+                eprintln!("  {}", cdn_skipped_path.display());
+            }
+            if dns_failed_path.exists() {
+                eprintln!("  {}", dns_failed_path.display());
+            }
             return Ok(());
         }
     }
@@ -5011,6 +5084,39 @@ async fn main() -> anyhow::Result<()> {
             ),
         )
     );
+
+    // v0.14.2 — list every artefact we wrote, one per line, so users can
+    // copy-paste the paths straight into their next pipeline stage
+    // (jq / grep / curl / ffuf / xargs / …). Each is annotated with its
+    // purpose + line count so the user knows at a glance which file to
+    // reach for. Only shown when any artefact is non-empty.
+    let mut artefacts: Vec<(&PathBuf, &str)> = Vec::new();
+    let candidates: &[(&PathBuf, &str)] = &[
+        (&jsonl_path,           "open_ports.jsonl    — per-port JSON records (full enrichment)"),
+        (&raw_path,             "targets.txt         — bare IP:PORT list (every open port)"),
+        (&nuclei_path,          "nuclei_targets.txt  — URL form, HTTP-candidate filter"),
+        (&httpx_out,            "httpx_results.txt   — httpx probe output"),
+        (&nuclei_out,           "nuclei_results.txt  — nuclei scan findings"),
+        (&summary_path,         "scan_summary.json   — totals + counts + timings"),
+        (&diff_path,            "scan_diff.json      — opens/closes since last run"),
+        (&domains_json_path,    "domains.json        — domain resolution + CDN detection (structured)"),
+        (&origin_domains_path,  "origin_domains.txt  — domains that survived CDN filter (pipe to httpx/ffuf)"),
+        (&cdn_skipped_path,     "cdn_skipped.txt     — domains skipped as CDN-fronted (domain<TAB>provider)"),
+        (&dns_failed_path,      "dns_failed.txt      — domains with NXDOMAIN / timeout (domain<TAB>reason)"),
+    ];
+    for (p, desc) in candidates {
+        if let Ok(meta) = std::fs::metadata(p) {
+            if meta.len() > 0 {
+                artefacts.push((*p, *desc));
+            }
+        }
+    }
+    if !artefacts.is_empty() {
+        println!("\n{}", cfmt("1", "Artefacts written:"));
+        for (p, desc) in &artefacts {
+            println!("  {}", cfmt("2", &format!("{:<60} {}", p.display(), desc)));
+        }
+    }
 
     println!("\n{}", cfmt("1;32", "--- WORKFLOW COMPLETE ---"));
     Ok(())
