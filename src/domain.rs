@@ -187,13 +187,22 @@ fn build_resolver(timeout: Duration) -> TokioAsyncResolver {
 fn keep_scannable(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v) => {
+            let octets = v.octets();
+            // v0.14.5: explicit CGNAT (100.64.0.0/10, RFC6598) filter.
+            // std's is_private() only covers RFC1918 (10/8, 172.16/12,
+            // 192.168/16) and misses this. ISPs use CGNAT for subscriber
+            // aggregation; DNS sinkholes occasionally return addresses
+            // in this range. Scanning them would either hit the wrong
+            // host entirely or waste probes on the user's ISP router.
+            let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
             !(v.is_loopback()
                 || v.is_private()
                 || v.is_link_local()
                 || v.is_broadcast()
                 || v.is_unspecified()
                 || v.is_multicast()
-                || v.is_documentation())
+                || v.is_documentation()
+                || is_cgnat)
         }
         IpAddr::V6(v) => {
             let seg = v.segments();
@@ -205,7 +214,9 @@ fn keep_scannable(ip: &IpAddr) -> bool {
                 // fe80::/10 — link-local
                 || (seg[0] & 0xffc0) == 0xfe80
                 // 2001:db8::/32 — documentation prefix
-                || (seg[0] == 0x2001 && seg[1] == 0x0db8))
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+                // 2001:20::/28 — ORCHIDv2 (RFC7343, cryptographic hash IDs)
+                || (seg[0] == 0x2001 && (seg[1] & 0xfff0) == 0x0020))
         }
     }
 }

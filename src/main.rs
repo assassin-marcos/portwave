@@ -2272,9 +2272,16 @@ async fn refresh_update_cache_best_effort() {
     };
     // Fast path: cache fresh enough that we know any update within the
     // window has already been seen. No network call.
+    //
+    // v0.14.5: tightened window from 300s → 120s. With a 5-minute
+    // fast path, a user who ran `portwave -u` right before a new
+    // release dropped could see "(latest)" incorrectly for up to 5
+    // minutes on subsequent invocations. 2 minutes is the narrowest
+    // window that still avoids hammering GitHub's releases API when
+    // the same user runs portwave multiple times in quick succession.
     if let Ok(meta) = fs::metadata(&p) {
         if let Some(age) = meta.modified().ok().and_then(|t| t.elapsed().ok()) {
-            if age < Duration::from_secs(300) {
+            if age < Duration::from_secs(120) {
                 return;
             }
         }
@@ -3643,10 +3650,10 @@ async fn main() -> anyhow::Result<()> {
     let mut nets: Vec<IpNetwork> = Vec::new();
     let mut domains: Vec<String> = Vec::new();
     let mut invalid_lines: Vec<(String, &'static str)> = Vec::new();
-    let mut take_token = |tok: &str,
-                           nets: &mut Vec<IpNetwork>,
-                           domains: &mut Vec<String>,
-                           invalid_lines: &mut Vec<(String, &'static str)>| {
+    let take_token = |tok: &str,
+                      nets: &mut Vec<IpNetwork>,
+                      domains: &mut Vec<String>,
+                      invalid_lines: &mut Vec<(String, &'static str)>| {
         let tok = tok.trim();
         if tok.is_empty() {
             return;
@@ -3681,7 +3688,8 @@ async fn main() -> anyhow::Result<()> {
         // v0.14.4 — support `-` as stdin, Unix-tool convention.
         // Enables `subfinder -d target.com -silent | portwave bb -i -`
         // without a temp file in the middle.
-        let content_result: std::io::Result<String> = if path == "-" {
+        let from_stdin = path == "-";
+        let content_result: std::io::Result<String> = if from_stdin {
             use std::io::Read as _;
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf).map(|_| buf)
@@ -3703,7 +3711,20 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                println!("Loaded {} entries from {}", file_tokens, path);
+                // v0.14.5: help the user when `-i -` reads an empty stream.
+                // Most common cause: upstream producer (subfinder, etc.)
+                // emitted nothing, or the user typed `portwave bb -i -` with
+                // no pipe and then hit Ctrl+D. Surface this explicitly so the
+                // eventual "No valid targets" later doesn't look like a bug.
+                if file_tokens == 0 && from_stdin {
+                    eprintln!(
+                        "[!] --input-file - received 0 targets on stdin. \
+                         Did the upstream command produce output? \
+                         Example: subfinder -d example.com -silent | portwave bb -i -"
+                    );
+                } else {
+                    println!("Loaded {} entries from {}", file_tokens, path);
+                }
             }
             Err(e) => eprintln!("Failed to read --input-file {}: {}", path, e),
         }
@@ -3772,13 +3793,24 @@ async fn main() -> anyhow::Result<()> {
             args.dns_concurrency,
             args.dns_timeout
         );
-        let results = domain::resolve_many(
-            &domains,
-            args.dns_concurrency.max(1),
-            dns_timeout,
-            &cdn_table,
-        )
-        .await;
+        // v0.14.5: Ctrl+C during DNS would otherwise block on the resolver
+        // until every in-flight lookup hit its `dns_timeout` — up to 3s
+        // per stalled query even on small domain lists, worse on huge
+        // bug-bounty scopes (5000 subdomains × 3s = "why isn't Ctrl+C
+        // working?"). Race the resolution future against ctrl_c and
+        // exit cleanly if the user interrupts.
+        let results = tokio::select! {
+            r = domain::resolve_many(
+                &domains,
+                args.dns_concurrency.max(1),
+                dns_timeout,
+                &cdn_table,
+            ) => r,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\n[!] Interrupted during DNS resolution — exiting.");
+                return Ok(());
+            }
+        };
 
         // Collect (domain → outcome) triples so we can print a per-domain
         // list, not just aggregate counts. Users triaging a big
@@ -4035,7 +4067,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if nets.is_empty() {
-        eprintln!("No valid targets. Provide <CIDR_INPUT>, --input-file, or --asn.");
+        eprintln!(
+            "No valid targets. Provide <CIDR_INPUT>, -d/--domain, -i/--input-file, \
+             or -a/--asn (use -i - to read targets from stdin)."
+        );
         return Ok(());
     }
 
@@ -4599,7 +4634,21 @@ async fn main() -> anyhow::Result<()> {
     let mut nuclei_skipped = 0usize;
     for op in &open_records {
         writeln!(jsonl, "{}", serde_json::to_string(op)?)?;
-        let ip: IpAddr = op.ip.parse()?;
+        // v0.14.5: parse errors must NOT abort the writer loop. If a
+        // bug anywhere upstream produced an OpenPort with a malformed
+        // ip string, the record is kept in the JSONL (for visibility)
+        // but skipped for downstream artefacts. Previously used `?`
+        // which returned early and left truncated http_targets.txt.
+        let ip: IpAddr = match op.ip.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                eprintln!(
+                    "[!] skipping OpenPort with unparseable ip {:?} (port={})",
+                    op.ip, op.port
+                );
+                continue;
+            }
+        };
         let _ = SocketAddr::new(ip, op.port); // (kept as a validity check; raw targets.txt removed in v0.14.4)
         // Filter non-HTTP services out of the http_targets list unless --nuclei-all-ports.
         let include_in_nuclei = args.nuclei_all_ports
