@@ -361,8 +361,7 @@ Every scan writes to `<OUTPUT_DIR>/<FOLDER_NAME>/`:
 
 | File | Contents |
 |---|---|
-| `targets.txt`        | `ip:port` per line — raw open endpoints |
-| `nuclei_targets.txt` | URL form, filtered to HTTP-candidate ports (unless `--nuclei-all-ports`) |
+| `http_targets.txt`   | URL form, HTTP-candidate filter. **Both httpx and nuclei read this file.** Domain-aware — when the scan was seeded from a domain, URLs use the domain name (not the resolved IP) so TLS SNI + virtual-host routing work. |
 | `open_ports.jsonl`   | One JSON per line: `{ip, port, rtt_ms, tls, protocol, banner, cdn}` |
 | `scan_summary.json`  | `{duration_ms, attempts, open, closed, timeouts, by_port, by_protocol, by_cdn, phase_a_ms, phase_b_ms, ...}` |
 | `scan_diff.json`     | `{prior_opens, current_opens, new:[…], closed:[…], unchanged}` vs. previous run |
@@ -482,7 +481,7 @@ What portwave deliberately doesn't do (by design or deferred):
 - **No exhaustive IPv6 `/64` enumeration.** Physically impossible at any speed; `--smart-ipv6` covers the ~450 addresses real admins actually use (RFC 7707 patterns). Anything beyond that wants passive enumeration (CT logs, DNS brute-force, Shodan).
 - **No ICMP host discovery pre-flight.** Every target gets TCP probes whether it's alive or not. On sparse ranges this wastes probes; on dense ranges it doesn't matter. `--max-scan-time` is the mitigation for huge sparse scopes.
 - **HTTP/2 + HTTP/3 banners not parsed.** The HTTP probe speaks HTTP/1.1; h2/h3-only services show up as open ports with empty banners. httpx in Phase B handles h2/h3 via ALPN, so hits still surface in `httpx_results.txt`.
-- **No scanner-side DNS resolution.** Input is IPs, CIDRs, ranges, or ASNs — never hostnames. Resolve with your enum tool (amass, subfinder) and pipe results in via `--input-file`.
+- **No passive subdomain enumeration** (CT logs / Shodan lookups). Pair with `subfinder -silent | portwave -i -` for full bug-bounty scope expansion. DNS resolution of domains you hand portwave IS built-in since v0.14.0.
 
 ## Input validation
 

@@ -3531,8 +3531,12 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let raw_path = out_dir.join("targets.txt");
-    let nuclei_path = out_dir.join("nuclei_targets.txt");
+    // v0.14.4 — `targets.txt` (bare ip:port) removed. Any consumer can
+    // derive ip:port from open_ports.jsonl via
+    //   jq -r '"\(.ip):\(.port)"' open_ports.jsonl
+    // `nuclei_targets.txt` renamed to `http_targets.txt` since httpx
+    // reads it too (has since v0.13.3); the old name was historical.
+    let http_targets_path = out_dir.join("http_targets.txt");
     let jsonl_path = out_dir.join("open_ports.jsonl");
     let summary_path = out_dir.join("scan_summary.json");
     let diff_path = out_dir.join("scan_diff.json");
@@ -3580,8 +3584,13 @@ async fn main() -> anyhow::Result<()> {
         // Fresh run: clear derived files.
         let _ = fs::remove_file(&jsonl_path);
     }
-    let _ = fs::remove_file(&raw_path);
-    let _ = fs::remove_file(&nuclei_path);
+    let _ = fs::remove_file(&http_targets_path);
+    // v0.14.4 — stale targets.txt from pre-0.14.4 scans gets removed so
+    // the folder stays clean after the file was dropped.
+    let _ = fs::remove_file(out_dir.join("targets.txt"));
+    // Same cleanup for the old nuclei_targets.txt name (renamed to
+    // http_targets.txt in v0.14.4).
+    let _ = fs::remove_file(out_dir.join("nuclei_targets.txt"));
 
     // Default port source priority:
     //   1. CLI --port-file
@@ -3669,7 +3678,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     if let Some(path) = &args.input_file {
-        match fs::read_to_string(path) {
+        // v0.14.4 — support `-` as stdin, Unix-tool convention.
+        // Enables `subfinder -d target.com -silent | portwave bb -i -`
+        // without a temp file in the middle.
+        let content_result: std::io::Result<String> = if path == "-" {
+            use std::io::Read as _;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).map(|_| buf)
+        } else {
+            fs::read_to_string(path)
+        };
+        match content_result {
             Ok(content) => {
                 let mut file_tokens = 0usize;
                 for line in content.lines() {
@@ -4567,8 +4586,7 @@ async fn main() -> anyhow::Result<()> {
             .write(true)
             .open(&jsonl_path)?,
     );
-    let mut raw = BufWriter::new(fs::File::create(&raw_path)?);
-    let mut nuc = BufWriter::new(fs::File::create(&nuclei_path)?);
+    let mut nuc = BufWriter::new(fs::File::create(&http_targets_path)?);
     // v0.14.3 — dedupe nuclei_targets.txt entries. When a scan is seeded
     // from a domain that resolves to N IPs, we'd otherwise write the
     // same https://example.com URL N times (once per IP). httpx / nuclei
@@ -4582,9 +4600,8 @@ async fn main() -> anyhow::Result<()> {
     for op in &open_records {
         writeln!(jsonl, "{}", serde_json::to_string(op)?)?;
         let ip: IpAddr = op.ip.parse()?;
-        let sa = SocketAddr::new(ip, op.port);
-        writeln!(raw, "{}", sa)?;
-        // Filter non-HTTP services out of the nuclei list unless --nuclei-all-ports.
+        let _ = SocketAddr::new(ip, op.port); // (kept as a validity check; raw targets.txt removed in v0.14.4)
+        // Filter non-HTTP services out of the http_targets list unless --nuclei-all-ports.
         let include_in_nuclei = args.nuclei_all_ports
             || is_http_candidate(op.port, op.protocol.as_deref(), op.tls);
         if include_in_nuclei {
@@ -4611,7 +4628,6 @@ async fn main() -> anyhow::Result<()> {
     }
     let cdn_count_total: u64 = by_cdn.values().sum();
     jsonl.flush()?;
-    raw.flush()?;
     nuc.flush()?;
 
     let summary = ScanSummary {
@@ -4724,11 +4740,11 @@ async fn main() -> anyhow::Result<()> {
 
     if open_records.is_empty() {
         println!("No open ports. Done.");
-        // Even on 0-open runs, prune the zero-byte files (targets.txt,
-        // nuclei_targets.txt, open_ports.jsonl) so the folder isn't
+        // Even on 0-open runs, prune the zero-byte files
+        // (http_targets.txt, open_ports.jsonl) so the folder isn't
         // polluted with empty husks. Summary + diff are kept — they
         // carry the "I ran but found nothing" signal.
-        for p in [&raw_path, &nuclei_path, &jsonl_path] {
+        for p in [&http_targets_path, &jsonl_path] {
             if let Ok(meta) = fs::metadata(p) {
                 if meta.len() == 0 {
                     let _ = fs::remove_file(p);
@@ -4857,22 +4873,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── httpx ──
-    // Skip the subprocess entirely if (a) no open ports were found at all
-    // or (b) none of the open ports passed the HTTP-candidate filter
-    // (i.e., everything was SSH / BGP / MySQL / Redis etc.). Spawning
-    // httpx on a non-HTTP-only hit list just burns a subprocess and
-    // produces an empty file that auto-prune deletes.
-    let raw_targets_nonempty = std::fs::metadata(&raw_path)
+    // Skip the subprocess entirely if no open port passed the HTTP-
+    // candidate filter (everything was SSH / BGP / MySQL / Redis etc.)
+    // or if there were zero opens at all. Spawning httpx on an empty /
+    // non-HTTP-only hit list just burns a subprocess and produces an
+    // empty file that auto-prune deletes.
+    let http_targets_has_http = std::fs::metadata(&http_targets_path)
         .map(|m| m.len() > 0)
         .unwrap_or(false);
-    let nuclei_targets_has_http = std::fs::metadata(&nuclei_path)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false);
+    let any_opens = open_records.iter().any(|_| true);
     if args.no_httpx {
         println!("Skipping httpx (--no-httpx).");
-    } else if !raw_targets_nonempty {
+    } else if !any_opens {
         println!("Skipping httpx — no open ports to probe.");
-    } else if !nuclei_targets_has_http {
+    } else if !http_targets_has_http {
         println!("Skipping httpx — no HTTP-candidate ports (all opens were non-HTTP services).");
     } else {
         // Resolve: env → config → PATH. Offer to install if still missing.
@@ -4891,7 +4905,7 @@ async fn main() -> anyhow::Result<()> {
             println!("\n--- httpx ({}) ---", bin.display());
             let httpx_started = Instant::now();
             let mut cmd = Command::new(&bin);
-            cmd.arg("-l").arg(&nuclei_path)     // v0.13.3: use explicit-scheme
+            cmd.arg("-l").arg(&http_targets_path)     // v0.13.3: use explicit-scheme
                                                 // URL list instead of bare
                                                 // ip:port. Guarantees httpx
                                                 // probes exactly one scheme
@@ -4943,7 +4957,7 @@ async fn main() -> anyhow::Result<()> {
     // entirely. Addresses the case where e.g. a range exposes only port
     // 179 (BGP) — there's nothing for nuclei to do and spawning it just
     // produces empty artefacts.
-    let nuclei_targets_nonempty = std::fs::metadata(&nuclei_path)
+    let nuclei_targets_nonempty = std::fs::metadata(&http_targets_path)
         .map(|m| m.len() > 0)
         .unwrap_or(false);
     if args.no_nuclei {
@@ -4966,7 +4980,7 @@ async fn main() -> anyhow::Result<()> {
             println!("\n--- nuclei ({}) ---", bin.display());
             let nuclei_started = Instant::now();
             let mut cmd = Command::new(&bin);
-            cmd.arg("-l").arg(&nuclei_path)
+            cmd.arg("-l").arg(&http_targets_path)
                 .arg("-c").arg(args.nuclei_concurrency.to_string())
                 .arg("-rl").arg(args.nuclei_rate.to_string())
                 .arg("-mhe").arg(args.nuclei_max_host_error.to_string())
@@ -5072,8 +5086,7 @@ async fn main() -> anyhow::Result<()> {
     // clutter like an empty httpx_results.txt when httpx found nothing.
     // Keeps the output folder focused on data that actually has content.
     let cleanup_candidates = [
-        &raw_path,
-        &nuclei_path,
+        &http_targets_path,
         &httpx_out,
         &nuclei_out,
         &jsonl_path,
@@ -5128,9 +5141,8 @@ async fn main() -> anyhow::Result<()> {
     // reach for. Only shown when any artefact is non-empty.
     let mut artefacts: Vec<(&PathBuf, &str)> = Vec::new();
     let candidates: &[(&PathBuf, &str)] = &[
-        (&jsonl_path,           "open_ports.jsonl    — per-port JSON records (full enrichment)"),
-        (&raw_path,             "targets.txt         — bare IP:PORT list (every open port)"),
-        (&nuclei_path,          "nuclei_targets.txt  — URL form, HTTP-candidate filter"),
+        (&jsonl_path,           "open_ports.jsonl    — per-port JSON records (the canonical output; all enrichment here)"),
+        (&http_targets_path,    "http_targets.txt    — URL form, HTTP-candidate filter (httpx + nuclei read this)"),
         (&httpx_out,            "httpx_results.txt   — httpx probe output"),
         (&nuclei_out,           "nuclei_results.txt  — nuclei scan findings"),
         (&summary_path,         "scan_summary.json   — totals + counts + timings"),
