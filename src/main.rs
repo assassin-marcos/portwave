@@ -3835,8 +3835,22 @@ fn check_deprecated_flags() {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+// v0.15.6: raise max_blocking_threads from Tokio's default 512 to 2048 so
+// Pass-C HTTP enrichment with `-C > 512` actually parallelizes. Every Pass-C
+// probe runs inside `spawn_blocking(http_probe_blocking)`; at default 512 the
+// blocking pool caps concurrent probes even when the user passes -C 1000.
+// `max_blocking_threads` isn't a `tokio::main` macro arg, so we build the
+// runtime manually. Idle blocking threads cost nothing (Tokio spawns them
+// on demand).
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(2048)
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     check_deprecated_flags();
     let args = Args::parse();
 
@@ -4798,16 +4812,19 @@ async fn main() -> anyhow::Result<()> {
     // v0.14.8: network-down monitor. Polls `stats.net_unreach` every second
     // and flips `stats.shutdown` if it crosses a threshold, triggering the
     // same graceful drain + save-and-exit path as Ctrl+C / --max-scan-time.
-    // v0.15.5: threshold is scope-proportional (5 % of total probes, min
-    // 500). On large ASN scans with a minority of unroutable prefixes,
-    // the old absolute-500 threshold false-positived — a 46 M-probe scan
-    // with 168 k ENETUNREACH errors is 0.36 %, a perfectly healthy scan,
-    // but 168 k > 500 tripped shutdown and lost all the enrichment work.
-    let net_unreach_threshold: u64 = (scanned_estimate / 20).max(500);
+    // v0.15.6: trip requires BOTH an absolute floor (500 probes — catches
+    // wrong-gateway / VPN-down on tiny scans fast) AND a ratio floor (>=5 %
+    // of completed probes failed with ENETUNREACH — avoids false trips on
+    // huge ASN scans where a minority of unroutable prefixes naturally
+    // accumulates thousands of errors on an otherwise healthy scan).
+    // On a truly broken network, ratio hits 100 % fast regardless of
+    // scope, so detection is ~0.5 s same as before.
     let net_monitor = {
         let stats = stats.clone();
         let pb_for_net = pb.clone();
         tokio::spawn(async move {
+            const ABSOLUTE_FLOOR: u64 = 500;
+            const RATIO_FLOOR: f64 = 0.05; // 5 %
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             ticker.tick().await; // consume the immediate tick
             loop {
@@ -4816,15 +4833,20 @@ async fn main() -> anyhow::Result<()> {
                     return;
                 }
                 let n = stats.net_unreach.load(Ordering::Relaxed);
-                if n >= net_unreach_threshold {
+                if n < ABSOLUTE_FLOOR {
+                    continue;
+                }
+                let attempts = stats.attempts.load(Ordering::Relaxed).max(1);
+                let ratio = n as f64 / attempts as f64;
+                if ratio >= RATIO_FLOOR {
                     pb_for_net.println(format!(
-                        "\n[!] Network looks unreachable — {} probes failed with \
-                         ENETUNREACH ({:.1}% of scope, threshold {}). Saving \
-                         progress and exiting gracefully. Re-run the same \
-                         command to resume from where this stopped.",
+                        "[!] Network looks unreachable — {} probes failed with \
+                         ENETUNREACH ({:.1}% of {} attempts). Saving progress \
+                         and exiting gracefully. Re-run the same command to \
+                         resume from where this stopped.",
                         n,
-                        (n as f64 / scanned_estimate.max(1) as f64) * 100.0,
-                        net_unreach_threshold
+                        ratio * 100.0,
+                        attempts
                     ));
                     stats.shutdown.store(true, Ordering::Relaxed);
                     return;
