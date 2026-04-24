@@ -3787,10 +3787,6 @@ fn check_deprecated_flags() {
             "--httpx-paths",
             "gone — pipe http_targets.txt to httpx -path \"/a,/b\" manually if you need custom paths.",
         ),
-        (
-            "--resume",
-            "resume is the default again as of v0.15.2 — just drop the flag. Use --no-resume (or -n / --nr) to start fresh and wipe old artefacts.",
-        ),
     ];
     for arg in argv.iter().skip(1) {
         // Accept both `--flag` and `--flag=value` forms.
