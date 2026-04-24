@@ -2233,6 +2233,11 @@ async fn adaptive_monitor(
     sem: Arc<Semaphore>,
     initial: usize,
     max: usize,
+    // v0.15.5: route adaptive log lines through the progress bar's
+    // atomic "clear + print above + redraw" so they don't interleave
+    // with the bar and cause duplicated / garbled terminal output on
+    // long scans where shrink/grow events fire repeatedly.
+    pb: ProgressBar,
 ) {
     let mut prev_a: u64 = 0;
     let mut prev_l: u64 = 0;
@@ -2272,13 +2277,13 @@ async fn adaptive_monitor(
                 // semaphore again — they bypass it in the unshrunk state
                 // for a ~3–5 % hot-path CPU saving.
                 stats.adaptive_shrunk.store(true, Ordering::Relaxed);
-                eprintln!(
+                pb.println(format!(
                     "[adaptive] local-resource errors {:.1}% ({} of {} probes) — shrinking to {}",
                     local_ratio * 100.0,
                     dl,
                     da,
                     current
-                );
+                ));
             }
             clean_windows = 0;
         } else if dl == 0 {
@@ -2289,12 +2294,12 @@ async fn adaptive_monitor(
                 sem.add_permits(grow);
                 current += grow;
                 // v0.14.15: print grow events so users can see the
-                // controller upgrading the pool. Silent before — users
-                // didn't know it was happening.
-                eprintln!(
+                // controller upgrading the pool. v0.15.5: route through
+                // pb.println so multi-hour scans don't get garbled output.
+                pb.println(format!(
                     "[adaptive] clean — growing pool to {} (ceiling {})",
                     current, max
-                );
+                ));
                 if current >= max {
                     // Fully recovered — workers can skip the semaphore again.
                     stats.adaptive_shrunk.store(false, Ordering::Relaxed);
@@ -4744,8 +4749,9 @@ async fn main() -> anyhow::Result<()> {
         let sm = sem.clone();
         let initial = initial_pool;
         let max = max_ceiling;
+        let pb_for_adaptive = pb.clone();
         Some(tokio::spawn(async move {
-            adaptive_monitor(s, sm, initial, max).await
+            adaptive_monitor(s, sm, initial, max, pb_for_adaptive).await
         }))
     } else {
         None
@@ -4792,14 +4798,16 @@ async fn main() -> anyhow::Result<()> {
     // v0.14.8: network-down monitor. Polls `stats.net_unreach` every second
     // and flips `stats.shutdown` if it crosses a threshold, triggering the
     // same graceful drain + save-and-exit path as Ctrl+C / --max-scan-time.
-    // Threshold is conservative (500) because a healthy scan should see
-    // zero ENETUNREACH errors — hosts timeout or RST, they don't produce
-    // "no route to destination network". Zero perf impact on workers (the
-    // error path already does an atomic add; the monitor is a 1 Hz ticker).
+    // v0.15.5: threshold is scope-proportional (5 % of total probes, min
+    // 500). On large ASN scans with a minority of unroutable prefixes,
+    // the old absolute-500 threshold false-positived — a 46 M-probe scan
+    // with 168 k ENETUNREACH errors is 0.36 %, a perfectly healthy scan,
+    // but 168 k > 500 tripped shutdown and lost all the enrichment work.
+    let net_unreach_threshold: u64 = (scanned_estimate / 20).max(500);
     let net_monitor = {
         let stats = stats.clone();
+        let pb_for_net = pb.clone();
         tokio::spawn(async move {
-            const NET_UNREACH_THRESHOLD: u64 = 500;
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             ticker.tick().await; // consume the immediate tick
             loop {
@@ -4808,13 +4816,16 @@ async fn main() -> anyhow::Result<()> {
                     return;
                 }
                 let n = stats.net_unreach.load(Ordering::Relaxed);
-                if n >= NET_UNREACH_THRESHOLD {
-                    eprintln!(
+                if n >= net_unreach_threshold {
+                    pb_for_net.println(format!(
                         "\n[!] Network looks unreachable — {} probes failed with \
-                         ENETUNREACH. Saving progress and exiting gracefully. \
-                         Re-run the same command to resume from where this stopped.",
-                        n
-                    );
+                         ENETUNREACH ({:.1}% of scope, threshold {}). Saving \
+                         progress and exiting gracefully. Re-run the same \
+                         command to resume from where this stopped.",
+                        n,
+                        (n as f64 / scanned_estimate.max(1) as f64) * 100.0,
+                        net_unreach_threshold
+                    ));
                     stats.shutdown.store(true, Ordering::Relaxed);
                     return;
                 }
