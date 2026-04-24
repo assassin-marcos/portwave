@@ -187,9 +187,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     json_out: bool,
 
-    /// Disable resume from previous open_ports.jsonl
+    /// Resume from previous open_ports.jsonl (skip ports already found open). Default: fresh scan.
     #[arg(long, default_value_t = false)]
-    no_resume: bool,
+    resume: bool,
 
     /// Webhook URL (POST summary on completion)
     #[arg(short = 'w', long)]
@@ -3787,13 +3787,17 @@ fn check_deprecated_flags() {
             "--httpx-paths",
             "gone — pipe http_targets.txt to httpx -path \"/a,/b\" manually if you need custom paths.",
         ),
+        (
+            "--no-resume",
+            "removed in v0.15.1 — fresh scan is now the default. Pass --resume to opt in to skipping ports already found open in open_ports.jsonl.",
+        ),
     ];
     for arg in argv.iter().skip(1) {
         // Accept both `--flag` and `--flag=value` forms.
         let stem = arg.split('=').next().unwrap_or(arg);
         for (dep, hint) in RETIRED {
             if stem == *dep {
-                eprintln!("error: {} removed in v0.14.9.", dep);
+                eprintln!("error: {} is no longer supported.", dep);
                 eprintln!("  hint: {}", hint);
                 std::process::exit(2);
             }
@@ -3952,7 +3956,7 @@ async fn main() -> anyhow::Result<()> {
     let cdn_skipped_path = out_dir.join("cdn_skipped.txt");    // CDN-fronted, skipped
     let dns_failed_path = out_dir.join("dns_failed.txt");      // NXDOMAIN / timeout / no records
 
-    // Always capture prior opens (independent of --no-resume) so scan_diff
+    // Always capture prior opens (independent of --resume) so scan_diff
     // can compare this run against the last one.
     let mut prior_set: FxHashSet<SocketAddr> = FxHashSet::default();
     if jsonl_path.exists() {
@@ -3970,7 +3974,7 @@ async fn main() -> anyhow::Result<()> {
     // Resume — read existing jsonl into skip set.
     let mut skip_set: FxHashSet<SocketAddr> = FxHashSet::default();
     let mut preserved: Vec<OpenPort> = Vec::new();
-    if !args.no_resume && jsonl_path.exists() {
+    if args.resume && jsonl_path.exists() {
         if let Ok(f) = fs::File::open(&jsonl_path) {
             for line in BufReader::new(f).lines().flatten() {
                 if let Ok(op) = serde_json::from_str::<OpenPort>(&line) {
@@ -4760,7 +4764,7 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!(
                         "\n[!] Network looks unreachable — {} probes failed with \
                          ENETUNREACH. Saving progress and exiting gracefully. \
-                         Re-run the same command to resume from where this stopped.",
+                         Re-run with --resume to skip ports already confirmed open.",
                         n
                     );
                     stats.shutdown.store(true, Ordering::Relaxed);
