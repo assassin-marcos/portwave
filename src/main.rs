@@ -2293,16 +2293,18 @@ async fn adaptive_monitor(
                 let grow = ((max - current) / 4).max(1);
                 sem.add_permits(grow);
                 current += grow;
-                // v0.14.15: print grow events so users can see the
-                // controller upgrading the pool. v0.15.5: route through
-                // pb.println so multi-hour scans don't get garbled output.
-                pb.println(format!(
-                    "[adaptive] clean — growing pool to {} (ceiling {})",
-                    current, max
-                ));
+                // v0.15.8: silent on intermediate grow steps. The pool
+                // grows in 25 % increments — from 2000 to 3000 that's
+                // ~14 grow events per scan, and printing every one
+                // floods the terminal on multi-hour runs. Only announce
+                // when we actually reach the ceiling (one line, end-state).
+                // Shrinks still log because they indicate real pressure.
                 if current >= max {
-                    // Fully recovered — workers can skip the semaphore again.
                     stats.adaptive_shrunk.store(false, Ordering::Relaxed);
+                    pb.println(format!(
+                        "[adaptive] pool restored to ceiling {}",
+                        max
+                    ));
                 }
             }
         } else {
