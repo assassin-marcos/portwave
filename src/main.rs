@@ -1,6 +1,6 @@
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use ipnetwork::IpNetwork;
+use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -943,8 +943,19 @@ fn fetch_asn_prefixes(asn: &str) -> anyhow::Result<Vec<IpNetwork>> {
 
 const CDN_RANGES_RAW: &str = include_str!("../ports/cdn-ranges.txt");
 
+// v0.15.4: CDN table is now split by IP family. Hot lookups dispatch
+// on the IpAddr variant and iterate only one family's Vec, so IPv4
+// queries skip the ~3.9k IPv6 entries (and vice versa). Arc-wrapped
+// so the per-domain spawn loop in resolve_many does O(1) clones
+// instead of a 217 KB Vec clone per task.
+pub struct CdnTables {
+    pub v4: Vec<(Ipv4Network, &'static str)>,
+    pub v6: Vec<(Ipv6Network, &'static str)>,
+}
+pub type CdnTable = Arc<CdnTables>;
+
 // Loaded once at startup. (CIDR, provider-name).
-fn load_cdn_ranges() -> Vec<(IpNetwork, &'static str)> {
+fn load_cdn_ranges() -> CdnTable {
     // Prefer the user's cache file (written by `portwave --refresh-cdn`)
     // over the compiled-in snapshot so users can keep the list current
     // without a portwave rebuild.
@@ -953,7 +964,10 @@ fn load_cdn_ranges() -> Vec<(IpNetwork, &'static str)> {
     } else {
         CDN_RANGES_RAW.to_string()
     };
-    let mut out = Vec::with_capacity(128);
+    let mut tables = CdnTables {
+        v4: Vec::with_capacity(10_000),
+        v6: Vec::with_capacity(4_000),
+    };
     for line in raw.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -962,20 +976,35 @@ fn load_cdn_ranges() -> Vec<(IpNetwork, &'static str)> {
         if let Some((cidr, provider)) = line.split_once('|') {
             if let Ok(n) = cidr.trim().parse::<IpNetwork>() {
                 let p: &'static str = Box::leak(provider.trim().to_string().into_boxed_str());
-                out.push((n, p));
+                match n {
+                    IpNetwork::V4(n4) => tables.v4.push((n4, p)),
+                    IpNetwork::V6(n6) => tables.v6.push((n6, p)),
+                }
             }
         }
     }
-    out
+    Arc::new(tables)
 }
 
-fn cdn_tag_for(ip: IpAddr, table: &[(IpNetwork, &'static str)]) -> Option<&'static str> {
-    for (net, name) in table {
-        if net.contains(ip) {
-            return Some(*name);
+fn cdn_tag_for(ip: IpAddr, table: &CdnTables) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => {
+            for (net, name) in &table.v4 {
+                if net.contains(v4) {
+                    return Some(*name);
+                }
+            }
+            None
+        }
+        IpAddr::V6(v6) => {
+            for (net, name) in &table.v6 {
+                if net.contains(v6) {
+                    return Some(*name);
+                }
+            }
+            None
         }
     }
-    None
 }
 
 fn is_usable_ipv4_host(net: &IpNetwork, ip: IpAddr) -> bool {
@@ -4222,7 +4251,7 @@ async fn main() -> anyhow::Result<()> {
                 &domains,
                 args.dns_concurrency.max(1),
                 dns_timeout,
-                &cdn_table,
+                cdn_table.clone(),
             ) => r,
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\n[!] Interrupted during DNS resolution — exiting.");

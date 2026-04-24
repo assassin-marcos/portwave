@@ -278,7 +278,10 @@ pub async fn resolve_many(
     domains: &[String],
     concurrency: usize,
     timeout: Duration,
-    cdn_table: &[(IpNetwork, &'static str)],
+    // v0.15.4: Arc-wrapped + split by IP family so each spawned task
+    // gets an O(1) Arc clone (not a per-task ~217 KB Vec clone) AND
+    // each lookup scans only the relevant family's Vec.
+    cdn_table: std::sync::Arc<crate::CdnTables>,
 ) -> Vec<DomainResult> {
     if domains.is_empty() {
         return Vec::new();
@@ -298,7 +301,8 @@ pub async fn resolve_many(
         let d = d.clone();
         let r = resolver.clone();
         let sem = sem.clone();
-        let cdn_table: Vec<(IpNetwork, &'static str)> = cdn_table.to_vec();
+        // Arc clone — O(1) atomic increment, no Vec allocation.
+        let cdn_table = cdn_table.clone();
         set.push(tokio::spawn(async move {
             let _permit = sem.acquire_owned().await.ok();
             let outcome = resolve_one(&r, &d).await;
@@ -330,16 +334,28 @@ pub async fn resolve_many(
     results.into_iter().flatten().collect()
 }
 
-/// Linear scan against the CDN CIDR table. Same behavior as the
-/// `cdn_tag_for()` helper in main.rs — duplicated here so this module
-/// has no back-reference into main. Returns the first provider match.
-fn cdn_tag_first(ip: IpAddr, table: &[(IpNetwork, &'static str)]) -> Option<&'static str> {
-    for (net, tag) in table {
-        if net.contains(ip) {
-            return Some(*tag);
+/// Linear scan against the CDN CIDR table, dispatched by IP family so
+/// IPv4 lookups don't walk the ~3.9k v6 entries (and vice versa).
+/// Mirrors `cdn_tag_for()` in main.rs — first provider match wins.
+fn cdn_tag_first(ip: IpAddr, table: &crate::CdnTables) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => {
+            for (net, tag) in &table.v4 {
+                if net.contains(v4) {
+                    return Some(*tag);
+                }
+            }
+            None
+        }
+        IpAddr::V6(v6) => {
+            for (net, tag) in &table.v6 {
+                if net.contains(v6) {
+                    return Some(*tag);
+                }
+            }
+            None
         }
     }
-    None
 }
 
 /// Collapse many `DomainResult`s into a compact "by CDN provider"
