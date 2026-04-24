@@ -4515,9 +4515,10 @@ async fn async_main() -> anyhow::Result<()> {
                 total, nets.len()
             );
             eprintln!("  bypass options:");
+            eprintln!("    --ipv4-only          drop IPv6 prefixes entirely (most common fix for ASN scans with v6 space)");
             eprintln!("    --smart-ipv6         scan only RFC-7707 common IPv6 addresses in huge IPv6 ranges");
-            eprintln!("    --allow-huge-scope   explicitly proceed with the full expansion (you really sure?)");
             eprintln!("    --top-ports 100      cut the per-host probe cost if the range is accurate");
+            eprintln!("    --allow-huge-scope   explicitly proceed with the full expansion (you really sure?)");
             std::process::exit(2);
         }
     }
