@@ -325,7 +325,9 @@ pub async fn resolve_many(
             results[idx] = Some(r);
         }
     }
-    results.into_iter().map(|o| o.unwrap()).collect()
+    // flatten (not unwrap): a panicked / aborted DNS task leaves its
+    // slot None — drop it instead of crashing the whole scan.
+    results.into_iter().flatten().collect()
 }
 
 /// Linear scan against the CDN CIDR table. Same behavior as the
