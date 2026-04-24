@@ -187,7 +187,7 @@ Short where it matters. Full list via `portwave -h`. Common ones:
 | `-e, --exclude` | Ranges to skip |
 | `-p, --ports` | Port list / ranges |
 | `--top-ports N` | Use only top-N ports |
-| `-t, --threads` | Phase-A concurrency (default 3000) |
+| `-t, --threads` | Phase-A starting pool (default 2000; adaptive grows to 3000 or 1.5×) |
 | `-T, --timeout-ms` | Phase-A timeout (default 800 ms) |
 | `-r, --retries` | Phase-A retries (default 1) |
 | `-C, --probe-concurrency` | HTTP probe concurrency (default 100) |

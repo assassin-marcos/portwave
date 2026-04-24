@@ -154,24 +154,35 @@ pub struct DomainResult {
     pub error: Option<String>,
 }
 
-/// Build a hickory resolver pointing at Cloudflare + Google upstreams
+/// Build a hickory resolver pointing at Cloudflare + Google + Quad9 upstreams
 /// with the caller's timeout budget. Fresh resolver per call so state
 /// (cache / in-flight) is scoped to the scan.
+///
+/// v0.14.15: added Quad9 (9.9.9.9 / 149.112.112.112) as a third resolver
+/// tier and bumped per-server `attempts = 2`. Networks that block or
+/// rate-limit Cloudflare / Google specifically (corp DNS, captive portals,
+/// some ISPs) now still resolve via Quad9, and transient UDP packet loss
+/// gets one automatic retry per server. More chances to find the truth =
+/// not more chances for false positives — a domain that resolves on ANY
+/// of the three upstreams is a real domain.
 fn build_resolver(timeout: Duration) -> TokioAsyncResolver {
     let mut opts = ResolverOpts::default();
     opts.timeout = timeout;
-    opts.attempts = 1; // one try per A/AAAA; caller can retry at a higher level
+    opts.attempts = 2; // v0.14.15: one retry per server (was 1)
     opts.num_concurrent_reqs = 2; // A and AAAA in parallel per domain
     opts.cache_size = 0; // scan-scoped; no reason to persist across domains
 
-    // Cloudflare 1.1.1.1 / 1.0.0.1 + Google 8.8.8.8 / 8.8.4.4 as fallback.
-    // Hickory rotates through these if the primary fails.
+    // Cloudflare + Google + Quad9. Hickory round-robins through all six
+    // IPs, so any one upstream being blocked / throttled still leaves the
+    // others reachable.
     let nameservers = NameServerConfigGroup::from_ips_clear(
         &[
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),       // Cloudflare
+            IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),       // Cloudflare
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),       // Google
+            IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),       // Google
+            IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),       // Quad9
+            IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)), // Quad9
         ],
         53,
         true, // trust_negative_responses — NXDOMAIN is fatal per query

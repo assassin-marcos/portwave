@@ -101,8 +101,8 @@ struct Args {
     udp: bool,
 
     // ── Timing / concurrency ───────────────────────────────
-    /// Max concurrent Phase-A probes
-    #[arg(short = 't', long, default_value_t = 3000)]
+    /// Starting Phase-A probe pool (adaptive can grow to 1.5× or 3000, whichever's higher)
+    #[arg(short = 't', long, default_value_t = 2000)]
     threads: usize,
 
     /// Phase-A connect timeout, ms
@@ -1178,6 +1178,13 @@ fn resolve_redirect_url(base: &str, loc: &str) -> String {
 // Danger flags: scanner use-case. We WANT to see the server's response
 // whether the cert is expired, self-signed, name-mismatched, or has a
 // negative X.509 serial number from some 2006 Cisco appliance.
+//
+// v0.14.15: User-Agent moved off the client and onto each request, so we
+// can rotate across real browser strings (see BROWSER_UAS below). WAFs
+// rule-block any UA containing "scanner / probe / tool name", which the
+// old `portwave/0.14.x` literally tripped. Browser UAs get past those
+// filters and the server returns whatever it actually serves a real
+// browser — zero false-positive risk.
 static HTTP_CLIENT: std::sync::OnceLock<reqwest::blocking::Client> =
     std::sync::OnceLock::new();
 
@@ -1187,7 +1194,6 @@ fn http_client() -> Option<&'static reqwest::blocking::Client> {
             reqwest::blocking::Client::builder()
                 .danger_accept_invalid_certs(true)
                 .danger_accept_invalid_hostnames(true)
-                .user_agent(concat!("portwave/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(5))
                 .connect_timeout(Duration::from_secs(5))
                 .redirect(reqwest::redirect::Policy::none())
@@ -1199,15 +1205,43 @@ fn http_client() -> Option<&'static reqwest::blocking::Client> {
         .into()
 }
 
+// v0.14.15: real-browser User-Agent strings rotated per HTTP probe so
+// WAFs don't rule-block us on the UA alone. Picked the current major
+// version of each engine (Chrome 131, Firefox 122, Safari 17.5, Edge 131
+// at time of release). Kept identical platform fingerprint patterns to
+// what each browser actually sends so server-side UA-parsing libraries
+// classify them correctly.
+const BROWSER_UAS: &[&str] = &[
+    // Chrome on Windows 10/11
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    // Firefox on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:122.0) Gecko/20100101 Firefox/122.0",
+    // Safari on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    // Edge on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+];
+
+static UA_ROTATOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn next_browser_ua() -> &'static str {
+    let i = UA_ROTATOR.fetch_add(1, Ordering::Relaxed);
+    BROWSER_UAS[i % BROWSER_UAS.len()]
+}
+
 fn http_probe_single(url: &str, follow: bool) -> Option<HttpProbeResult> {
     let client = http_client()?;
     let started_https = url.starts_with("https://");
     let mut current = url.to_string();
     let mut chain: Vec<String> = Vec::new();
     let mut last: Option<(u16, String, Option<String>, Option<u64>)> = None;
+    // v0.14.15: pick a fresh browser UA for this probe. Same UA is used
+    // for every hop in the redirect chain (a real browser wouldn't change
+    // mid-redirect either).
+    let ua = next_browser_ua();
 
     for hop in 0..=3 {
-        let resp = match client.get(&current).send() {
+        let resp = match client.get(&current).header("User-Agent", ua).send() {
             Ok(r) => r,
             Err(_) => {
                 // TLS handshake failed / connection refused / etc.
@@ -2040,7 +2074,10 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
 
     // Active HTTP probe.
     if stream
-        .write_all(b"GET / HTTP/1.0\r\nHost: scan\r\nUser-Agent: portwave\r\n\r\n")
+        // v0.14.15: Phase-B raw HTTP probe also sends a real-browser UA
+        // so any WAF in front of the target doesn't 403/406 us on the
+        // fast banner-grab path before Pass-C even runs.
+        .write_all(b"GET / HTTP/1.0\r\nHost: scan\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n\r\n")
         .await
         .is_ok()
     {
@@ -2162,10 +2199,19 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
 //     last two windows.
 //   - No action when timeouts are high but local errors are zero — that's a
 //     dead / firewalled target and shrinking wouldn't help anyway.
-async fn adaptive_monitor(stats: Arc<Stats>, sem: Arc<Semaphore>, max: usize) {
+async fn adaptive_monitor(
+    stats: Arc<Stats>,
+    sem: Arc<Semaphore>,
+    initial: usize,
+    max: usize,
+) {
     let mut prev_a: u64 = 0;
     let mut prev_l: u64 = 0;
-    let mut current = max;
+    // v0.14.15: pool starts at `initial` (which equals args.threads by
+    // default, 2000). On clean windows the controller grows it toward
+    // `max` = max(3000, initial * 1.5), so a target that accepts our
+    // load gets the full ceiling without the user having to tune it.
+    let mut current = initial;
     let min = (max / 16).max(64);
     let mut clean_windows: u32 = 0;
 
@@ -2207,12 +2253,19 @@ async fn adaptive_monitor(stats: Arc<Stats>, sem: Arc<Semaphore>, max: usize) {
             }
             clean_windows = 0;
         } else if dl == 0 {
-            // No local pressure. Grow back toward max after 2 clean windows.
+            // No local pressure. Grow toward max after 2 clean windows.
             clean_windows += 1;
             if clean_windows >= 2 && current < max {
                 let grow = ((max - current) / 4).max(1);
                 sem.add_permits(grow);
                 current += grow;
+                // v0.14.15: print grow events so users can see the
+                // controller upgrading the pool. Silent before — users
+                // didn't know it was happening.
+                eprintln!(
+                    "[adaptive] clean — growing pool to {} (ceiling {})",
+                    current, max
+                );
                 if current >= max {
                     // Fully recovered — workers can skip the semaphore again.
                     stats.adaptive_shrunk.store(false, Ordering::Relaxed);
@@ -4464,11 +4517,21 @@ async fn main() -> anyhow::Result<()> {
     let scanned_estimate = total_estimate.saturating_sub(skip_set.len() as u64);
 
     println!("--- PHASE A: DISCOVERY ---");
+    // v0.14.15: compute adaptive-pool start / ceiling early so the header
+    // prints them. Dupe of the logic in the stats / sem setup below —
+    // pulled out here purely for display ordering.
+    let max_ceiling_disp: usize = (args.threads * 3 / 2).max(3000).max(args.threads);
+    let initial_pool_disp: usize = args.threads.min(max_ceiling_disp);
+    let workers_label = if initial_pool_disp == max_ceiling_disp {
+        format!("{}", max_ceiling_disp)
+    } else {
+        format!("{} → {} (adaptive)", initial_pool_disp, max_ceiling_disp)
+    };
     println!(
-        "Ranges: {}  Ports: {}  Workers(max): {}  Timeout: {}ms  Retries: {}  Est. probes: {}",
+        "Ranges: {}  Ports: {}  Workers: {}  Timeout: {}ms  Retries: {}  Est. probes: {}",
         nets.len(),
         ports.len(),
-        args.threads,
+        workers_label,
         args.timeout_ms,
         args.retries,
         scanned_estimate
@@ -4567,6 +4630,13 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // v0.14.15: dynamic pool ceiling. Start at --threads (default 2000)
+    // and let the adaptive controller grow the pool up to `max_ceiling`
+    // when local_errors stay at zero. `max(3000, N*1.5)` keeps 3000 as
+    // the floor ceiling for the default case and scales up proportionally
+    // when the user sets --threads higher.
+    let max_ceiling: usize = (args.threads * 3 / 2).max(3000).max(args.threads);
+    let initial_pool: usize = args.threads.min(max_ceiling);
     let stats = Arc::new(Stats {
         shutdown: AtomicBool::new(false),
         attempts: AtomicU64::new(0),
@@ -4575,9 +4645,15 @@ async fn main() -> anyhow::Result<()> {
         local_errors: AtomicU64::new(0),
         net_unreach: AtomicU64::new(0),
         priority_done: AtomicBool::new(false),
-        adaptive_shrunk: AtomicBool::new(false),
+        // When initial_pool < max_ceiling, workers must gate through the
+        // semaphore to respect the lower starting count. The controller
+        // will clear this flag once the pool grows to max_ceiling.
+        adaptive_shrunk: AtomicBool::new(initial_pool < max_ceiling),
     });
-    let sem = Arc::new(Semaphore::new(args.threads));
+    // Semaphore starts with `initial_pool` permits. Controller calls
+    // sem.add_permits() to grow up to max_ceiling on clean windows, or
+    // acquires permits to shrink on local-resource errors.
+    let sem = Arc::new(Semaphore::new(initial_pool));
 
     // SIGINT handler.
     {
@@ -4614,8 +4690,11 @@ async fn main() -> anyhow::Result<()> {
     let monitor = if !args.no_adaptive {
         let s = stats.clone();
         let sm = sem.clone();
-        let max = args.threads;
-        Some(tokio::spawn(async move { adaptive_monitor(s, sm, max).await }))
+        let initial = initial_pool;
+        let max = max_ceiling;
+        Some(tokio::spawn(async move {
+            adaptive_monitor(s, sm, initial, max).await
+        }))
     } else {
         None
     };
@@ -4831,10 +4910,14 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    // Phase-A workers.
+    // Phase-A workers. v0.14.15: spawn `max_ceiling` workers (not just
+    // `args.threads`) so we have capacity for the adaptive controller to
+    // scale the pool up to the ceiling. Workers gate on the semaphore
+    // whenever `adaptive_shrunk` is true (true from the start when
+    // initial < ceiling) so only `current_permits` probes run at once.
     let mut workers: JoinSet<()> = JoinSet::new();
     let timeout_a = Duration::from_millis(args.timeout_ms);
-    for _ in 0..args.threads {
+    for _ in 0..max_ceiling {
         let rx = work_rx.clone();
         let ht = hit_tx.clone();
         let sm = sem.clone();
