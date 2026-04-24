@@ -187,9 +187,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     json_out: bool,
 
-    /// Resume from previous open_ports.jsonl (skip ports already found open). Default: fresh scan.
-    #[arg(long, default_value_t = false)]
-    resume: bool,
+    /// Start a fresh scan: wipe prior artefacts in the output dir instead of resuming from open_ports.jsonl.
+    #[arg(short = 'n', long = "no-resume", visible_alias = "nr", default_value_t = false)]
+    no_resume: bool,
 
     /// Webhook URL (POST summary on completion)
     #[arg(short = 'w', long)]
@@ -3788,8 +3788,8 @@ fn check_deprecated_flags() {
             "gone — pipe http_targets.txt to httpx -path \"/a,/b\" manually if you need custom paths.",
         ),
         (
-            "--no-resume",
-            "removed in v0.15.1 — fresh scan is now the default. Pass --resume to opt in to skipping ports already found open in open_ports.jsonl.",
+            "--resume",
+            "resume is the default again as of v0.15.2 — just drop the flag. Use --no-resume (or -n / --nr) to start fresh and wipe old artefacts.",
         ),
     ];
     for arg in argv.iter().skip(1) {
@@ -3956,7 +3956,7 @@ async fn main() -> anyhow::Result<()> {
     let cdn_skipped_path = out_dir.join("cdn_skipped.txt");    // CDN-fronted, skipped
     let dns_failed_path = out_dir.join("dns_failed.txt");      // NXDOMAIN / timeout / no records
 
-    // Always capture prior opens (independent of --resume) so scan_diff
+    // Always capture prior opens (independent of --no-resume) so scan_diff
     // can compare this run against the last one.
     let mut prior_set: FxHashSet<SocketAddr> = FxHashSet::default();
     if jsonl_path.exists() {
@@ -3974,7 +3974,7 @@ async fn main() -> anyhow::Result<()> {
     // Resume — read existing jsonl into skip set.
     let mut skip_set: FxHashSet<SocketAddr> = FxHashSet::default();
     let mut preserved: Vec<OpenPort> = Vec::new();
-    if args.resume && jsonl_path.exists() {
+    if !args.no_resume && jsonl_path.exists() {
         if let Ok(f) = fs::File::open(&jsonl_path) {
             for line in BufReader::new(f).lines().flatten() {
                 if let Ok(op) = serde_json::from_str::<OpenPort>(&line) {
@@ -3986,9 +3986,32 @@ async fn main() -> anyhow::Result<()> {
             }
             println!("Resume: {} prior open ports loaded; will skip re-probing.", skip_set.len());
         }
-    } else {
-        // Fresh run: clear derived files.
-        let _ = fs::remove_file(&jsonl_path);
+    } else if args.no_resume {
+        // --no-resume / -n / --nr: wipe every prior scan artefact the
+        // scanner writes into out_dir, so the run starts genuinely clean.
+        // prior_set above has already been populated from the old jsonl
+        // for scan-diff purposes, so we keep diff semantics intact.
+        let wipe = [
+            &jsonl_path,
+            &http_targets_path,
+            &summary_path,
+            &diff_path,
+            &enrich_out,
+            &nuclei_out,
+            &domains_json_path,
+            &origin_domains_path,
+            &cdn_skipped_path,
+            &dns_failed_path,
+        ];
+        let mut removed = 0usize;
+        for p in wipe {
+            if p.exists() && fs::remove_file(p).is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            println!("Fresh scan (-n): removed {} stale artefact(s) from {}", removed, out_dir.display());
+        }
     }
     let _ = fs::remove_file(&http_targets_path);
     // v0.14.4 — stale targets.txt from pre-0.14.4 scans gets removed so
@@ -4764,7 +4787,7 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!(
                         "\n[!] Network looks unreachable — {} probes failed with \
                          ENETUNREACH. Saving progress and exiting gracefully. \
-                         Re-run with --resume to skip ports already confirmed open.",
+                         Re-run the same command to resume from where this stopped.",
                         n
                     );
                     stats.shutdown.store(true, Ordering::Relaxed);
