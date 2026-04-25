@@ -6251,40 +6251,17 @@ async fn async_main() -> anyhow::Result<()> {
             );
             println!();
 
-            // v0.16.3: in domain-mode scans (Phase 0 ran; we have a
-            // populated domain_origin_map), suppress the per-cert SAN
-            // tree — on big subdomain enumerations it floods the
-            // terminal with hundreds of bracketed lines that are
-            // already in ssl_findings.txt anyway. Instead, aggregate
-            // unique ROOT (eTLD+1) domains across all SANs and print
-            // ONE summary block at the end. On IP/CIDR/ASN-only scans
-            // (no Phase 0), keep the per-cert tree — it's the only
-            // place that data shows up for those scan types.
-            let is_domain_mode = !domain_origin_map.is_empty();
-
-            if is_domain_mode {
-                // Domain-mode: silent during cert iteration, just collect.
-                // Final "Unique root domains" section prints below.
-            } else {
-                // IP/CIDR/ASN-only: print per-cert tree as before.
-                for rec in &unique {
-                    let host = ssl_scan::host_label(rec);
-                    println!("  {}", cfmt("1;36", &host));
-                    let mut sans = rec.sans.clone();
-                    sans.sort();
-                    sans.dedup();
-                    let n = sans.len();
-                    for (i, san) in sans.iter().enumerate() {
-                        let glyph = if i + 1 == n { "└─" } else { "├─" };
-                        println!("    {} {}", cfmt("2", glyph), san);
-                    }
-                    println!();
-                }
-            }
+            // v0.17.1: roots-only summary now ALWAYS, regardless of scan
+            // mode. Previously gated on domain-mode (`!domain_origin_map.is_empty()`),
+            // which left CIDR / IP / ASN scans showing the per-cert SAN
+            // tree — on a /24 of an HTTPS-fronted load balancer that was
+            // 200+ near-identical bracketed lines ("199.204.56.101:443 →
+            // *.epic.com / epic.com" repeated for every IP). The roots
+            // summary is more useful in every mode; the per-cert detail
+            // is preserved on disk in ssl_findings.txt for grep.
 
             // File output: one [ssl-dns-names] line per UNIQUE record
             // (same dedupe). Plain nuclei-bracketed format for grep / jq.
-            // ALWAYS written, regardless of mode.
             let file_lines: Vec<String> = unique
                 .iter()
                 .filter_map(|r| ssl_scan::format_file_line(r))
@@ -6293,23 +6270,18 @@ async fn async_main() -> anyhow::Result<()> {
                 let _ = fs::write(&ssl_findings_path, file_lines.join("\n") + "\n");
             }
 
-            // v0.16.3: in domain-mode, aggregate unique ROOT domains
-            // (eTLD+1) across all cert SANs and print as the final
-            // SSL section. This is the actually-useful signal for
-            // attack-surface mapping — "what other root domains is
-            // this org running?" — without 200 lines of subdomain
-            // noise.
-            if is_domain_mode {
+            // Aggregate unique ROOT domains (eTLD+1) across all cert SANs.
+            // v0.16.4 platform-domain denylist drops third-party SSO / CDN
+            // / PaaS roots (microsoftonline.com, cloudflare.com, okta.com,
+            // herokuapp.com, …) that show up in cert SANs but aren't the
+            // scan target — just artifacts of corp identity / CDN setups.
+            {
                 use std::collections::HashSet;
                 let mut roots: HashSet<String> = HashSet::new();
                 let mut filtered_platform = 0usize;
                 for rec in &unique {
                     for san in &rec.sans {
                         let root = domain::extract_root_domain(san);
-                        // v0.16.4: drop third-party platform domains
-                        // (MS Identity, Cloudflare Access, Okta, etc.)
-                        // — they're not the scan target, just artifacts
-                        // of corp SSO / CDN / identity setups.
                         if domain::is_platform_domain(&root) {
                             filtered_platform += 1;
                             continue;
