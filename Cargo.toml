@@ -1,6 +1,6 @@
 [package]
 name = "portwave"
-version = "0.15.9"
+version = "0.15.10"
 edition = "2021"
 description = "Ultra-fast, IP-focused IPv4/IPv6 port scanner with adaptive concurrency, banner grab, TLS sniff, CDN tagging, scan-diff, webhook, self-update, and a built-in httpx + nuclei recon pipeline."
 license = "MIT"
@@ -60,13 +60,14 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Fast non-DoS-resistant hasher for scan-state HashSets (skip / prior
 # sets). ~4× faster than the std SipHash on small keys like SocketAddr.
 rustc-hash = "1.1"
-# v0.15.9 native SSL recon: direct openssl bindings reuse the same
-# vendored OpenSSL that reqwest's native-tls-vendored already statically
-# links — zero extra binary size, lenient cert parsing matches the rest
-# of the toolchain (legacy IoT/Cisco quirks accepted, same as reqwest).
-# Provides peer_certificate(), subject_alt_names(), issuer_name() — no
-# need for a separate X.509 parser crate.
-openssl = "0.10"
+# v0.15.10 native SSL recon: direct openssl bindings. `vendored` feature
+# builds OpenSSL from source statically — same posture as reqwest's
+# native-tls-vendored — so macOS / Windows CI runners don't need system
+# libssl-dev installed (v0.15.9 release CI failed without this). Lenient
+# cert parsing matches the rest of the toolchain (legacy IoT/Cisco
+# quirks accepted). Provides peer_certificate(), subject_alt_names(),
+# issuer_name() — no separate X.509 parser crate needed.
+openssl = { version = "0.10", features = ["vendored"] }
 # Pure-Rust async DNS resolver. Used by the v0.14.0 domain/subdomain
 # scanning feature to resolve hostnames → A/AAAA records in parallel
 # with predictable per-query timeouts. Connects directly to Cloudflare
