@@ -20,13 +20,9 @@ open_ports.jsonl
 *.env
 !.env.example
 
-# Editors / assistants
+# Editors
 .idea/
 .vscode/
-.claude/
-CLAUDE.md
-.aider*
-.cursor/
 *.swp
 *.swo
 *~
