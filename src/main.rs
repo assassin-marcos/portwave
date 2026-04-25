@@ -1171,6 +1171,13 @@ struct HttpProbeResult {
     chain: Vec<String>,            // intermediate URLs; empty if no / one-hop redirect
     via_https: bool,               // true if final successful probe used https:// scheme
     content_length: Option<u64>,   // from Content-Length header, for the httpx-compat line
+    // STAGING (v0.17.0 candidate): leaf cert DER from the FIRST hop's TLS
+    // handshake. Captured via reqwest's TlsInfo extension when the
+    // ClientBuilder has tls_info(true). Reused by the SSL recon phase so
+    // we don't re-handshake the same port. None when the probe was
+    // plaintext HTTP, when the request errored before TLS, or when reqwest's
+    // backend didn't surface the cert (some H2 paths).
+    cert_der: Option<Vec<u8>>,
 }
 
 fn extract_title(html: &str) -> Option<String> {
@@ -1241,6 +1248,13 @@ fn http_client() -> Option<&'static reqwest::blocking::Client> {
             reqwest::blocking::Client::builder()
                 .danger_accept_invalid_certs(true)
                 .danger_accept_invalid_hostnames(true)
+                // STAGING (v0.17.0 candidate): tls_info(true) makes reqwest
+                // attach a TlsInfo extension to every Response, exposing the
+                // peer cert via `.peer_certificate()` (DER bytes). Lets the
+                // SSL recon phase reuse this cert and skip a second TLS
+                // handshake on the same port. Zero overhead when not used —
+                // it's just an Arc clone into the response extensions map.
+                .tls_info(true)
                 .timeout(Duration::from_secs(5))
                 .connect_timeout(Duration::from_secs(5))
                 .redirect(reqwest::redirect::Policy::none())
@@ -1286,6 +1300,11 @@ fn http_probe_single(url: &str, follow: bool) -> Option<HttpProbeResult> {
     // for every hop in the redirect chain (a real browser wouldn't change
     // mid-redirect either).
     let ua = next_browser_ua();
+    // STAGING (v0.17.0 candidate): leaf cert DER from the first-hop TLS
+    // handshake. Captured once on the original target (subsequent redirect
+    // hops are different hosts and irrelevant to the original probed
+    // port's cert).
+    let mut captured_cert_der: Option<Vec<u8>> = None;
 
     for hop in 0..=3 {
         let resp = match client.get(&current).header("User-Agent", ua).send() {
@@ -1299,6 +1318,17 @@ fn http_probe_single(url: &str, follow: bool) -> Option<HttpProbeResult> {
                 break;
             }
         };
+
+        // STAGING capture (first hop only): pull the leaf cert from
+        // reqwest's TlsInfo response extension. Available because the
+        // ClientBuilder has tls_info(true) set above.
+        if hop == 0 && started_https {
+            if let Some(tls_info) = resp.extensions().get::<reqwest::tls::TlsInfo>() {
+                if let Some(der) = tls_info.peer_certificate() {
+                    captured_cert_der = Some(der.to_vec());
+                }
+            }
+        }
 
         let status = resp.status().as_u16();
         // reqwest gives us `canonical_reason()` which is a human-friendly
@@ -1371,6 +1401,7 @@ fn http_probe_single(url: &str, follow: bool) -> Option<HttpProbeResult> {
         chain,
         via_https: started_https,
         content_length,
+        cert_der: captured_cert_der,
     })
 }
 
@@ -5378,6 +5409,11 @@ async fn async_main() -> anyhow::Result<()> {
              redirect chains, and final URLs will NOT be populated in output."
         );
     }
+    // STAGING (v0.17.0 candidate): collect leaf certs from Pass-C's TLS
+    // handshakes (via reqwest TlsInfo). Reused by the SSL recon phase
+    // below to skip a redundant TLS handshake on the same port.
+    let mut precaptured_certs: std::collections::HashMap<SocketAddr, Vec<u8>> =
+        std::collections::HashMap::new();
     let http_probe_ms: u128 = if args.no_enrich || args.no_banner || open_records.is_empty() {
         0
     } else {
@@ -5498,6 +5534,8 @@ async fn async_main() -> anyhow::Result<()> {
                         break;
                     }
                     if let Ok((idx, Some(res))) = joined {
+                        // STAGING: capture cert BEFORE moving res fields.
+                        let cert_der_taken = res.cert_der;
                         open_records[idx].banner = Some(res.status_line);
                         open_records[idx].title = res.title;
                         open_records[idx].final_url = res.final_url;
@@ -5510,6 +5548,15 @@ async fn async_main() -> anyhow::Result<()> {
                             match open_records[idx].protocol.as_deref() {
                                 Some("https") | Some("ssh") | Some("ssl") => {}
                                 _ => open_records[idx].protocol = Some("https".into()),
+                            }
+                        }
+                        // STAGING (v0.17.0 candidate): store leaf cert
+                        // keyed by (IP, port) so the SSL recon phase
+                        // skips a redundant handshake.
+                        if let Some(der) = cert_der_taken {
+                            if let Ok(ip) = open_records[idx].ip.parse::<IpAddr>() {
+                                let addr = SocketAddr::new(ip, open_records[idx].port);
+                                precaptured_certs.insert(addr, der);
                             }
                         }
                     }
@@ -6130,6 +6177,10 @@ async fn async_main() -> anyhow::Result<()> {
         // can't confirm but are HTTPS in practice). SNI = source_label
         // (resolved domain) when available; falls back to IP literal.
         let mut ssl_targets: Vec<ssl_scan::SslTarget> = Vec::new();
+        // STAGING (v0.17.0 candidate): records we already have from
+        // Pass-C cert capture. These get added to the final record set
+        // without re-handshaking.
+        let mut precaptured_records: Vec<ssl_scan::SslRecord> = Vec::new();
         for op in &open_records {
             let is_canonical_https = matches!(op.port, 443 | 4443 | 8443 | 9443 | 10443);
             if !op.tls && !is_canonical_https {
@@ -6140,17 +6191,29 @@ async fn async_main() -> anyhow::Result<()> {
                 Some(d) if !d.is_empty() => d.to_string(),
                 _ => ip.to_string(),
             };
-            ssl_targets.push(ssl_scan::SslTarget {
-                addr: SocketAddr::new(ip, op.port),
-                sni,
-            });
+            let addr = SocketAddr::new(ip, op.port);
+            // STAGING: if Pass-C already captured a cert for this addr,
+            // parse it directly instead of queueing a fresh handshake.
+            if let Some(der) = precaptured_certs.get(&addr) {
+                if let Some(rec) = ssl_scan::from_der(addr, sni.clone(), der) {
+                    precaptured_records.push(rec);
+                    continue;
+                }
+                // from_der failed (cert didn't parse) → fall through to
+                // a full handshake just to be safe.
+            }
+            ssl_targets.push(ssl_scan::SslTarget { addr, sni });
         }
 
-        if !ssl_targets.is_empty() {
+        let total_targets = ssl_targets.len() + precaptured_records.len();
+        if total_targets > 0 {
             let ssl_started = Instant::now();
             let ssl_concurrency = args.probe_concurrency.max(1);
-            let target_count = ssl_targets.len();
-            let records = ssl_scan::run(ssl_targets, ssl_concurrency).await;
+            let target_count = total_targets;
+            let scanned = ssl_scan::run(ssl_targets, ssl_concurrency).await;
+            // Combine: Pass-C-precaptured records + freshly-scanned ones.
+            let mut records = precaptured_records;
+            records.extend(scanned);
             let ssl_ms = ssl_started.elapsed().as_millis();
 
             // v0.16.0: dedupe by (host:port, sorted-SAN-set). When a

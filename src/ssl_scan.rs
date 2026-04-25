@@ -76,9 +76,43 @@ pub async fn run(targets: Vec<SslTarget>, concurrency: usize) -> Vec<SslRecord> 
     out
 }
 
+/// Extract SANs from an OpenSSL X509 cert. Shared between the
+/// fresh-handshake `probe_blocking` path and the `from_der` constructor
+/// that reuses Pass-C's cert. Modern certs use SAN; pre-RFC-6125 certs
+/// fall back to CN as a synthetic single-element SAN list (matches
+/// nuclei's `ssl-dns-names` template behaviour).
+fn extract_sans(cert: &openssl::x509::X509) -> Vec<String> {
+    let mut sans: Vec<String> = Vec::new();
+    if let Some(stack) = cert.subject_alt_names() {
+        for n in stack.iter() {
+            if let Some(s) = n.dnsname() {
+                sans.push(s.to_string());
+            }
+        }
+    }
+    if sans.is_empty() {
+        for entry in cert.subject_name().entries_by_nid(openssl::nid::Nid::COMMONNAME) {
+            if let Ok(s) = entry.data().as_utf8() {
+                sans.push(s.to_string());
+            }
+        }
+    }
+    sans
+}
+
+/// STAGING (v0.17.0 candidate): build an SslRecord directly from the leaf
+/// cert DER bytes captured by reqwest's TlsInfo during Pass-C HTTP probing.
+/// Lets us skip a redundant TLS handshake on ports already covered by
+/// Pass-C. Returns None if the DER doesn't parse.
+pub fn from_der(addr: SocketAddr, sni: String, der: &[u8]) -> Option<SslRecord> {
+    let cert = openssl::x509::X509::from_der(der).ok()?;
+    let sans = extract_sans(&cert);
+    Some(SslRecord { addr, sni, sans })
+}
+
 /// Single blocking TLS probe. Connects, handshakes with NO verification
 /// (we just want the cert metadata, not to validate it), pulls the
-/// peer cert, extracts SANs + issuer-org. Times out at 5 s combined.
+/// peer cert, extracts SANs. Times out at 5 s combined.
 fn probe_blocking(t: &SslTarget) -> Option<SslRecord> {
     let mut builder = SslConnector::builder(SslMethod::tls_client()).ok()?;
     // Scanner use case: we WANT to see the cert no matter what (expired,
@@ -97,27 +131,7 @@ fn probe_blocking(t: &SslTarget) -> Option<SslRecord> {
     let mut stream = connector.connect(&t.sni, sock).ok()?;
 
     let cert = stream.ssl().peer_certificate()?;
-
-    // SAN list — the primary signal. Modern certs have it; older
-    // CN-only certs return None and we synthesize from CN below.
-    let mut sans: Vec<String> = Vec::new();
-    if let Some(stack) = cert.subject_alt_names() {
-        for n in stack.iter() {
-            if let Some(s) = n.dnsname() {
-                sans.push(s.to_string());
-            }
-        }
-    }
-    if sans.is_empty() {
-        // Fallback: use the CN as a single-element SAN list. Same
-        // behaviour as nuclei's ssl-dns-names template when the cert
-        // predates RFC 6125.
-        for entry in cert.subject_name().entries_by_nid(openssl::nid::Nid::COMMONNAME) {
-            if let Ok(s) = entry.data().as_utf8() {
-                sans.push(s.to_string());
-            }
-        }
-    }
+    let sans = extract_sans(&cert);
 
     // Trigger a graceful shutdown so the server's socket can close
     // cleanly; ignore errors (we already have what we need.)
