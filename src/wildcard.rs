@@ -37,7 +37,28 @@ use hickory_resolver::TokioAsyncResolver;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
+
+/// Maximum parallel wildcard probes (v0.17.3). On 1M-domain inputs the
+/// previous unbounded `tokio::spawn`-per-bucket pattern fanned out to
+/// thousands of simultaneous DNS queries against the upstream resolver
+/// pool (15 trusted upstreams). Free-tier Cloudflare / Google rate
+/// limits dropped a fraction of those, and combined with the strict
+/// "≥2-of-3 probes must succeed" vote rule, parent zones with high
+/// fan-out (e.g. `*.ai.vwgroup.com` with 50k+ children) silently
+/// escaped detection — letting tens of thousands of duplicate domains
+/// survive into `resolve_many`. Bounding to 64 concurrent probes keeps
+/// upstream load at ~192 queries/sec which is well within free-tier
+/// limits while still finishing wildcard detection in seconds for
+/// realistic input sizes.
+const PROBER_CONCURRENCY: usize = 64;
+
+/// Per-probe DNS timeout (v0.17.3, was 3s). Longer than the resolver's
+/// own per-server timeout so retries inside hickory still get a chance,
+/// while not so long that a fully-broken upstream hangs detection.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One detected wildcard zone.
 #[derive(Debug, Clone)]
@@ -93,9 +114,12 @@ pub async fn pre_detect_and_filter(
     let buckets = bucket_by_suffix(domains, 3);
 
     // Step 2 — probe each bucket with ≥ min_cluster members.
-    // Probes run in parallel across buckets to keep wall time low.
+    // v0.17.3: probes run with bounded concurrency (PROBER_CONCURRENCY)
+    // so the upstream DNS pool isn't bursted past its rate limits — see
+    // the constant's doc comment for the failure mode this defends.
     let mut wildcarded_suffixes: HashMap<String, Vec<IpAddr>> = HashMap::new();
     let mut probe_handles: Vec<(String, tokio::task::JoinHandle<Option<Vec<IpAddr>>>)> = Vec::new();
+    let probe_sem = Arc::new(Semaphore::new(PROBER_CONCURRENCY));
 
     for (suffix, members) in &buckets {
         if members.len() < min_cluster {
@@ -103,7 +127,11 @@ pub async fn pre_detect_and_filter(
         }
         let resolver_clone = resolver.clone();
         let suffix_clone = suffix.clone();
+        let sem = probe_sem.clone();
         let h = tokio::spawn(async move {
+            // Hold the permit for the entire probe (3 DNS queries with
+            // retries). Permit drops automatically when the task ends.
+            let _permit = sem.acquire_owned().await.ok()?;
             probe_wildcard(&suffix_clone, &resolver_clone).await
         });
         probe_handles.push((suffix.clone(), h));
@@ -222,29 +250,47 @@ fn bucket_by_suffix(domains: &[String], _depth_unused: usize) -> HashMap<String,
     buckets
 }
 
+/// One DNS lookup attempt, returning a sorted/deduped IP list on
+/// success. Empty results filter out so callers see `None` for "no
+/// usable IPs" the same as for "DNS error / timeout".
+async fn try_resolve_probe(probe: &str, resolver: &TokioAsyncResolver) -> Option<Vec<IpAddr>> {
+    tokio::time::timeout(PROBE_TIMEOUT, resolver.lookup_ip(probe))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|lu| {
+            let mut ips: Vec<IpAddr> = lu.iter().collect();
+            ips.sort();
+            ips.dedup();
+            ips
+        })
+        .filter(|ips| !ips.is_empty())
+}
+
 /// Probe a suffix for wildcard behaviour. Generate 3 random labels,
 /// resolve each at `<random>.<suffix>`, and return the wildcard
 /// fingerprint IPs if ≥2 of 3 probes share at least one IP.
+///
+/// v0.17.3: each individual probe retries once on transient failure
+/// (timeout / NXDOMAIN-from-upstream-hiccup / empty result). The retry
+/// catches the single-drop case that previously killed detection of
+/// real parent wildcards under bursty load.
 async fn probe_wildcard(suffix: &str, resolver: &TokioAsyncResolver) -> Option<Vec<IpAddr>> {
     let probes: Vec<String> = (0..3)
         .map(|_| format!("{}.{}", random_label(32), suffix))
         .collect();
 
-    // Resolve all 3 in parallel with a short timeout.
+    // Resolve all 3 in parallel; per-probe retry once on failure.
     let mut handles = Vec::with_capacity(3);
     for probe in probes {
         let resolver = resolver.clone();
         handles.push(tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_secs(3), resolver.lookup_ip(probe))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .map(|lu| {
-                    let mut ips: Vec<IpAddr> = lu.iter().collect();
-                    ips.sort();
-                    ips.dedup();
-                    ips
-                })
+            if let Some(ips) = try_resolve_probe(&probe, &resolver).await {
+                return Some(ips);
+            }
+            // First attempt failed/empty — retry once. Catches transient
+            // upstream rate-limit drops; doesn't change cost in success cases.
+            try_resolve_probe(&probe, &resolver).await
         }));
     }
 
