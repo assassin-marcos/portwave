@@ -4283,8 +4283,13 @@ async fn async_main() -> anyhow::Result<()> {
     // were no direct IPs, exit cleanly with a clear message.
     let mut domain_origin_map: std::collections::HashMap<IpAddr, String> =
         std::collections::HashMap::new();
+    // v0.16.7: load CDN table once at this point and share across both
+    // call sites (Phase 0 domain resolution + post-Phase-A IP tagging).
+    // Previously we called `load_cdn_ranges()` twice per domain-mode
+    // scan, leaking a second copy of all 13,553 provider strings via
+    // Box::leak. Arc-wrapped since v0.15.4 so the share is free.
+    let cdn_table = load_cdn_ranges();
     if !domains.is_empty() {
-        let cdn_table = load_cdn_ranges();
         let dns_timeout = Duration::from_secs(args.dns_timeout.max(1));
 
         // v0.16.2: wildcard pre-filter. Detects wildcard zones in the
@@ -5335,7 +5340,7 @@ async fn async_main() -> anyhow::Result<()> {
     // from --domain / --input-file domain entries). The domain label is
     // used by the OPEN PORTS renderer to show "example.com → 1.2.3.4"
     // grouping, and lands in the JSONL for downstream tooling.
-    let cdn_table = load_cdn_ranges();
+    // v0.16.7: reuses the Arc<CdnTables> loaded above (no second call).
     for op in &mut open_records {
         if op.cdn.is_none() {
             if let Ok(ip) = op.ip.parse::<IpAddr>() {
@@ -5759,27 +5764,22 @@ async fn async_main() -> anyhow::Result<()> {
     );
 
     // v0.16.5: choose grouping mode. By-host is the classic nmap-like
-    // layout (one block per host, ports indented). On big domain-mode
-    // scans where the same ports recur across hundreds of hosts, that
-    // layout repeats `:80 [http]` and `:443 [https]` thousands of
-    // times. By-port grouping shows each port once with its host list,
-    // making "what ports are exposed across the scope?" answerable at
-    // a glance.
+    // layout (one block per host, ports indented). On domain-mode
+    // scans where the same ports recur across many subdomains, that
+    // layout repeats `:80 [http]` and `:443 [https]` per host —
+    // exactly the clutter users report. By-port grouping shows each
+    // port once with its host list.
     //
-    // Auto mode: by-host below 20 unique hosts, by-port above. Manual
-    // override via --group-by host|port.
-    let unique_host_count: usize = {
-        use std::collections::HashSet;
-        let mut set = HashSet::new();
-        for op in &open_records {
-            set.insert(&op.ip);
-        }
-        set.len()
-    };
+    // v0.16.7 auto rule (revised): in DOMAIN-mode scans we always
+    // default to by-port (the user input is a subdomain list, so port
+    // recurrence is expected). In IP/CIDR/ASN-mode we keep by-host
+    // (the user is probing a small set of distinct IPs and the nmap
+    // layout is what they expect). Manual override via
+    // `--group-by host|port` still works.
     let group_by_port = match args.group_by.to_ascii_lowercase().as_str() {
         "port" => true,
         "host" => false,
-        _ => unique_host_count > 20, // auto
+        _ => !domain_origin_map.is_empty(), // auto: domain-mode → by-port
     };
 
     // Helper: render the port-tag bundle + title + redirect. Reused by
