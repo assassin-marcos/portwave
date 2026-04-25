@@ -20,6 +20,7 @@ use tokio::task::JoinSet;
 // Lives in a dedicated module so DNS + CDN concerns don't leak into
 // the scanner hot path and so main.rs stays under 5 K lines.
 mod domain;
+mod ssl_scan;
 
 // ────────────────────────── CLI ──────────────────────────
 
@@ -149,6 +150,10 @@ struct Args {
     /// Disable TLS sniff on non-443 ports
     #[arg(long, default_value_t = false)]
     no_tls_sniff: bool,
+
+    /// Skip the native SSL recon pass (SAN + issuer extraction). Default-on.
+    #[arg(long, default_value_t = false)]
+    no_ssl_scan: bool,
 
     /// Disable adaptive concurrency controller
     #[arg(long, default_value_t = false)]
@@ -3994,6 +3999,9 @@ async fn async_main() -> anyhow::Result<()> {
     let diff_path = out_dir.join("scan_diff.json");
     let enrich_out = out_dir.join("enrichment_results.txt");
     let nuclei_out = out_dir.join("nuclei_results.txt");
+    // v0.15.9 — native SSL recon output (nuclei-bracketed format,
+    // matches `nuclei -tags ssl -severity info` line shape).
+    let ssl_findings_path = out_dir.join("ssl_findings.txt");
     // v0.14.2 — per-concern domain artefacts, written only when a scan
     // actually had domain input. Each is bare-per-line for trivial
     // piping into jq / grep / another tool — the classic Unix shape.
@@ -4044,6 +4052,7 @@ async fn async_main() -> anyhow::Result<()> {
             &diff_path,
             &enrich_out,
             &nuclei_out,
+            &ssl_findings_path,
             &domains_json_path,
             &origin_domains_path,
             &cdn_skipped_path,
@@ -5915,6 +5924,85 @@ async fn async_main() -> anyhow::Result<()> {
     }
     summary.enrich_ms = http_probe_ms;
 
+    // ── SSL recon (v0.15.9) ──
+    // Native TLS handshake + cert SAN/issuer extraction for every
+    // TLS-confirmed open port. Runs BEFORE main nuclei so SSL findings
+    // are on disk even if the user kills the long nuclei pass. Output
+    // matches `nuclei -tags ssl -severity info` line shape so it slots
+    // into the same downstream tooling. Independent of --no-nuclei:
+    // SSL scan is ~1-5 s for typical ASN scopes (native, no subprocess)
+    // so disabling nuclei shouldn't also kill SSL recon.
+    if !args.no_ssl_scan {
+        // Build target list: every TLS-confirmed port plus canonical
+        // HTTPS ports (which Phase-B's minimal ClientHello sometimes
+        // can't confirm but are HTTPS in practice). SNI = source_label
+        // (resolved domain) when available; falls back to IP literal.
+        let mut ssl_targets: Vec<ssl_scan::SslTarget> = Vec::new();
+        for op in &open_records {
+            let is_canonical_https = matches!(op.port, 443 | 4443 | 8443 | 9443 | 10443);
+            if !op.tls && !is_canonical_https {
+                continue;
+            }
+            let Ok(ip) = op.ip.parse::<IpAddr>() else { continue };
+            let sni = match op.source_label.as_deref() {
+                Some(d) if !d.is_empty() => d.to_string(),
+                _ => ip.to_string(),
+            };
+            ssl_targets.push(ssl_scan::SslTarget {
+                addr: SocketAddr::new(ip, op.port),
+                sni,
+            });
+        }
+
+        if !ssl_targets.is_empty() {
+            println!();
+            println!(
+                "{} {} {} target(s) · -C {}",
+                cfmt("1;36", "───"),
+                cfmt("1;36", "ssl recon"),
+                cfmt("1", &ssl_targets.len().to_string()),
+                args.probe_concurrency
+            );
+            let ssl_started = Instant::now();
+            let ssl_concurrency = args.probe_concurrency.max(1);
+            let records = ssl_scan::run(ssl_targets, ssl_concurrency).await;
+            let ssl_ms = ssl_started.elapsed().as_millis();
+
+            // Write file in nuclei-bracketed format + print to terminal.
+            let mut all_lines: Vec<String> = Vec::with_capacity(records.len() * 2);
+            for rec in &records {
+                for line in ssl_scan::format_record_lines(rec) {
+                    all_lines.push(line);
+                }
+            }
+            if !all_lines.is_empty() {
+                let _ = fs::write(&ssl_findings_path, all_lines.join("\n") + "\n");
+            }
+            // Terminal: print each finding line with light coloring so it
+            // matches the visual weight of the enrichment section above.
+            for line in &all_lines {
+                // Colorise [tag] [ssl] [info] prefix for readability;
+                // body stays plain so bracketed SAN list is grep-clean.
+                if let Some(rest) = line.strip_prefix("[ssl-dns-names] [ssl] [info] ") {
+                    println!("{} {}", cfmt("1;36", "[ssl-dns-names] [ssl] [info]"), rest);
+                } else if let Some(rest) = line.strip_prefix("[ssl-issuer] [ssl] [info] ") {
+                    println!("{} {}", cfmt("1;35", "[ssl-issuer]    [ssl] [info]"), rest);
+                } else {
+                    println!("{}", line);
+                }
+            }
+            println!(
+                "{} {} record(s) · {:.2}s · → {}",
+                cfmt("1;32", "✓ ssl:"),
+                records.len(),
+                ssl_ms as f64 / 1000.0,
+                cfmt("2", &ssl_findings_path.display().to_string())
+            );
+        }
+    } else if args.no_ssl_scan && !args.quiet {
+        println!("Skipping SSL recon (--no-ssl-scan).");
+    }
+
     // ── nuclei ──
     // Same guard as httpx: if the filtered nuclei target list is empty
     // (everything was non-HTTP like SSH/BGP/MySQL), skip the subprocess
@@ -6109,6 +6197,7 @@ async fn async_main() -> anyhow::Result<()> {
         (&jsonl_path,           "open_ports.jsonl    — per-port JSON records (the canonical output; all enrichment here)"),
         (&http_targets_path,    "http_targets.txt    — URL list of HTTP candidates (nuclei input)"),
         (&enrich_out,            "enrichment_results.txt — URL / status / length / title per HTTP target"),
+        (&ssl_findings_path,    "ssl_findings.txt    — SAN + issuer per TLS port (nuclei -tags ssl format)"),
         (&nuclei_out,           "nuclei_results.txt  — nuclei scan findings"),
         (&summary_path,         "scan_summary.json   — totals + counts + timings"),
         (&diff_path,            "scan_diff.json      — opens/closes since last run"),
