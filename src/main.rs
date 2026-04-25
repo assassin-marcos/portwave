@@ -467,37 +467,100 @@ fn resolve_path(
 // Raise the file-descriptor soft limit so thousands of concurrent sockets work.
 // On Windows this is a no-op: socket handles aren't bounded by RLIMIT_NOFILE.
 //
+// Returns the achieved soft limit (post-raise) so the caller can warn if it's
+// still too low for the configured concurrency. On Windows returns u64::MAX
+// (sentinel "no limit", suppresses the caller's warning).
+//
 // v0.12.4 bug fix: previously this hardcoded want=50_000 and always set
 // rlim_cur to that min'd with hard_max. On systems where the user had
 // already configured a *higher* soft limit (modern Linux defaults to
 // 1 048 576 on many distros), we were silently *downgrading* them to
 // 50 K, capping concurrency on large scans. Now we only upgrade.
+//
+// v0.17.2 macOS fix: setrlimit(RLIMIT_NOFILE, x) on macOS returns EINVAL when
+// x > kern.maxfilesperproc, regardless of what rlim_max reports (which can be
+// "unlimited"). launchd ships a 256 soft default for interactive shells, so
+// the previous implementation asked for 1 M, hit EINVAL silently (we ignored
+// the return value), and left users stuck at 256 FDs — capping concurrency
+// on every macOS scan and producing the high-local_err / adaptive-shrink
+// thrash users reported. We now query kern.maxfilesperproc via sysctlbyname()
+// and target that explicitly so the setrlimit() call actually succeeds.
 #[cfg(unix)]
-fn raise_fd_limit() {
+fn raise_fd_limit() -> u64 {
     unsafe {
         let mut rlim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            return;
+            return 0;
         }
-        // If the existing soft limit is already generous, leave it alone.
-        // Target 1 M — the Linux kernel ceiling since 5.x and enough
-        // headroom for any scan portwave realistically runs.
+        // Target 1 M — Linux kernel ceiling since 5.x and enough headroom for
+        // any portwave scan. The macOS path may clamp this further.
         let want: libc::rlim_t = 1_048_576;
         if rlim.rlim_cur >= want {
-            return;
+            return rlim.rlim_cur as u64;
         }
-        // Never exceed the hard limit (we'd need CAP_SYS_RESOURCE for that).
-        let new_cur = want.min(rlim.rlim_max);
-        if new_cur <= rlim.rlim_cur {
-            return; // can't improve — hard limit caps us below `want`
+
+        // Determine the kernel's actual per-process ceiling. On Linux,
+        // rlim_max already reflects this. On macOS, rlim_max can be RLIM_INFINITY
+        // while the kernel still rejects setrlimit > kern.maxfilesperproc.
+        #[cfg(target_os = "macos")]
+        let kernel_ceiling: libc::rlim_t = {
+            let mut val: libc::c_uint = 0;
+            let mut size: libc::size_t = std::mem::size_of::<libc::c_uint>();
+            let name = b"kern.maxfilesperproc\0";
+            let rc = libc::sysctlbyname(
+                name.as_ptr() as *const libc::c_char,
+                &mut val as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            );
+            if rc == 0 && val > 0 {
+                val as libc::rlim_t
+            } else {
+                // sysctl somehow failed; fall back to historical macOS
+                // OPEN_MAX so we at least raise above launchd's 256.
+                10_240
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let kernel_ceiling: libc::rlim_t = rlim.rlim_max;
+
+        let target = want.min(kernel_ceiling).min(rlim.rlim_max);
+        if target <= rlim.rlim_cur {
+            // Read back current and return — caller will warn if still tight.
+            return rlim.rlim_cur as u64;
         }
-        rlim.rlim_cur = new_cur;
-        libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+
+        rlim.rlim_cur = target;
+        // On macOS, also raise rlim_max so subsequent setrlimit calls (from
+        // child processes / libraries) aren't bounded by launchd's 256 soft
+        // ceiling masquerading as the inherited rlim_max.
+        #[cfg(target_os = "macos")]
+        if rlim.rlim_max < target {
+            rlim.rlim_max = target;
+        }
+
+        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rlim);
+
+        // Read back the actual effective limit. setrlimit may silently cap
+        // below the requested value on platforms / sandboxes not anticipated
+        // above, so we trust getrlimit's post-call value, not our request.
+        let mut check = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut check) == 0 {
+            check.rlim_cur as u64
+        } else {
+            0
+        }
     }
 }
 
 #[cfg(not(unix))]
-fn raise_fd_limit() {}
+fn raise_fd_limit() -> u64 {
+    // Windows: socket handles aren't subject to RLIMIT_NOFILE. Return a
+    // sentinel "effectively unlimited" so the caller's threshold check
+    // skips the warning on Windows.
+    u64::MAX
+}
 
 // The default port list is baked into the binary so `--update` automatically
 // ships the latest list — no separate asset, no path-resolution failure modes.
@@ -4009,7 +4072,23 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
-    raise_fd_limit();
+    // v0.17.2: raise FD limit (now macOS-aware via kern.maxfilesperproc) and
+    // warn if the result is still too tight for the configured concurrency.
+    // Default macOS interactive shells start at 256 (launchd default). Without
+    // the warning, users see only the symptom — heavy local_err + adaptive
+    // shrinks — and can't tell the cause is their shell, not the network.
+    let fd_limit = raise_fd_limit();
+    let needed_fds: u64 = (args.threads as u64) + (args.probe_concurrency as u64) + 1024;
+    if fd_limit > 0 && fd_limit < needed_fds {
+        eprintln!(
+            "[!] FD limit only {} — need ~{} for -t {} -C {}.",
+            fd_limit, needed_fds, args.threads, args.probe_concurrency
+        );
+        eprintln!("[!] Run BEFORE portwave:  ulimit -n 65535");
+        eprintln!("[!] Or persist:           echo 'ulimit -n 65535' >> ~/.zshrc");
+        eprintln!("[!] Continuing — expect heavy local_err + adaptive shrinks.");
+    }
+
     let cfg = load_config();
 
     // Non-blocking startup update check (cached 24 h, 3 s timeout).
