@@ -94,9 +94,8 @@ pub async fn pre_detect_and_filter(
 
     // Step 2 — probe each bucket with ≥ min_cluster members.
     // Probes run in parallel across buckets to keep wall time low.
-    let mut zones: Vec<WildcardZone> = Vec::new();
     let mut wildcarded_suffixes: HashMap<String, Vec<IpAddr>> = HashMap::new();
-    let mut probe_handles: Vec<(String, Vec<String>, tokio::task::JoinHandle<Option<Vec<IpAddr>>>)> = Vec::new();
+    let mut probe_handles: Vec<(String, tokio::task::JoinHandle<Option<Vec<IpAddr>>>)> = Vec::new();
 
     for (suffix, members) in &buckets {
         if members.len() < min_cluster {
@@ -107,38 +106,62 @@ pub async fn pre_detect_and_filter(
         let h = tokio::spawn(async move {
             probe_wildcard(&suffix_clone, &resolver_clone).await
         });
-        probe_handles.push((suffix.clone(), members.clone(), h));
+        probe_handles.push((suffix.clone(), h));
     }
 
-    for (suffix, members, h) in probe_handles {
+    for (suffix, h) in probe_handles {
         if let Ok(Some(ip_set)) = h.await {
-            wildcarded_suffixes.insert(suffix.clone(), ip_set.clone());
-            zones.push(WildcardZone {
-                suffix,
-                ip_set,
-                collapsed_count: members.len().saturating_sub(1),
-                representative: members[0].clone(),
-            });
+            wildcarded_suffixes.insert(suffix, ip_set);
         }
     }
 
-    // Step 3 — partition inputs into kept + collapsed.
-    let zone_reps: HashSet<&String> = zones.iter().map(|z| &z.representative).collect();
+    // Step 3 — partition inputs into kept + collapsed. For each
+    // domain we find its DEEPEST matching wildcarded ancestor zone
+    // (so `*.foo.example.com` wins over `*.example.com` when both
+    // are wildcarded). First-seen domain per zone becomes the
+    // representative; subsequent matches collapse.
+    let mut zone_reps: HashMap<String, String> = HashMap::new();
+    let mut zone_collapsed_count: HashMap<String, usize> = HashMap::new();
     let mut kept: Vec<String> = Vec::with_capacity(domains.len() / 4);
     let mut collapsed: Vec<String> = Vec::with_capacity(domains.len() / 2);
 
     for d in domains {
-        let suffix = parent_suffix(d, 3);
-        if wildcarded_suffixes.contains_key(&suffix) {
-            if zone_reps.contains(d) {
-                kept.push(d.clone());
-            } else {
-                collapsed.push(d.clone());
+        // ancestor_zones returns most-specific first → first-found
+        // is the deepest match.
+        let deepest_match: Option<String> = ancestor_zones(d)
+            .into_iter()
+            .find(|z| wildcarded_suffixes.contains_key(z));
+
+        match deepest_match {
+            Some(zone) => {
+                if zone_reps.contains_key(&zone) {
+                    *zone_collapsed_count.entry(zone).or_insert(0) += 1;
+                    collapsed.push(d.clone());
+                } else {
+                    zone_reps.insert(zone, d.clone());
+                    kept.push(d.clone());
+                }
             }
-        } else {
-            kept.push(d.clone());
+            None => {
+                kept.push(d.clone());
+            }
         }
     }
+
+    // Step 4 — build zone summaries.
+    let mut zones: Vec<WildcardZone> = wildcarded_suffixes
+        .into_iter()
+        .filter_map(|(suffix, ip_set)| {
+            let rep = zone_reps.get(&suffix)?.clone();
+            let collapsed_count = zone_collapsed_count.get(&suffix).copied().unwrap_or(0);
+            Some(WildcardZone {
+                suffix,
+                ip_set,
+                collapsed_count,
+                representative: rep,
+            })
+        })
+        .collect();
 
     // Stable order so re-runs produce deterministic output.
     zones.sort_by(|a, b| b.collapsed_count.cmp(&a.collapsed_count));
@@ -146,26 +169,55 @@ pub async fn pre_detect_and_filter(
     WildcardOutcome { kept, collapsed, zones }
 }
 
-/// Extract parent suffix at the given label depth. Returns the input
-/// unchanged if it has fewer labels than `depth`.
-fn parent_suffix(domain: &str, depth: usize) -> String {
+/// Compute ancestor zones for a domain, from most-specific to least-specific.
+/// Used for multi-tier wildcard detection — a name like
+/// "x.y.dev.example.com" might match either `*.y.dev.example.com`,
+/// `*.dev.example.com`, or `*.example.com`. We probe all candidates
+/// and pick the deepest confirmed match.
+///
+/// Stops at eTLD+1 (computed via `extract_root_domain`) so we never
+/// probe `*.com` or `*.co.uk`.
+fn ancestor_zones(domain: &str) -> Vec<String> {
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
     let labels: Vec<&str> = domain.split('.').collect();
-    if labels.len() <= depth {
-        return domain.to_string();
+    let etld_plus_1 = crate::domain::extract_root_domain(&domain);
+    let etld_label_count = etld_plus_1.matches('.').count() + 1;
+
+    let mut out: Vec<String> = Vec::new();
+    // Walk up from "second-to-leftmost" toward eTLD+1 inclusive.
+    // labels.len() = N. eTLD has `etld_label_count` labels. We add
+    // suffixes from depth `etld_label_count` to depth `N-1` (parent of
+    // input, grandparent, ... eTLD+1).
+    if labels.len() <= etld_label_count {
+        // 3-label input where eTLD+1 also has 3 labels (compound TLD)
+        // OR 2-label input — only meaningful candidate is eTLD+1.
+        out.push(etld_plus_1);
+        return out;
     }
-    labels[labels.len() - depth..].join(".")
+    // For "a.b.c.example.com" with eTLD+1 "example.com" (2 labels),
+    // candidates are: "b.c.example.com", "c.example.com", "example.com"
+    // (most specific first; skip the input itself).
+    for i in (etld_label_count..labels.len()).rev() {
+        let suffix = labels[labels.len() - i..].join(".");
+        out.push(suffix);
+    }
+    out
 }
 
-/// Group input domains by their parent suffix.
-fn bucket_by_suffix(domains: &[String], depth: usize) -> HashMap<String, Vec<String>> {
+/// Group input domains by candidate wildcard-zone suffix. Each domain
+/// is added to MULTIPLE buckets (one per ancestor level up to eTLD+1)
+/// so the same input contributes to wildcard detection at every
+/// possible parent zone.
+fn bucket_by_suffix(domains: &[String], _depth_unused: usize) -> HashMap<String, Vec<String>> {
     let mut buckets: HashMap<String, Vec<String>> = HashMap::new();
     for d in domains {
-        let suffix = parent_suffix(d, depth);
-        // Need at least 2 dots in the suffix → "X.Y.Z" form.
-        if suffix.matches('.').count() < 2 {
-            continue;
+        for suffix in ancestor_zones(d) {
+            // Suffix must have ≥ 1 dot (not a bare TLD).
+            if suffix.matches('.').count() < 1 {
+                continue;
+            }
+            buckets.entry(suffix).or_default().push(d.clone());
         }
-        buckets.entry(suffix).or_default().push(d.clone());
     }
     buckets
 }
@@ -268,16 +320,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parent_suffix_depth_3() {
-        assert_eq!(parent_suffix("a.b.c.example.com", 3), "c.example.com");
-        assert_eq!(parent_suffix("foo.example.com", 3), "foo.example.com");
-        assert_eq!(parent_suffix("example.com", 3), "example.com");
+    fn ancestor_zones_three_label_input() {
+        // 3-label input: only meaningful candidate is eTLD+1.
+        assert_eq!(ancestor_zones("host-1.gammanetworking.com"), vec!["gammanetworking.com"]);
     }
 
     #[test]
-    fn parent_suffix_short_returns_input() {
-        assert_eq!(parent_suffix("example.com", 5), "example.com");
-        assert_eq!(parent_suffix("a", 3), "a");
+    fn ancestor_zones_deeper_input() {
+        // "a.b.c.example.com" → candidates (most specific first):
+        // b.c.example.com, c.example.com, example.com
+        // (the input itself is excluded — it's the leaf, not an ancestor)
+        let zones = ancestor_zones("a.b.c.example.com");
+        assert_eq!(zones, vec!["b.c.example.com", "c.example.com", "example.com"]);
+    }
+
+    #[test]
+    fn ancestor_zones_compound_tld() {
+        // example.co.uk has eTLD+1 = "example.co.uk" (3 labels);
+        // 4-label "api.example.co.uk" should yield ["example.co.uk"].
+        let zones = ancestor_zones("api.example.co.uk");
+        assert_eq!(zones, vec!["example.co.uk"]);
+    }
+
+    #[test]
+    fn bucket_clusters_three_label_inputs() {
+        // The v0.16.6 fix: 3-label inputs all cluster under their eTLD+1.
+        let domains = vec![
+            "host-1.gammanetworking.com".to_string(),
+            "host-2.gammanetworking.com".to_string(),
+            "host-3.gammanetworking.com".to_string(),
+            "x.elsewhere.com".to_string(),
+        ];
+        let buckets = bucket_by_suffix(&domains, 0);
+        assert_eq!(buckets.get("gammanetworking.com").map(|v| v.len()), Some(3));
+        assert_eq!(buckets.get("elsewhere.com").map(|v| v.len()), Some(1));
     }
 
     #[test]
@@ -288,17 +364,10 @@ mod tests {
             "c.foo.example.com".to_string(),
             "x.bar.example.com".to_string(),
         ];
-        let buckets = bucket_by_suffix(&domains, 3);
-        assert_eq!(buckets.get("foo.example.com").map(|v| v.len()), Some(3));
-        assert_eq!(buckets.get("bar.example.com").map(|v| v.len()), Some(1));
-    }
-
-    #[test]
-    fn bucket_skips_too_short_suffixes() {
-        let domains = vec!["example.com".to_string(), "test.org".to_string()];
-        let buckets = bucket_by_suffix(&domains, 3);
-        // Suffix "example.com" only has 1 dot → skipped (need ≥2 dots).
-        assert!(buckets.is_empty());
+        let buckets = bucket_by_suffix(&domains, 0);
+        // Each domain ALSO contributes to eTLD+1 bucket now.
+        assert!(buckets.get("foo.example.com").map(|v| v.len()).unwrap_or(0) >= 3);
+        assert!(buckets.get("example.com").map(|v| v.len()).unwrap_or(0) >= 4);
     }
 
     #[test]

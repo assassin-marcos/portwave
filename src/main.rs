@@ -5628,7 +5628,10 @@ async fn async_main() -> anyhow::Result<()> {
     // those subprocesses finish (see rewrite below).
     let mut summary = summary;
     fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
-    println!("Summary: {:?}", summary_path);
+    // v0.16.6: removed mid-scan "Summary: <path>" announce — the path
+    // is in the final artefact table at the bottom of the run; printing
+    // it twice was clutter, especially in scripted wrappers that print
+    // their own summary section after.
 
     // Colored Totals line — at-a-glance scan health check:
     //   open     → bright green (hits are what the user came for)
@@ -5688,14 +5691,16 @@ async fn async_main() -> anyhow::Result<()> {
         fs::write(&diff_path, serde_json::to_string_pretty(&diff)?)?;
         let new_n = diff["new"].as_array().map(|a| a.len()).unwrap_or(0);
         let closed_n = diff["closed"].as_array().map(|a| a.len()).unwrap_or(0);
+        // v0.16.6: drop the path from these lines — it's in the
+        // artefact table at the end. Keep the informative diff numbers.
         if prior_set.is_empty() && open_records.is_empty() {
-            println!("Diff: no opens this run (and no prior in scope) → {:?}", diff_path);
+            // Silent: nothing to compare, no open ports either.
         } else if prior_set.is_empty() {
-            println!("Diff: first scan (no prior baseline) → {:?}", diff_path);
+            println!("Diff: first scan (no prior baseline)");
         } else {
             println!(
-                "Diff: +{} new, -{} closed, {} unchanged → {:?}",
-                new_n, closed_n, unchanged, diff_path
+                "Diff: +{} new, -{} closed, {} unchanged",
+                new_n, closed_n, unchanged
             );
         }
     }
