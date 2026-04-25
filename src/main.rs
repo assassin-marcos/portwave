@@ -64,8 +64,8 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     dns_timeout: u64,
 
-    /// Concurrent DNS lookups
-    #[arg(long, default_value_t = 50)]
+    /// Concurrent DNS lookups (raised from 50 in v0.16.1 — UDP queries, no FD pressure)
+    #[arg(long, default_value_t = 100)]
     dns_concurrency: usize,
 
     /// Scan only IPv4
@@ -131,8 +131,8 @@ struct Args {
     dry_run: bool,
 
     // ── Enrichment (HTTP / nuclei) ─────────────────────────
-    /// Concurrent HTTP probes
-    #[arg(short = 'C', long, default_value_t = 100)]
+    /// Concurrent HTTP probes (raised from 100 in v0.16.1)
+    #[arg(short = 'C', long, default_value_t = 150)]
     probe_concurrency: usize,
 
     /// Don't follow redirects (default: follow up to 3 hops)
@@ -4270,6 +4270,18 @@ async fn async_main() -> anyhow::Result<()> {
             args.dns_concurrency,
             args.dns_timeout
         );
+        // v0.16.1: live progress bar so users see DNS resolution
+        // landing in real time on huge scopes (we've seen 400k+ domain
+        // runs). Each completed domain prints "[+] domain → IPs" via
+        // pb.println so the bar redraws cleanly underneath.
+        let dns_pb = ProgressBar::new(domains.len() as u64);
+        dns_pb.set_style(
+            ProgressStyle::with_template(
+                "  [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({percent}%) DNS",
+            )
+            .unwrap(),
+        );
+        dns_pb.enable_steady_tick(Duration::from_millis(200));
         // v0.14.5: Ctrl+C during DNS would otherwise block on the resolver
         // until every in-flight lookup hit its `dns_timeout` — up to 3s
         // per stalled query even on small domain lists, worse on huge
@@ -4282,6 +4294,7 @@ async fn async_main() -> anyhow::Result<()> {
                 args.dns_concurrency.max(1),
                 dns_timeout,
                 cdn_table.clone(),
+                Some(dns_pb.clone()),
             ) => r,
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\n[!] Interrupted during DNS resolution — exiting.");
@@ -4586,6 +4599,23 @@ async fn async_main() -> anyhow::Result<()> {
     // Also scope-filter the diff baseline, so scan_diff reflects changes
     // *within the current scope only*.
     prior_set.retain(sockaddr_in_scope);
+
+    // v0.16.1: dedupe `nets` before Phase A. Sources can introduce
+    // duplicates: input file with the same CIDR listed twice, ASN
+    // lookups overlapping with --domain inputs, multiple subdomains
+    // resolving to the same IP. Without dedup we'd scan the same
+    // (IP, port) probe more than once. Fixed-prefix /32 + /128 entries
+    // also dedupe cleanly here.
+    let nets_before_dedupe = nets.len();
+    nets.sort_by(|a, b| a.network().cmp(&b.network()).then(a.prefix().cmp(&b.prefix())));
+    nets.dedup();
+    if nets.len() < nets_before_dedupe {
+        println!(
+            "[+] Deduped {} duplicate range(s) — {} unique target(s) to scan",
+            nets_before_dedupe - nets.len(),
+            nets.len()
+        );
+    }
 
     let total_estimate: u64 = nets
         .iter()

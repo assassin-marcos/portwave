@@ -45,17 +45,48 @@ pub enum InputKind {
     Invalid { raw: String, reason: &'static str },
 }
 
+/// Strip URL scheme + path + port (and userinfo, ports, brackets) from
+/// a line, returning the bare host. Returns None if the line doesn't
+/// look like a URL (no `://`). Lets users pipe httpx / gau / waymore
+/// output straight into `-i` without preprocessing.
+fn strip_url_to_host(raw: &str) -> Option<String> {
+    let after_scheme = raw.split_once("://")?.1;
+    // Drop path / query / fragment.
+    let host_port = after_scheme.split(['/', '?', '#']).next().unwrap_or(after_scheme);
+    // Drop userinfo (user:pass@host).
+    let host_port = host_port.split_once('@').map_or(host_port, |(_, h)| h);
+    // [ipv6]:port → just the IPv6 literal.
+    if let Some(stripped) = host_port.strip_prefix('[') {
+        if let Some(end) = stripped.find(']') {
+            return Some(stripped[..end].to_string());
+        }
+    }
+    // host:port (single colon, port is numeric) → just host.
+    if let Some((host, port)) = host_port.rsplit_once(':') {
+        if !host.contains(':') && port.parse::<u16>().is_ok() {
+            return Some(host.to_string());
+        }
+    }
+    Some(host_port.to_string())
+}
+
 /// Best-effort classification of one trimmed input line. Does not touch
 /// the network. Order of checks matters — CIDR first (has `/`), then
 /// range (`A-B` with both sides parseable), then bare IP, then domain.
 pub fn classify_input_line(raw: &str) -> InputKind {
-    let tok = raw.trim();
-    if tok.is_empty() {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return InputKind::Invalid {
             raw: raw.to_string(),
             reason: "empty line",
         };
     }
+
+    // v0.16.1: smart input. If the line looks like a URL
+    // (http://, https://, ws://, wss://, ftp://, …), pull just the host
+    // out so users can feed httpx / gau / waymore lists directly.
+    let host_only = strip_url_to_host(trimmed);
+    let tok: &str = host_only.as_deref().unwrap_or(trimmed);
 
     // CIDR — contains `/` and parses as IpNetwork
     if tok.contains('/') {
@@ -274,14 +305,17 @@ async fn resolve_one(
 /// Resolve many domains in parallel with bounded concurrency, tagging
 /// each result with a CDN provider name if any resolved IP lands in
 /// `cdn_table`. Order of returned results matches input order.
+///
+/// v0.16.1: optional `pb` parameter. When provided, each completed
+/// domain (resolved or failed) increments the bar, and a one-line
+/// summary of resolved hits is printed above it via `pb.println` so
+/// users see progress live on huge scopes (5k+ domains).
 pub async fn resolve_many(
     domains: &[String],
     concurrency: usize,
     timeout: Duration,
-    // v0.15.4: Arc-wrapped + split by IP family so each spawned task
-    // gets an O(1) Arc clone (not a per-task ~217 KB Vec clone) AND
-    // each lookup scans only the relevant family's Vec.
     cdn_table: std::sync::Arc<crate::CdnTables>,
+    pb: Option<indicatif::ProgressBar>,
 ) -> Vec<DomainResult> {
     if domains.is_empty() {
         return Vec::new();
@@ -326,8 +360,43 @@ pub async fn resolve_many(
     let mut results: Vec<Option<DomainResult>> = (0..domains.len()).map(|_| None).collect();
     while let Some(join) = set.next().await {
         if let Ok((idx, r)) = join {
+            // Live progress: emit a one-line summary for each completed
+            // domain ABOVE the progress bar (via pb.println). Resolved
+            // hits print their IPs + CDN tag; failures print the reason
+            // truncated. NXDOMAIN noise on huge scopes is suppressed —
+            // we only print the useful signal: "what resolved + where".
+            if let Some(p) = &pb {
+                if r.error.is_none() && !r.ips.is_empty() {
+                    let ip_preview: Vec<String> =
+                        r.ips.iter().take(3).map(|i| i.to_string()).collect();
+                    let extra = if r.ips.len() > 3 {
+                        format!(" (+{} more)", r.ips.len() - 3)
+                    } else {
+                        String::new()
+                    };
+                    let cdn_tag = match r.cdn {
+                        Some(t) => format!("  [CDN: {}]", t),
+                        None => String::new(),
+                    };
+                    p.println(format!(
+                        "[+] {} → {}{}{}",
+                        r.domain,
+                        ip_preview.join(","),
+                        extra,
+                        cdn_tag
+                    ));
+                }
+                p.inc(1);
+            }
             results[idx] = Some(r);
+        } else if let Some(p) = &pb {
+            // Task failed (panic/abort) — still tick the bar so the
+            // count stays accurate.
+            p.inc(1);
         }
+    }
+    if let Some(p) = pb {
+        p.finish_and_clear();
     }
     // flatten (not unwrap): a panicked / aborted DNS task leaves its
     // slot None — drop it instead of crashing the whole scan.
@@ -428,5 +497,74 @@ mod tests {
         assert!(!keep_scannable(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert!(!keep_scannable(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
         assert!(keep_scannable(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    // v0.16.1 — URL-style inputs from httpx / gau / waymore lists.
+    #[test]
+    fn url_http_strips_to_host() {
+        assert!(matches!(
+            classify_input_line("http://example.com"),
+            InputKind::Domain(d) if d == "example.com"
+        ));
+    }
+
+    #[test]
+    fn url_https_with_path_strips() {
+        assert!(matches!(
+            classify_input_line("https://example.com/admin/users.php?id=1"),
+            InputKind::Domain(d) if d == "example.com"
+        ));
+    }
+
+    #[test]
+    fn url_with_port_strips_port() {
+        assert!(matches!(
+            classify_input_line("https://example.com:8443/login"),
+            InputKind::Domain(d) if d == "example.com"
+        ));
+    }
+
+    #[test]
+    fn url_with_userinfo_strips() {
+        assert!(matches!(
+            classify_input_line("https://user:pass@example.com/path"),
+            InputKind::Domain(d) if d == "example.com"
+        ));
+    }
+
+    #[test]
+    fn url_to_ip_strips() {
+        assert!(matches!(
+            classify_input_line("http://1.2.3.4:8080/login"),
+            InputKind::Ipv4(_)
+        ));
+    }
+
+    #[test]
+    fn url_to_ipv6_strips_brackets() {
+        assert!(matches!(
+            classify_input_line("https://[2606:4700::1111]:443/"),
+            InputKind::Ipv6(_)
+        ));
+    }
+
+    #[test]
+    fn bare_host_with_path_still_invalid() {
+        // No `://` → NOT a URL → existing "contains '/'" rule applies.
+        // We don't auto-strip bare paths to avoid mis-handling
+        // CIDR-looking inputs.
+        assert!(matches!(
+            classify_input_line("example.com/admin"),
+            InputKind::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn cidr_still_works() {
+        // Sanity: URL-stripper must not touch valid CIDRs.
+        assert!(matches!(
+            classify_input_line("10.0.0.0/24"),
+            InputKind::Cidr(_)
+        ));
     }
 }
