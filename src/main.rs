@@ -164,6 +164,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_ssl_scan: bool,
 
+    /// OPEN PORTS rendering: `host` (default for ≤20 hosts), `port` (default for >20 hosts), or `auto`.
+    #[arg(long, default_value = "auto")]
+    group_by: String,
+
     /// Disable adaptive concurrency controller
     #[arg(long, default_value_t = false)]
     no_adaptive: bool,
@@ -5749,47 +5753,34 @@ async fn async_main() -> anyhow::Result<()> {
         )
     );
 
-    // Per-host grouping (v0.12.3): emit the IP once, then list every port
-    // on that host indented beneath it — same layout as `nmap` uses.
-    // Drastically easier to visually parse on multi-host scans where the
-    // same IP used to repeat on every line. open_records is sorted by
-    // (IpAddr, port) so we walk it linearly and track the "current host".
-    let mut current_ip: Option<String> = None;
-    for op in &open_records {
-        let host = match op.ip.parse::<IpAddr>() {
-            Ok(IpAddr::V6(v)) => format!("[{}]", v),
-            _ => op.ip.clone(),
-        };
-        let proto = op.protocol.as_deref().unwrap_or("unknown");
-        let banner = op.banner.as_deref().unwrap_or("");
-
-        // Emit a host header when the IP changes. v0.14.0: when the scan
-        // came from a domain input, the header reads "example.com → 1.2.3.4"
-        // so the user's intent is preserved in the output; otherwise we
-        // keep the bare-IP header from v0.12.3+.
-        if current_ip.as_ref() != Some(&op.ip) {
-            if current_ip.is_some() {
-                println!();
-            }
-            match &op.source_label {
-                Some(dom) => {
-                    println!(
-                        "  {} {} {}",
-                        cfmt("1", dom),
-                        cfmt("2", "→"),
-                        cfmt("1", &host),
-                    );
-                }
-                None => {
-                    println!("  {}", cfmt("1", &host));
-                }
-            }
-            current_ip = Some(op.ip.clone());
+    // v0.16.5: choose grouping mode. By-host is the classic nmap-like
+    // layout (one block per host, ports indented). On big domain-mode
+    // scans where the same ports recur across hundreds of hosts, that
+    // layout repeats `:80 [http]` and `:443 [https]` thousands of
+    // times. By-port grouping shows each port once with its host list,
+    // making "what ports are exposed across the scope?" answerable at
+    // a glance.
+    //
+    // Auto mode: by-host below 20 unique hosts, by-port above. Manual
+    // override via --group-by host|port.
+    let unique_host_count: usize = {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        for op in &open_records {
+            set.insert(&op.ip);
         }
+        set.len()
+    };
+    let group_by_port = match args.group_by.to_ascii_lowercase().as_str() {
+        "port" => true,
+        "host" => false,
+        _ => unique_host_count > 20, // auto
+    };
 
-        // Colored [proto, tls, cdn:x] tag bundle. TLS is only printed as
-        // a separate tag when the protocol isn't already "https" (which
-        // implies TLS) — avoids the redundant "[https, tls]".
+    // Helper: render the port-tag bundle + title + redirect. Reused by
+    // both grouping modes so output stays consistent.
+    let render_tags_suffix = |op: &OpenPort| -> (String, String, String) {
+        let proto = op.protocol.as_deref().unwrap_or("unknown");
         let mut tags: Vec<String> = Vec::with_capacity(3);
         tags.push(color_protocol(proto));
         if op.tls && proto != "https" {
@@ -5799,14 +5790,6 @@ async fn async_main() -> anyhow::Result<()> {
             tags.push(cfmt("35", &format!("cdn:{}", c)));
         }
         let tag_bundle = format!("[{}]", tags.join(cfmt("2", ", ").as_str()));
-
-        // Port column in dim white, tag bundle colored, banner colored
-        // by HTTP-status class (2xx green, 3xx cyan, 4xx yellow, 5xx red).
-        let port_col = cfmt("2", &format!(":{:<5}", op.port));
-
-        // v0.14.9 — render title and redirect target after the banner.
-        // Title is dimmed italic-ish; redirect target appended with an arrow.
-        // Keeps non-HTTP rows (SSH banners etc.) visually unchanged.
         let title_suffix = match &op.title {
             Some(t) if !t.is_empty() => format!("  {}", cfmt("2", &format!("· \"{}\"", t))),
             _ => String::new(),
@@ -5815,22 +5798,114 @@ async fn async_main() -> anyhow::Result<()> {
             Some(u) => format!("  {} {}", cfmt("2", "→"), cfmt("36", u)),
             None => String::new(),
         };
+        (tag_bundle, title_suffix, redirect_suffix)
+    };
 
-        if banner.is_empty() {
+    if !group_by_port {
+        // ── By-host (classic) ──
+        // Per-host grouping (v0.12.3): emit the IP once, then list every
+        // port on that host indented beneath it — same layout as `nmap`.
+        let mut current_ip: Option<String> = None;
+        for op in &open_records {
+            let host = match op.ip.parse::<IpAddr>() {
+                Ok(IpAddr::V6(v)) => format!("[{}]", v),
+                _ => op.ip.clone(),
+            };
+            let banner = op.banner.as_deref().unwrap_or("");
+
+            if current_ip.as_ref() != Some(&op.ip) {
+                if current_ip.is_some() {
+                    println!();
+                }
+                match &op.source_label {
+                    Some(dom) => {
+                        println!(
+                            "  {} {} {}",
+                            cfmt("1", dom),
+                            cfmt("2", "→"),
+                            cfmt("1", &host),
+                        );
+                    }
+                    None => {
+                        println!("  {}", cfmt("1", &host));
+                    }
+                }
+                current_ip = Some(op.ip.clone());
+            }
+
+            let (tag_bundle, title_suffix, redirect_suffix) = render_tags_suffix(op);
+            let port_col = cfmt("2", &format!(":{:<5}", op.port));
+
+            if banner.is_empty() {
+                println!("      {} {}{}{}", port_col, tag_bundle, title_suffix, redirect_suffix);
+            } else {
+                let b: String = banner.chars().take(110).collect();
+                println!(
+                    "      {} {}  {}{}{}",
+                    port_col,
+                    tag_bundle,
+                    color_banner_status(&b),
+                    title_suffix,
+                    redirect_suffix
+                );
+            }
+        }
+    } else {
+        // ── By-port (v0.16.5, auto for >20 hosts) ──
+        // Group open_records by port number, then list one line per
+        // host inside each port block. Ports rendered ascending so the
+        // common ones (80, 443, 8443) come first.
+        use std::collections::BTreeMap;
+        let mut by_port: BTreeMap<u16, Vec<&OpenPort>> = BTreeMap::new();
+        for op in &open_records {
+            by_port.entry(op.port).or_default().push(op);
+        }
+
+        let mut first_block = true;
+        for (port, ops) in &by_port {
+            if !first_block {
+                println!();
+            }
+            first_block = false;
+
+            // Block header: ":<port>  (N host(s))"
             println!(
-                "      {} {}{}{}",
-                port_col, tag_bundle, title_suffix, redirect_suffix
+                "  {} {}",
+                cfmt("1;36", &format!(":{}", port)),
+                cfmt("2", &format!("({} host(s))", ops.len()))
             );
-        } else {
-            let b: String = banner.chars().take(110).collect();
-            println!(
-                "      {} {}  {}{}{}",
-                port_col,
-                tag_bundle,
-                color_banner_status(&b),
-                title_suffix,
-                redirect_suffix
-            );
+
+            for op in ops {
+                let host_label = match (op.ip.parse::<IpAddr>(), &op.source_label) {
+                    (Ok(IpAddr::V6(v)), Some(dom)) => format!("{} → [{}]", dom, v),
+                    (Ok(IpAddr::V6(v)), None) => format!("[{}]", v),
+                    (_, Some(dom)) => format!("{} → {}", dom, op.ip),
+                    (_, None) => op.ip.clone(),
+                };
+                let (tag_bundle, title_suffix, redirect_suffix) = render_tags_suffix(op);
+                let banner = op.banner.as_deref().unwrap_or("");
+                if banner.is_empty() {
+                    println!(
+                        "      {}  {}{}{}",
+                        cfmt("1", &host_label),
+                        tag_bundle,
+                        title_suffix,
+                        redirect_suffix
+                    );
+                } else {
+                    // In by-port mode banners get tighter (80 chars) so
+                    // long lists stay readable on a 120-col terminal.
+                    let b: String = banner.chars().take(80).collect();
+                    println!(
+                        "      {}  {}  {}{}{}",
+                        cfmt("1", &host_label),
+                        tag_bundle,
+                        color_banner_status(&b),
+                        title_suffix,
+                        redirect_suffix
+                    );
+                }
+            }
         }
     }
 
