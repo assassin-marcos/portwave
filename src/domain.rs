@@ -446,7 +446,7 @@ fn cdn_tag_first(ip: IpAddr, table: &crate::CdnTables) -> Option<&'static str> {
 /// Examples:
 ///   "csync.solar.cat.com"          → "cat.com"
 ///   "*.eo-ignition.example.co.uk"  → "example.co.uk"
-///   "ai.insightplatform.com."      → "insightplatform.com"
+///   "ai.example.com."              → "example.com"
 pub fn extract_root_domain(host: &str) -> String {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let host = host.strip_prefix("*.").unwrap_or(&host);
@@ -786,9 +786,9 @@ mod tests {
     #[test]
     fn platform_keeps_real_targets() {
         // These are scan targets, NOT platforms — must NOT be filtered.
-        assert!(!is_platform_domain("deere.com"));
-        assert!(!is_platform_domain("johndeerecloud.com"));
-        assert!(!is_platform_domain("adityasec.com"));
+        assert!(!is_platform_domain("tenant.example"));
+        assert!(!is_platform_domain("tenant-cloud.example"));
+        assert!(!is_platform_domain("customer.example"));
         assert!(!is_platform_domain("example.co.uk"));
     }
 

@@ -46,8 +46,8 @@ use tokio::sync::Semaphore;
 /// thousands of simultaneous DNS queries against the upstream resolver
 /// pool (15 trusted upstreams). Free-tier Cloudflare / Google rate
 /// limits dropped a fraction of those, and combined with the strict
-/// "≥2-of-3 probes must succeed" vote rule, parent zones with high
-/// fan-out (e.g. `*.ai.vwgroup.com` with 50k+ children) silently
+/// "≥2-of-3 probes must succeed" vote rule, high-fan-out parent zones
+/// (e.g. a wildcard with tens of thousands of children) silently
 /// escaped detection — letting tens of thousands of duplicate domains
 /// survive into `resolve_many`. Bounding to 64 concurrent probes keeps
 /// upstream load at ~192 queries/sec which is well within free-tier
@@ -63,7 +63,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// One detected wildcard zone.
 #[derive(Debug, Clone)]
 pub struct WildcardZone {
-    /// Common suffix of the bucket — e.g. "ghns-web-platform-r2-prod-standalone4.eu.e00.c01.johndeerecloud.com"
+    /// Common suffix of the bucket — e.g. "r2-prod-standalone4.eu.e00.c01.tenant-cloud.example"
     pub suffix: String,
     /// Wildcard's fingerprint IPs (overlap of the 3 probe results).
     pub ip_set: Vec<IpAddr>,
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn ancestor_zones_three_label_input() {
         // 3-label input: only meaningful candidate is eTLD+1.
-        assert_eq!(ancestor_zones("host-1.gammanetworking.com"), vec!["gammanetworking.com"]);
+        assert_eq!(ancestor_zones("host-1.test-net.example"), vec!["test-net.example"]);
     }
 
     #[test]
@@ -392,13 +392,13 @@ mod tests {
     fn bucket_clusters_three_label_inputs() {
         // The v0.16.6 fix: 3-label inputs all cluster under their eTLD+1.
         let domains = vec![
-            "host-1.gammanetworking.com".to_string(),
-            "host-2.gammanetworking.com".to_string(),
-            "host-3.gammanetworking.com".to_string(),
+            "host-1.test-net.example".to_string(),
+            "host-2.test-net.example".to_string(),
+            "host-3.test-net.example".to_string(),
             "x.elsewhere.com".to_string(),
         ];
         let buckets = bucket_by_suffix(&domains, 0);
-        assert_eq!(buckets.get("gammanetworking.com").map(|v| v.len()), Some(3));
+        assert_eq!(buckets.get("test-net.example").map(|v| v.len()), Some(3));
         assert_eq!(buckets.get("elsewhere.com").map(|v| v.len()), Some(1));
     }
 

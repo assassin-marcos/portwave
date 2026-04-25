@@ -118,13 +118,6 @@ change, rerun the `grep` at the bottom of this file and update.
   - Ctrl+C handling lives at the **caller** (`main.rs:4197`), not here
 - `336`  `cdn_tag_first` / `347` `cdn_breakdown`
 
-## Smoke-test commands (CLAUDE.md rule #2)
-
-```sh
-./target/release/portwave t 109.123.239.180 -p 22,80,443 --no-nuclei
-./target/release/portwave t -d hack.adityasec.com --no-nuclei
-```
-
 ## Regenerating this map
 
 From repo root:

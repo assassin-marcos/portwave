@@ -9,8 +9,8 @@
 // Output goal: nuclei-style bracketed lines so users can pipe the file
 // into the same downstream tooling they already use:
 //
-//   [ssl-dns-names] [ssl] [info] adityasec.com:443 ["adityasec.com"]
-//   [ssl-issuer]    [ssl] [info] adityasec.com:443 ["GoDaddy.com"]
+//   [ssl-dns-names] [ssl] [info] example.com:443 ["example.com"]
+//   [ssl-issuer]    [ssl] [info] example.com:443 ["GoDaddy.com"]
 //
 // Why these two templates only:
 //   - ssl-dns-names: the SAN list — primary signal for "what other

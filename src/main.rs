@@ -4063,7 +4063,7 @@ async fn async_main() -> anyhow::Result<()> {
             eprintln!();
             eprintln!("examples:");
             eprintln!("  portwave bb 203.0.113.0/24                     # CIDR");
-            eprintln!("  portwave bb -d adityasec.com                   # single domain");
+            eprintln!("  portwave bb -d example.com                     # single domain");
             eprintln!("  portwave bb -i subdomains.txt --no-enrich --no-nuclei");
             eprintln!("  portwave bb -a AS13335 -e 203.0.113.64/26      # ASN + exclude");
             eprintln!();
@@ -5033,8 +5033,8 @@ async fn async_main() -> anyhow::Result<()> {
     //
     // Old flow: Phase A → collect hits → Phase B enrichment. Two phases
     // in series; enrichment couldn't start until Phase A's last probe
-    // timed out. On the 43.230.180.0/24 × 3-port benchmark that meant
-    // 1.74 s Phase A + 1.29 s Phase B = 3.03 s total.
+    // timed out. On a 256-host /24 × 3-port benchmark that meant
+    // ~1.7 s Phase A + ~1.3 s Phase B = ~3 s total.
     //
     // New flow: the moment a Phase A worker finds an open port, we spawn
     // its enrichment task here — concurrently with the remaining Phase A
