@@ -481,6 +481,96 @@ pub fn extract_root_domain(host: &str) -> String {
     }
 }
 
+/// Third-party platform / SSO / CDN root domains that show up in cert
+/// SANs but are NOT the scan target. Filtered out of the SSL roots
+/// summary so attack-surface mapping stays focused on the org's own
+/// infrastructure. Users running `portwave -d corp.com` don't care
+/// that corp.com's identity provider is `*.microsoftonline.com` — they
+/// care about other corp.com-owned roots.
+///
+/// Categories covered:
+///   - Microsoft Identity / Azure AD / Office 365 SSO
+///   - Cloudflare (Access, edge)
+///   - Major SSO platforms (Okta, Auth0, OneLogin, Ping)
+///   - PaaS (Heroku, Netlify, Vercel)
+///   - Git platforms (GitHub Pages)
+///   - Generic CDN / cloud (Amazon, Akamai, Fastly, Google APIs)
+///
+/// Maintained as a sorted slice for binary_search → O(log n) check
+/// per SAN. Keeping it inline (no external file / PSL crate) so it
+/// ships in the binary unchanged across releases.
+const PLATFORM_DOMAINS: &[&str] = &[
+    // Microsoft Identity / Azure / Office 365
+    "authapp.net",
+    "azure-int.net",
+    "azure.net",
+    "b2clogin.com",
+    "ccsctp.com",
+    "live-int.com",
+    "live.com",
+    "microsoft.com",
+    "microsoftazuread-sso.com",
+    "microsoft-ppe.com",
+    "microsoftonline-p-int.com",
+    "microsoftonline-p-int.net",
+    "microsoftonline-p.com",
+    "microsoftonline-p.net",
+    "microsoftonline.com",
+    "msidentity.com",
+    "passport-int.com",
+    "windows-int.net",
+    "windows-ppe.net",
+    "windows.net",
+    // Cloudflare
+    "cloudflare.com",
+    "cloudflareaccess.com",
+    "cloudflareclient.com",
+    "cloudflareinsights.com",
+    // SSO / identity providers
+    "auth0.com",
+    "okta.com",
+    "oktacdn.com",
+    "oktapreview.com",
+    "onelogin.com",
+    "pingidentity.com",
+    // PaaS / hosting
+    "fly.dev",
+    "github.io",
+    "githubusercontent.com",
+    "herokuapp.com",
+    "herokussl.com",
+    "netlify.app",
+    "netlify.com",
+    "render.com",
+    "vercel.app",
+    "vercel.com",
+    // CDN / cloud
+    "akamaiedge.net",
+    "akamaihd.net",
+    "akamaized.net",
+    "amazonaws.com",
+    "cloudfront.net",
+    "fastly.net",
+    "fastlylb.net",
+    "googleapis.com",
+    "googleusercontent.com",
+    "gstatic.com",
+    // Telemetry / analytics that show up in TLS SANs but are noise
+    "doubleclick.net",
+    "google-analytics.com",
+    "googletagmanager.com",
+];
+
+/// True if a root domain (eTLD+1) is a third-party platform we should
+/// drop from the SSL-roots attack-surface summary.
+pub fn is_platform_domain(root: &str) -> bool {
+    let r = root.to_ascii_lowercase();
+    // Linear scan is fine — list is ~50 entries, called per-SAN
+    // (~hundreds per scan max). For huge lists we could presort +
+    // binary_search, but this isn't on a hot loop.
+    PLATFORM_DOMAINS.iter().any(|p| *p == r)
+}
+
 /// Collapse many `DomainResult`s into a compact "by CDN provider"
 /// histogram, for the pre-scan summary.
 pub fn cdn_breakdown(results: &[DomainResult]) -> Vec<(&'static str, usize)> {
@@ -666,5 +756,45 @@ mod tests {
     fn root_domain_too_short() {
         assert_eq!(extract_root_domain("localhost"), "localhost");
         assert_eq!(extract_root_domain("a"), "a");
+    }
+
+    // v0.16.4 — platform-domain denylist
+    #[test]
+    fn platform_microsoft_identity() {
+        assert!(is_platform_domain("microsoft.com"));
+        assert!(is_platform_domain("microsoftonline.com"));
+        assert!(is_platform_domain("windows.net"));
+        assert!(is_platform_domain("live.com"));
+        assert!(is_platform_domain("msidentity.com"));
+        assert!(is_platform_domain("b2clogin.com"));
+        assert!(is_platform_domain("microsoftazuread-sso.com"));
+    }
+
+    #[test]
+    fn platform_cloudflare() {
+        assert!(is_platform_domain("cloudflare.com"));
+        assert!(is_platform_domain("cloudflareaccess.com"));
+    }
+
+    #[test]
+    fn platform_paas() {
+        assert!(is_platform_domain("herokuapp.com"));
+        assert!(is_platform_domain("netlify.app"));
+        assert!(is_platform_domain("vercel.app"));
+    }
+
+    #[test]
+    fn platform_keeps_real_targets() {
+        // These are scan targets, NOT platforms — must NOT be filtered.
+        assert!(!is_platform_domain("deere.com"));
+        assert!(!is_platform_domain("johndeerecloud.com"));
+        assert!(!is_platform_domain("adityasec.com"));
+        assert!(!is_platform_domain("example.co.uk"));
+    }
+
+    #[test]
+    fn platform_case_insensitive() {
+        assert!(is_platform_domain("Microsoft.com"));
+        assert!(is_platform_domain("WINDOWS.NET"));
     }
 }

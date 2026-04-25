@@ -6159,9 +6159,19 @@ async fn async_main() -> anyhow::Result<()> {
             if is_domain_mode {
                 use std::collections::HashSet;
                 let mut roots: HashSet<String> = HashSet::new();
+                let mut filtered_platform = 0usize;
                 for rec in &unique {
                     for san in &rec.sans {
-                        roots.insert(domain::extract_root_domain(san));
+                        let root = domain::extract_root_domain(san);
+                        // v0.16.4: drop third-party platform domains
+                        // (MS Identity, Cloudflare Access, Okta, etc.)
+                        // — they're not the scan target, just artifacts
+                        // of corp SSO / CDN / identity setups.
+                        if domain::is_platform_domain(&root) {
+                            filtered_platform += 1;
+                            continue;
+                        }
+                        roots.insert(root);
                     }
                 }
                 let mut sorted_roots: Vec<String> = roots.into_iter().collect();
@@ -6170,12 +6180,23 @@ async fn async_main() -> anyhow::Result<()> {
                 if !sorted_roots.is_empty() {
                     let _ = fs::write(&ssl_root_domains_path, sorted_roots.join("\n") + "\n");
                     println!();
-                    println!(
-                        "{} {} · {} unique root domain(s) discovered",
-                        cfmt("1;36", "───"),
-                        cfmt("1;36", "ssl roots"),
-                        sorted_roots.len()
-                    );
+                    let header = if filtered_platform > 0 {
+                        format!(
+                            "{} {} · {} unique root domain(s) discovered ({} platform/SSO domain(s) filtered)",
+                            cfmt("1;36", "───"),
+                            cfmt("1;36", "ssl roots"),
+                            sorted_roots.len(),
+                            filtered_platform
+                        )
+                    } else {
+                        format!(
+                            "{} {} · {} unique root domain(s) discovered",
+                            cfmt("1;36", "───"),
+                            cfmt("1;36", "ssl roots"),
+                            sorted_roots.len()
+                        )
+                    };
+                    println!("{}", header);
                     for root in &sorted_roots {
                         println!("  {}", cfmt("32", root));
                     }
