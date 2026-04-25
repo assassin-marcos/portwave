@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
 // the scanner hot path and so main.rs stays under 5 K lines.
 mod domain;
 mod ssl_scan;
+mod wildcard;
 
 // ────────────────────────── CLI ──────────────────────────
 
@@ -67,6 +68,14 @@ struct Args {
     /// Concurrent DNS lookups (raised from 50 in v0.16.1 — UDP queries, no FD pressure)
     #[arg(long, default_value_t = 100)]
     dns_concurrency: usize,
+
+    /// Skip wildcard-DNS pre-filter (default-on: detects wildcard zones BEFORE resolving descendants, skipping 90% of DNS work on big lists).
+    #[arg(long, default_value_t = false)]
+    no_wildcard_filter: bool,
+
+    /// Minimum bucket size to trigger wildcard probing (default 10; raise on noisy targets).
+    #[arg(long, default_value_t = 10)]
+    wildcard_min_cluster: usize,
 
     /// Scan only IPv4
     #[arg(long, default_value_t = false)]
@@ -4009,6 +4018,9 @@ async fn async_main() -> anyhow::Result<()> {
     let origin_domains_path = out_dir.join("origin_domains.txt"); // resolved, not-CDN, scanned
     let cdn_skipped_path = out_dir.join("cdn_skipped.txt");    // CDN-fronted, skipped
     let dns_failed_path = out_dir.join("dns_failed.txt");      // NXDOMAIN / timeout / no records
+    // v0.16.2: wildcard pre-filter artefacts.
+    let wildcard_zones_path = out_dir.join("wildcard_zones.txt");      // detected zones
+    let wildcard_collapsed_path = out_dir.join("wildcard_collapsed.txt"); // names skipped
 
     // Always capture prior opens (independent of --no-resume) so scan_diff
     // can compare this run against the last one.
@@ -4057,6 +4069,8 @@ async fn async_main() -> anyhow::Result<()> {
             &origin_domains_path,
             &cdn_skipped_path,
             &dns_failed_path,
+            &wildcard_zones_path,
+            &wildcard_collapsed_path,
         ];
         let mut removed = 0usize;
         for p in wipe {
@@ -4264,6 +4278,70 @@ async fn async_main() -> anyhow::Result<()> {
     if !domains.is_empty() {
         let cdn_table = load_cdn_ranges();
         let dns_timeout = Duration::from_secs(args.dns_timeout.max(1));
+
+        // v0.16.2: wildcard pre-filter. Detects wildcard zones in the
+        // input list BEFORE resolving the bulk — so we skip ~90% of
+        // DNS queries on huge wildcard-heavy scopes (corp dev/QA infra,
+        // multi-tenant SaaS targets). Each detected zone gets one
+        // representative kept; rest collapsed to wildcard_collapsed.txt
+        // for audit. IP-level scan coverage is preserved (Phase A still
+        // sees the wildcard's fingerprint IPs via the representative).
+        let (filtered_domains, wildcard_collapsed, wildcard_zones) =
+            if !args.no_wildcard_filter && domains.len() >= args.wildcard_min_cluster {
+                let probe_resolver = domain::build_resolver(dns_timeout);
+                let wc_started = Instant::now();
+                let outcome = wildcard::pre_detect_and_filter(
+                    &domains,
+                    &probe_resolver,
+                    args.wildcard_min_cluster,
+                ).await;
+                let wc_ms = wc_started.elapsed().as_millis();
+                if !outcome.zones.is_empty() {
+                    println!(
+                        "{} {} · {} zone(s) · {} domain(s) collapsed · {:.2}s",
+                        cfmt("1;36", "───"),
+                        cfmt("1;36", "wildcard filter"),
+                        outcome.zones.len(),
+                        outcome.collapsed.len(),
+                        wc_ms as f64 / 1000.0
+                    );
+                    for z in outcome.zones.iter().take(20) {
+                        let ip_preview: Vec<String> =
+                            z.ip_set.iter().take(3).map(|i| i.to_string()).collect();
+                        println!(
+                            "  *.{} → {}  ({} collapsed)",
+                            cfmt("33", &z.suffix),
+                            cfmt("2", &ip_preview.join(",")),
+                            z.collapsed_count
+                        );
+                    }
+                    if outcome.zones.len() > 20 {
+                        println!("  …{} more zones (see wildcard_zones.txt)", outcome.zones.len() - 20);
+                    }
+                    // Persist artefacts.
+                    let zone_lines: Vec<String> = outcome.zones.iter().map(|z| {
+                        let ips: Vec<String> = z.ip_set.iter().map(|i| i.to_string()).collect();
+                        format!("*.{}\t{}\t{}\t{}", z.suffix, ips.join(","), z.representative, z.collapsed_count)
+                    }).collect();
+                    let _ = fs::write(&wildcard_zones_path, zone_lines.join("\n") + "\n");
+                    if !outcome.collapsed.is_empty() {
+                        let _ = fs::write(&wildcard_collapsed_path, outcome.collapsed.join("\n") + "\n");
+                    }
+                }
+                (outcome.kept, outcome.collapsed, outcome.zones)
+            } else {
+                (domains.clone(), Vec::new(), Vec::new())
+            };
+
+        // Replace the local `domains` we use for resolution with the
+        // filtered list. Originals stay in `domains` for any later
+        // reporting if needed (we don't currently need them).
+        let domains = filtered_domains;
+        // Keep the wildcard-zones map for potential post-resolution
+        // tagging in domains.json (currently unused but ready).
+        let _wildcard_zones = wildcard_zones;
+        let _wildcard_collapsed = wildcard_collapsed;
+
         println!(
             "Resolving {} domain(s) ({} concurrent, {}s timeout)…",
             domains.len(),
@@ -6263,6 +6341,8 @@ async fn async_main() -> anyhow::Result<()> {
         (&summary_path,         "scan_summary.json   — totals + counts + timings"),
         (&diff_path,            "scan_diff.json      — opens/closes since last run"),
         (&domains_json_path,    "domains.json        — domain resolution + CDN detection (structured)"),
+        (&wildcard_zones_path,  "wildcard_zones.txt  — detected wildcard zones (suffix\\tIPs\\trep\\tcollapsed_count)"),
+        (&wildcard_collapsed_path, "wildcard_collapsed.txt — domains collapsed under wildcard zones (audit)"),
         (&origin_domains_path,  "origin_domains.txt  — domains that survived CDN filter (pipe to httpx/ffuf)"),
         (&cdn_skipped_path,     "cdn_skipped.txt     — domains skipped as CDN-fronted (domain<TAB>provider)"),
         (&dns_failed_path,      "dns_failed.txt      — domains with NXDOMAIN / timeout (domain<TAB>reason)"),

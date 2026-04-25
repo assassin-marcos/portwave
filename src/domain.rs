@@ -185,35 +185,45 @@ pub struct DomainResult {
     pub error: Option<String>,
 }
 
-/// Build a hickory resolver pointing at Cloudflare + Google + Quad9 upstreams
+/// Build a hickory resolver pointing at 15 trusted public upstreams
 /// with the caller's timeout budget. Fresh resolver per call so state
 /// (cache / in-flight) is scoped to the scan.
 ///
-/// v0.14.15: added Quad9 (9.9.9.9 / 149.112.112.112) as a third resolver
-/// tier and bumped per-server `attempts = 2`. Networks that block or
-/// rate-limit Cloudflare / Google specifically (corp DNS, captive portals,
-/// some ISPs) now still resolve via Quad9, and transient UDP packet loss
-/// gets one automatic retry per server. More chances to find the truth =
-/// not more chances for false positives — a domain that resolves on ANY
-/// of the three upstreams is a real domain.
-fn build_resolver(timeout: Duration) -> TokioAsyncResolver {
+/// v0.16.2: expanded from 6 → 15 upstreams. The new set was empirically
+/// tested (each resolver answered google.com correctly under 250 ms);
+/// failed/slow resolvers from the trusted-resolvers list were excluded.
+/// More upstream diversity means: (a) better resilience when CF/Google
+/// are blocked/rate-limited on a network, (b) hickory has more parallel
+/// capacity to spread bursty queries across — useful for the v0.16.2
+/// wildcard-detection probes which fire 3 queries per zone in parallel,
+/// (c) catches geo-DNS wildcards that vary by resolver location.
+pub fn build_resolver(timeout: Duration) -> TokioAsyncResolver {
     let mut opts = ResolverOpts::default();
     opts.timeout = timeout;
     opts.attempts = 2; // v0.14.15: one retry per server (was 1)
     opts.num_concurrent_reqs = 2; // A and AAAA in parallel per domain
     opts.cache_size = 0; // scan-scoped; no reason to persist across domains
 
-    // Cloudflare + Google + Quad9. Hickory round-robins through all six
-    // IPs, so any one upstream being blocked / throttled still leaves the
-    // others reachable.
+    // 15 trusted public upstreams. Latencies measured 2026-04-25
+    // (all under 250 ms). Hickory round-robins, so any blocked /
+    // throttled provider still leaves 14 others reachable.
     let nameservers = NameServerConfigGroup::from_ips_clear(
         &[
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),       // Cloudflare
-            IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),       // Cloudflare
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),       // Google
-            IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),       // Google
-            IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),       // Quad9
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),         // Cloudflare
+            IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),         // Cloudflare
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),         // Google
+            IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),         // Google
+            IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),         // Quad9
             IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)), // Quad9
+            IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222)),  // OpenDNS
+            IpAddr::V4(Ipv4Addr::new(208, 67, 220, 220)),  // OpenDNS
+            IpAddr::V4(Ipv4Addr::new(74, 82, 42, 42)),     // Hurricane Electric
+            IpAddr::V4(Ipv4Addr::new(64, 6, 65, 6)),       // Verisign
+            IpAddr::V4(Ipv4Addr::new(8, 20, 247, 20)),     // Comodo Secure
+            IpAddr::V4(Ipv4Addr::new(8, 26, 56, 26)),      // Comodo Secure
+            IpAddr::V4(Ipv4Addr::new(134, 195, 4, 2)),     // Mullvad
+            IpAddr::V4(Ipv4Addr::new(84, 200, 69, 80)),    // DNS.WATCH
+            IpAddr::V4(Ipv4Addr::new(84, 200, 70, 40)),    // DNS.WATCH
         ],
         53,
         true, // trust_negative_responses — NXDOMAIN is fatal per query
