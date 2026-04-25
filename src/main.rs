@@ -4011,6 +4011,9 @@ async fn async_main() -> anyhow::Result<()> {
     // v0.15.9 — native SSL recon output (nuclei-bracketed format,
     // matches `nuclei -tags ssl -severity info` line shape).
     let ssl_findings_path = out_dir.join("ssl_findings.txt");
+    // v0.16.3: unique root domains aggregated across all SSL SANs.
+    // Written only in domain-mode scans (skipped on IP/CIDR/ASN-only).
+    let ssl_root_domains_path = out_dir.join("ssl_root_domains.txt");
     // v0.14.2 — per-concern domain artefacts, written only when a scan
     // actually had domain input. Each is bare-per-line for trivial
     // piping into jq / grep / another tool — the classic Unix shape.
@@ -4065,6 +4068,7 @@ async fn async_main() -> anyhow::Result<()> {
             &enrich_out,
             &nuclei_out,
             &ssl_findings_path,
+            &ssl_root_domains_path,
             &domains_json_path,
             &origin_domains_path,
             &cdn_skipped_path,
@@ -6104,31 +6108,79 @@ async fn async_main() -> anyhow::Result<()> {
             );
             println!();
 
-            // Tree-style terminal output: host header, SANs indented
-            // with ├─ / └─ tree-glyphs. Box-drawing chars are 1 column
-            // each in standard terminals so alignment is reliable.
-            for rec in &unique {
-                let host = ssl_scan::host_label(rec);
-                println!("  {}", cfmt("1;36", &host));
-                let mut sans = rec.sans.clone();
-                sans.sort();
-                sans.dedup();
-                let n = sans.len();
-                for (i, san) in sans.iter().enumerate() {
-                    let glyph = if i + 1 == n { "└─" } else { "├─" };
-                    println!("    {} {}", cfmt("2", glyph), san);
+            // v0.16.3: in domain-mode scans (Phase 0 ran; we have a
+            // populated domain_origin_map), suppress the per-cert SAN
+            // tree — on big subdomain enumerations it floods the
+            // terminal with hundreds of bracketed lines that are
+            // already in ssl_findings.txt anyway. Instead, aggregate
+            // unique ROOT (eTLD+1) domains across all SANs and print
+            // ONE summary block at the end. On IP/CIDR/ASN-only scans
+            // (no Phase 0), keep the per-cert tree — it's the only
+            // place that data shows up for those scan types.
+            let is_domain_mode = !domain_origin_map.is_empty();
+
+            if is_domain_mode {
+                // Domain-mode: silent during cert iteration, just collect.
+                // Final "Unique root domains" section prints below.
+            } else {
+                // IP/CIDR/ASN-only: print per-cert tree as before.
+                for rec in &unique {
+                    let host = ssl_scan::host_label(rec);
+                    println!("  {}", cfmt("1;36", &host));
+                    let mut sans = rec.sans.clone();
+                    sans.sort();
+                    sans.dedup();
+                    let n = sans.len();
+                    for (i, san) in sans.iter().enumerate() {
+                        let glyph = if i + 1 == n { "└─" } else { "├─" };
+                        println!("    {} {}", cfmt("2", glyph), san);
+                    }
+                    println!();
                 }
-                println!();
             }
 
             // File output: one [ssl-dns-names] line per UNIQUE record
             // (same dedupe). Plain nuclei-bracketed format for grep / jq.
+            // ALWAYS written, regardless of mode.
             let file_lines: Vec<String> = unique
                 .iter()
                 .filter_map(|r| ssl_scan::format_file_line(r))
                 .collect();
             if !file_lines.is_empty() {
                 let _ = fs::write(&ssl_findings_path, file_lines.join("\n") + "\n");
+            }
+
+            // v0.16.3: in domain-mode, aggregate unique ROOT domains
+            // (eTLD+1) across all cert SANs and print as the final
+            // SSL section. This is the actually-useful signal for
+            // attack-surface mapping — "what other root domains is
+            // this org running?" — without 200 lines of subdomain
+            // noise.
+            if is_domain_mode {
+                use std::collections::HashSet;
+                let mut roots: HashSet<String> = HashSet::new();
+                for rec in &unique {
+                    for san in &rec.sans {
+                        roots.insert(domain::extract_root_domain(san));
+                    }
+                }
+                let mut sorted_roots: Vec<String> = roots.into_iter().collect();
+                sorted_roots.sort();
+
+                if !sorted_roots.is_empty() {
+                    let _ = fs::write(&ssl_root_domains_path, sorted_roots.join("\n") + "\n");
+                    println!();
+                    println!(
+                        "{} {} · {} unique root domain(s) discovered",
+                        cfmt("1;36", "───"),
+                        cfmt("1;36", "ssl roots"),
+                        sorted_roots.len()
+                    );
+                    for root in &sorted_roots {
+                        println!("  {}", cfmt("32", root));
+                    }
+                    println!();
+                }
             }
 
             println!(
@@ -6337,6 +6389,7 @@ async fn async_main() -> anyhow::Result<()> {
         (&http_targets_path,    "http_targets.txt    — URL list of HTTP candidates (nuclei input)"),
         (&enrich_out,            "enrichment_results.txt — URL / status / length / title per HTTP target"),
         (&ssl_findings_path,    "ssl_findings.txt    — SSL DNS names per unique cert (nuclei -tags ssl format)"),
+        (&ssl_root_domains_path, "ssl_root_domains.txt — unique eTLD+1 domains aggregated across SSL SANs (domain-mode scans only)"),
         (&nuclei_out,           "nuclei_results.txt  — nuclei scan findings"),
         (&summary_path,         "scan_summary.json   — totals + counts + timings"),
         (&diff_path,            "scan_diff.json      — opens/closes since last run"),

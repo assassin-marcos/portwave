@@ -437,6 +437,50 @@ fn cdn_tag_first(ip: IpAddr, table: &crate::CdnTables) -> Option<&'static str> {
     }
 }
 
+/// Extract the registered (eTLD+1) domain from a hostname. Handles
+/// the most common compound TLDs without depending on a full Public
+/// Suffix List crate. Strips a leading `*.` (SAN wildcards) and
+/// trailing dots (FQDN canonical form). Falls back to last-2-labels
+/// for unknown TLDs — fine for ~99 % of bug-bounty real-world hosts.
+///
+/// Examples:
+///   "csync.solar.cat.com"          → "cat.com"
+///   "*.eo-ignition.example.co.uk"  → "example.co.uk"
+///   "ai.insightplatform.com."      → "insightplatform.com"
+pub fn extract_root_domain(host: &str) -> String {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host.strip_prefix("*.").unwrap_or(&host);
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
+        return host.to_string();
+    }
+
+    // Top compound public suffixes — covers .co.uk / .com.au / .co.jp /
+    // .com.br / .com.cn / .co.in family etc. For TLDs not in this
+    // list we use the last two labels, which is right for .com / .net
+    // / .org / .io / .ai / .dev / .app / etc.
+    const COMPOUND_TLDS: &[&str] = &[
+        "co.uk", "org.uk", "gov.uk", "ac.uk", "ltd.uk", "net.uk", "me.uk",
+        "com.au", "net.au", "org.au", "id.au", "edu.au", "gov.au",
+        "com.br", "com.ar", "com.mx", "com.co", "com.ec", "com.pe", "com.ve",
+        "co.jp", "ne.jp", "ac.jp", "or.jp", "go.jp",
+        "co.kr", "or.kr", "ne.kr", "go.kr", "re.kr",
+        "com.cn", "org.cn", "net.cn", "edu.cn", "gov.cn", "ac.cn",
+        "co.in", "com.in", "net.in", "org.in", "ac.in", "gov.in",
+        "com.tr", "com.tw", "com.sg", "com.my", "com.hk", "com.vn",
+        "com.ph", "com.ua", "com.eg", "com.sa", "com.ng", "com.pk",
+        "com.bd", "com.np", "com.bn",
+        "co.za", "co.nz", "co.id", "co.th", "co.il", "co.ke", "co.ug",
+    ];
+
+    let last_two = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
+    if labels.len() >= 3 && COMPOUND_TLDS.contains(&last_two.as_str()) {
+        format!("{}.{}", labels[labels.len() - 3], last_two)
+    } else {
+        last_two
+    }
+}
+
 /// Collapse many `DomainResult`s into a compact "by CDN provider"
 /// histogram, for the pre-scan summary.
 pub fn cdn_breakdown(results: &[DomainResult]) -> Vec<(&'static str, usize)> {
@@ -576,5 +620,51 @@ mod tests {
             classify_input_line("10.0.0.0/24"),
             InputKind::Cidr(_)
         ));
+    }
+
+    // v0.16.3 — extract_root_domain (eTLD+1)
+    #[test]
+    fn root_domain_simple_com() {
+        assert_eq!(extract_root_domain("foo.example.com"), "example.com");
+        assert_eq!(extract_root_domain("a.b.c.example.com"), "example.com");
+        assert_eq!(extract_root_domain("example.com"), "example.com");
+    }
+
+    #[test]
+    fn root_domain_strips_wildcard_prefix() {
+        assert_eq!(extract_root_domain("*.example.com"), "example.com");
+        assert_eq!(extract_root_domain("*.api.example.com"), "example.com");
+    }
+
+    #[test]
+    fn root_domain_strips_trailing_dot() {
+        assert_eq!(extract_root_domain("foo.example.com."), "example.com");
+    }
+
+    #[test]
+    fn root_domain_compound_tld_co_uk() {
+        assert_eq!(extract_root_domain("api.example.co.uk"), "example.co.uk");
+        assert_eq!(extract_root_domain("a.b.example.co.uk"), "example.co.uk");
+    }
+
+    #[test]
+    fn root_domain_compound_tld_com_au() {
+        assert_eq!(extract_root_domain("api.example.com.au"), "example.com.au");
+    }
+
+    #[test]
+    fn root_domain_compound_tld_co_jp() {
+        assert_eq!(extract_root_domain("api.foo.co.jp"), "foo.co.jp");
+    }
+
+    #[test]
+    fn root_domain_uppercase_normalized() {
+        assert_eq!(extract_root_domain("API.Example.COM"), "example.com");
+    }
+
+    #[test]
+    fn root_domain_too_short() {
+        assert_eq!(extract_root_domain("localhost"), "localhost");
+        assert_eq!(extract_root_domain("a"), "a");
     }
 }
