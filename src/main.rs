@@ -5955,47 +5955,78 @@ async fn async_main() -> anyhow::Result<()> {
         }
 
         if !ssl_targets.is_empty() {
-            println!();
-            println!(
-                "{} {} {} target(s) · -C {}",
-                cfmt("1;36", "───"),
-                cfmt("1;36", "ssl recon"),
-                cfmt("1", &ssl_targets.len().to_string()),
-                args.probe_concurrency
-            );
             let ssl_started = Instant::now();
             let ssl_concurrency = args.probe_concurrency.max(1);
+            let target_count = ssl_targets.len();
             let records = ssl_scan::run(ssl_targets, ssl_concurrency).await;
             let ssl_ms = ssl_started.elapsed().as_millis();
 
-            // Write file in nuclei-bracketed format + print to terminal.
-            let mut all_lines: Vec<String> = Vec::with_capacity(records.len() * 2);
+            // v0.16.0: dedupe by (host:port, sorted-SAN-set). When a
+            // domain resolves to multiple IPs that all serve the same
+            // cert, the raw output repeats the same SAN list per IP —
+            // noisy. Collapse to one entry per unique cert presentation.
+            let mut seen: std::collections::HashSet<(String, Vec<String>)> =
+                std::collections::HashSet::new();
+            let mut unique: Vec<&ssl_scan::SslRecord> = Vec::new();
             for rec in &records {
-                for line in ssl_scan::format_record_lines(rec) {
-                    all_lines.push(line);
+                if rec.sans.is_empty() {
+                    continue;
+                }
+                let host = ssl_scan::host_label(rec);
+                let mut sans_sorted = rec.sans.clone();
+                sans_sorted.sort();
+                sans_sorted.dedup();
+                let key = (host, sans_sorted);
+                if seen.insert(key) {
+                    unique.push(rec);
                 }
             }
-            if !all_lines.is_empty() {
-                let _ = fs::write(&ssl_findings_path, all_lines.join("\n") + "\n");
-            }
-            // Terminal: print each finding line with light coloring so it
-            // matches the visual weight of the enrichment section above.
-            for line in &all_lines {
-                // Colorise [tag] [ssl] [info] prefix for readability;
-                // body stays plain so bracketed SAN list is grep-clean.
-                if let Some(rest) = line.strip_prefix("[ssl-dns-names] [ssl] [info] ") {
-                    println!("{} {}", cfmt("1;36", "[ssl-dns-names] [ssl] [info]"), rest);
-                } else if let Some(rest) = line.strip_prefix("[ssl-issuer] [ssl] [info] ") {
-                    println!("{} {}", cfmt("1;35", "[ssl-issuer]    [ssl] [info]"), rest);
-                } else {
-                    println!("{}", line);
-                }
-            }
+            // Stable order: by host label so repeated runs render
+            // deterministically and grep-friendly.
+            unique.sort_by(|a, b| ssl_scan::host_label(a).cmp(&ssl_scan::host_label(b)));
+
+            println!();
             println!(
-                "{} {} record(s) · {:.2}s · → {}",
+                "{} {} · {} target(s) · {} unique cert(s) · {:.2}s",
+                cfmt("1;36", "───"),
+                cfmt("1;36", "ssl recon"),
+                target_count,
+                unique.len(),
+                ssl_ms as f64 / 1000.0
+            );
+            println!();
+
+            // Tree-style terminal output: host header, SANs indented
+            // with ├─ / └─ tree-glyphs. Box-drawing chars are 1 column
+            // each in standard terminals so alignment is reliable.
+            for rec in &unique {
+                let host = ssl_scan::host_label(rec);
+                println!("  {}", cfmt("1;36", &host));
+                let mut sans = rec.sans.clone();
+                sans.sort();
+                sans.dedup();
+                let n = sans.len();
+                for (i, san) in sans.iter().enumerate() {
+                    let glyph = if i + 1 == n { "└─" } else { "├─" };
+                    println!("    {} {}", cfmt("2", glyph), san);
+                }
+                println!();
+            }
+
+            // File output: one [ssl-dns-names] line per UNIQUE record
+            // (same dedupe). Plain nuclei-bracketed format for grep / jq.
+            let file_lines: Vec<String> = unique
+                .iter()
+                .filter_map(|r| ssl_scan::format_file_line(r))
+                .collect();
+            if !file_lines.is_empty() {
+                let _ = fs::write(&ssl_findings_path, file_lines.join("\n") + "\n");
+            }
+
+            println!(
+                "{} {} unique cert(s) · → {}",
                 cfmt("1;32", "✓ ssl:"),
-                records.len(),
-                ssl_ms as f64 / 1000.0,
+                unique.len(),
                 cfmt("2", &ssl_findings_path.display().to_string())
             );
         }
@@ -6197,7 +6228,7 @@ async fn async_main() -> anyhow::Result<()> {
         (&jsonl_path,           "open_ports.jsonl    — per-port JSON records (the canonical output; all enrichment here)"),
         (&http_targets_path,    "http_targets.txt    — URL list of HTTP candidates (nuclei input)"),
         (&enrich_out,            "enrichment_results.txt — URL / status / length / title per HTTP target"),
-        (&ssl_findings_path,    "ssl_findings.txt    — SAN + issuer per TLS port (nuclei -tags ssl format)"),
+        (&ssl_findings_path,    "ssl_findings.txt    — SSL DNS names per unique cert (nuclei -tags ssl format)"),
         (&nuclei_out,           "nuclei_results.txt  — nuclei scan findings"),
         (&summary_path,         "scan_summary.json   — totals + counts + timings"),
         (&diff_path,            "scan_diff.json      — opens/closes since last run"),

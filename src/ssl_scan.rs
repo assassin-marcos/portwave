@@ -34,14 +34,14 @@ pub struct SslTarget {
 }
 
 /// One probe outcome. Empty `sans` means the cert had no SAN extension
-/// (rare on modern certs — pre-2017 leaf certs sometimes used CN only).
-/// Empty `issuer_orgs` means OpenSSL couldn't extract the O= field.
+/// (rare on modern certs — pre-2017 leaf certs sometimes used CN only;
+/// in that case probe_blocking falls back to the CN as a synthetic SAN
+/// so the field is never empty for a successful probe).
 #[derive(Debug, Clone)]
 pub struct SslRecord {
     pub addr: SocketAddr,
     pub sni: String,
     pub sans: Vec<String>,
-    pub issuer_orgs: Vec<String>,
 }
 
 /// Run SSL probes against `targets` with bounded concurrency. Each
@@ -119,60 +119,42 @@ fn probe_blocking(t: &SslTarget) -> Option<SslRecord> {
         }
     }
 
-    // Issuer organisation list. CDN operators usually populate O=
-    // (e.g. "Let's Encrypt", "Google Trust Services", "Cloudflare Inc").
-    let mut issuer_orgs: Vec<String> = Vec::new();
-    for entry in cert.issuer_name().entries_by_nid(openssl::nid::Nid::ORGANIZATIONNAME) {
-        if let Ok(s) = entry.data().as_utf8() {
-            issuer_orgs.push(s.to_string());
-        }
-    }
-    if issuer_orgs.is_empty() {
-        // Fallback to issuer CN when no O= is set.
-        for entry in cert.issuer_name().entries_by_nid(openssl::nid::Nid::COMMONNAME) {
-            if let Ok(s) = entry.data().as_utf8() {
-                issuer_orgs.push(s.to_string());
-            }
-        }
-    }
-
     // Trigger a graceful shutdown so the server's socket can close
-    // cleanly; ignore errors (we already have what we need).
+    // cleanly; ignore errors (we already have what we need.)
     let _ = stream.shutdown();
 
     Some(SslRecord {
         addr: t.addr,
         sni: t.sni.clone(),
         sans,
-        issuer_orgs,
     })
 }
 
-/// Format one record as nuclei-style bracketed lines. One [ssl-dns-names]
-/// line per record, plus one [ssl-issuer] line if issuer info is present.
-/// Matches the exact format `nuclei -tags ssl -severity info` produces.
-pub fn format_record_lines(rec: &SslRecord) -> Vec<String> {
-    let mut out = Vec::with_capacity(2);
-    let host_label = if rec.sni.is_empty() || rec.sni == rec.addr.ip().to_string() {
+/// Compose the host:port label used in both the file output and the
+/// terminal tree. Prefers the SNI (resolved hostname) over the bare
+/// IP; falls back to IP for direct-IP scans without DNS context.
+pub fn host_label(rec: &SslRecord) -> String {
+    if rec.sni.is_empty() || rec.sni == rec.addr.ip().to_string() {
         format!("{}:{}", rec.addr.ip(), rec.addr.port())
     } else {
         format!("{}:{}", rec.sni, rec.addr.port())
-    };
-    if !rec.sans.is_empty() {
-        let sans_quoted: Vec<String> = rec.sans.iter().map(|s| format!("\"{}\"", s)).collect();
-        out.push(format!(
-            "[ssl-dns-names] [ssl] [info] {} [{}]",
-            host_label,
-            sans_quoted.join(",")
-        ));
     }
-    if !rec.issuer_orgs.is_empty() {
-        let orgs_quoted: Vec<String> = rec.issuer_orgs.iter().map(|s| format!("\"{}\"", s)).collect();
-        out.push(format!(
-            "[ssl-issuer] [ssl] [info] {} [{}]",
-            host_label,
-            orgs_quoted.join(",")
-        ));
+}
+
+/// Format one record as a single nuclei-style `[ssl-dns-names]` line for
+/// the file output (`ssl_findings.txt`). Matches the exact line shape
+/// `nuclei -tags ssl -severity info` produces, so the file slots into
+/// the same downstream tooling. v0.16.0 dropped the `[ssl-issuer]` line
+/// per user request — only DNS names are useful for "find more root
+/// domains from this IP" recon.
+pub fn format_file_line(rec: &SslRecord) -> Option<String> {
+    if rec.sans.is_empty() {
+        return None;
     }
-    out
+    let sans_quoted: Vec<String> = rec.sans.iter().map(|s| format!("\"{}\"", s)).collect();
+    Some(format!(
+        "[ssl-dns-names] [ssl] [info] {} [{}]",
+        host_label(rec),
+        sans_quoted.join(",")
+    ))
 }
