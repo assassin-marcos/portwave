@@ -5890,22 +5890,30 @@ async fn async_main() -> anyhow::Result<()> {
     );
 
     // v0.16.5: choose grouping mode. By-host is the classic nmap-like
-    // layout (one block per host, ports indented). On domain-mode
-    // scans where the same ports recur across many subdomains, that
-    // layout repeats `:80 [http]` and `:443 [https]` per host —
-    // exactly the clutter users report. By-port grouping shows each
-    // port once with its host list.
+    // layout (one block per host, ports indented). On scans where the
+    // same ports recur across many distinct hosts, that layout repeats
+    // `:80 [http]` and `:443 [https]` per host — exactly the clutter
+    // users report. By-port grouping shows each port once with its
+    // host list.
     //
-    // v0.16.7 auto rule (revised): in DOMAIN-mode scans we always
-    // default to by-port (the user input is a subdomain list, so port
-    // recurrence is expected). In IP/CIDR/ASN-mode we keep by-host
-    // (the user is probing a small set of distinct IPs and the nmap
-    // layout is what they expect). Manual override via
-    // `--group-by host|port` still works.
+    // Auto rule (matches the documented `host (default for ≤20 hosts),
+    // port (default for >20 hosts)` behaviour): switch to by-port when
+    // EITHER (a) the scan was domain-mode (subdomain list — port
+    // recurrence is expected by design) OR (b) the open results span
+    // more than 20 unique hosts (typical for large CIDR / ASN scans
+    // where the nmap layout becomes a wall of repetition). Manual
+    // override via `--group-by host|port` still works.
     let group_by_port = match args.group_by.to_ascii_lowercase().as_str() {
         "port" => true,
         "host" => false,
-        _ => !domain_origin_map.is_empty(), // auto: domain-mode → by-port
+        _ => {
+            let unique_hosts = open_records
+                .iter()
+                .map(|op| &op.ip)
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            !domain_origin_map.is_empty() || unique_hosts > 20
+        }
     };
 
     // Helper: render the port-tag bundle + title + redirect. Reused by
