@@ -5496,61 +5496,69 @@ async fn async_main() -> anyhow::Result<()> {
     let http_probe_ms: u128 = if args.no_enrich || args.no_banner || open_records.is_empty() {
         0
     } else {
-        let probe_targets: Vec<(usize, String)> = open_records
-            .iter()
-            .enumerate()
-            .filter_map(|(i, op)| {
-                // Only probe HTTP-plausible ports — `ssh`, `rdp`, `vnc`,
-                // database protocols etc. are already banner-classified
-                // and probing them via HTTP just wastes a round-trip.
-                // Positive-list match: the SAME filter used below when
-                // rendering the enrichment section, so the two views agree.
-                if !is_http_candidate(op.port, op.protocol.as_deref(), op.tls) {
-                    return None;
-                }
-                match op.protocol.as_deref() {
-                    None => {}
-                    Some(p) => {
-                        if !matches!(
-                            p,
-                            "http"
-                                | "http-alt"
-                                | "http-admin"
-                                | "http-proxy"
-                                | "https"
-                                | "https-alt"
-                                | "cloudflare-https"
-                                | "tls"
-                                | "ssl"
-                                | "unknown"
-                                | "cpanel"
-                                | "cpanel-ssl"
-                                | "whm"
-                                | "grafana-alt"
-                                | "sonarqube"
-                                | "kibana"
-                                | "weblogic"
-                                | "oracle-http"
-                                | "puppet"
-                                | "activemq-admin"
-                                | "vault"
-                                | "prometheus"
-                                | "transmission"
-                                | "alertmanager"
-                                | "zabbix"
-                                | "plex"
-                                | "vnc-http"
-                        ) {
-                            return None;
-                        }
+        // v0.17.5: dedup probe targets by URL. Multi-A-record hostnames
+        // (Office 365 mail/SMTP, AWS ELB-fronted apps, geo-DNS pools)
+        // produce N open_records — one per IP — that all share the SAME
+        // hostname-based URL. The previous code probed each IP separately,
+        // firing N identical HTTP requests with the same Host header and
+        // writing N identical lines to enrichment_results.txt. Now each
+        // unique URL is probed once and the response is fanned out to
+        // every record sharing that URL.
+        let mut url_to_indices: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, op) in open_records.iter().enumerate() {
+            // Only probe HTTP-plausible ports — `ssh`, `rdp`, `vnc`,
+            // database protocols etc. are already banner-classified
+            // and probing them via HTTP just wastes a round-trip.
+            // Positive-list match: the SAME filter used below when
+            // rendering the enrichment section, so the two views agree.
+            if !is_http_candidate(op.port, op.protocol.as_deref(), op.tls) {
+                continue;
+            }
+            match op.protocol.as_deref() {
+                None => {}
+                Some(p) => {
+                    if !matches!(
+                        p,
+                        "http"
+                            | "http-alt"
+                            | "http-admin"
+                            | "http-proxy"
+                            | "https"
+                            | "https-alt"
+                            | "cloudflare-https"
+                            | "tls"
+                            | "ssl"
+                            | "unknown"
+                            | "cpanel"
+                            | "cpanel-ssl"
+                            | "whm"
+                            | "grafana-alt"
+                            | "sonarqube"
+                            | "kibana"
+                            | "weblogic"
+                            | "oracle-http"
+                            | "puppet"
+                            | "activemq-admin"
+                            | "vault"
+                            | "prometheus"
+                            | "transmission"
+                            | "alertmanager"
+                            | "zabbix"
+                            | "plex"
+                            | "vnc-http"
+                    ) {
+                        continue;
                     }
                 }
-                let ip = op.ip.parse::<IpAddr>().ok()?;
-                Some((
-                    i,
-                    format_for_nuclei(&ip, op.port, op.tls, op.source_label.as_deref()),
-                ))
-            })
+            }
+            let Ok(ip) = op.ip.parse::<IpAddr>() else { continue };
+            let url = format_for_nuclei(&ip, op.port, op.tls, op.source_label.as_deref());
+            url_to_indices.entry(url).or_default().push(i);
+        }
+        let probe_targets: Vec<(Vec<usize>, String)> = url_to_indices
+            .into_iter()
+            .map(|(url, idxs)| (idxs, url))
             .collect();
 
         if probe_targets.is_empty() {
@@ -5572,19 +5580,19 @@ async fn async_main() -> anyhow::Result<()> {
             let sem = Arc::new(Semaphore::new(concurrency));
             let stats_probe = stats.clone();
             let mut set: futures::stream::FuturesUnordered<
-                tokio::task::JoinHandle<(usize, Option<HttpProbeResult>)>,
+                tokio::task::JoinHandle<(Vec<usize>, Option<HttpProbeResult>)>,
             > = futures::stream::FuturesUnordered::new();
-            for (idx, url) in probe_targets {
+            for (indices, url) in probe_targets {
                 let sem = sem.clone();
                 let stats_inner = stats_probe.clone();
                 set.push(tokio::spawn(async move {
                     // Early bail if shutdown fired before our turn came up.
                     if stats_inner.shutdown.load(Ordering::Relaxed) {
-                        return (idx, None);
+                        return (indices, None);
                     }
                     let _permit = sem.acquire_owned().await.ok();
                     if stats_inner.shutdown.load(Ordering::Relaxed) {
-                        return (idx, None);
+                        return (indices, None);
                     }
                     let res = tokio::task::spawn_blocking(move || {
                         http_probe_blocking(&url, follow)
@@ -5592,7 +5600,7 @@ async fn async_main() -> anyhow::Result<()> {
                     .await
                     .ok()
                     .flatten();
-                    (idx, res)
+                    (indices, res)
                 }));
             }
 
@@ -5612,30 +5620,37 @@ async fn async_main() -> anyhow::Result<()> {
                     if probe_stats.shutdown.load(Ordering::Relaxed) {
                         break;
                     }
-                    if let Ok((idx, Some(res))) = joined {
-                        // STAGING: capture cert BEFORE moving res fields.
+                    if let Ok((indices, Some(res))) = joined {
+                        // v0.17.5: fan the probe result out to every
+                        // record sharing this URL (multi-A-record hosts).
+                        // All share the same hostname-based response.
                         let cert_der_taken = res.cert_der;
-                        open_records[idx].banner = Some(res.status_line);
-                        open_records[idx].title = res.title;
-                        open_records[idx].final_url = res.final_url;
-                        open_records[idx].content_length = res.content_length;
-                        if !res.chain.is_empty() {
-                            open_records[idx].redirect_chain = Some(res.chain);
-                        }
-                        if res.via_https {
-                            open_records[idx].tls = true;
-                            match open_records[idx].protocol.as_deref() {
-                                Some("https") | Some("ssh") | Some("ssl") => {}
-                                _ => open_records[idx].protocol = Some("https".into()),
+                        for &idx in &indices {
+                            open_records[idx].banner = Some(res.status_line.clone());
+                            open_records[idx].title = res.title.clone();
+                            open_records[idx].final_url = res.final_url.clone();
+                            open_records[idx].content_length = res.content_length;
+                            if !res.chain.is_empty() {
+                                open_records[idx].redirect_chain = Some(res.chain.clone());
+                            }
+                            if res.via_https {
+                                open_records[idx].tls = true;
+                                match open_records[idx].protocol.as_deref() {
+                                    Some("https") | Some("ssh") | Some("ssl") => {}
+                                    _ => open_records[idx].protocol = Some("https".into()),
+                                }
                             }
                         }
-                        // STAGING (v0.17.0 candidate): store leaf cert
-                        // keyed by (IP, port) so the SSL recon phase
-                        // skips a redundant handshake.
+                        // Cert is per (IP, port), so insert one entry per
+                        // index. Same DER for all — they're the same
+                        // hostname's TLS chain regardless of which backend
+                        // IP the probe happened to land on.
                         if let Some(der) = cert_der_taken {
-                            if let Ok(ip) = open_records[idx].ip.parse::<IpAddr>() {
-                                let addr = SocketAddr::new(ip, open_records[idx].port);
-                                precaptured_certs.insert(addr, der);
+                            for &idx in &indices {
+                                if let Ok(ip) = open_records[idx].ip.parse::<IpAddr>() {
+                                    let addr = SocketAddr::new(ip, open_records[idx].port);
+                                    precaptured_certs.insert(addr, der.clone());
+                                }
                             }
                         }
                     }
@@ -6132,6 +6147,11 @@ async fn async_main() -> anyhow::Result<()> {
             .map(BufWriter::new);
 
         // Collect all HTTP-candidate records into a sorted, printable form.
+        // v0.17.5: dedup by URL so multi-A-record hostnames render once.
+        // After the probe-time dedup above, all records sharing a URL get
+        // the SAME enrichment data, so showing N identical lines is pure
+        // clutter. First-occurrence wins (records sorted by IP order).
+        let mut seen_urls: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut rows: Vec<(String, Option<u16>, Option<u64>, Option<String>, Option<String>)> =
             Vec::new();
         for op in &open_records {
@@ -6140,6 +6160,9 @@ async fn async_main() -> anyhow::Result<()> {
             }
             let Ok(ip) = op.ip.parse::<IpAddr>() else { continue };
             let url = format_for_nuclei(&ip, op.port, op.tls, op.source_label.as_deref());
+            if !seen_urls.insert(url.clone()) {
+                continue;
+            }
             let status: Option<u16> = op
                 .banner
                 .as_deref()
