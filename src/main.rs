@@ -5934,7 +5934,15 @@ async fn async_main() -> anyhow::Result<()> {
     // are always rendered "full" since there's nothing to abbreviate.
     let full_indices: std::collections::HashSet<usize> = {
         let mut full: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut seen: std::collections::HashSet<(String, String, String)> =
+        // v0.17.7: dedup key now includes the resolved IP, not just the
+        // domain label. Multi-A-record hostnames (e.g. adityasec.com →
+        // 3.33.251.168 AND 15.197.225.128) are listed as separate (IP,
+        // hostname) blocks; each IP needs its own canonical port to
+        // show the full title + redirect. Previously the key was just
+        // source_label, so the second IP's :80 lost its title because
+        // the first IP's :80 already "claimed" the (label, final_url,
+        // title) triple.
+        let mut seen: std::collections::HashSet<(String, String, String, String)> =
             std::collections::HashSet::new();
         for (i, op) in open_records.iter().enumerate() {
             let final_url = op.final_url.clone().unwrap_or_default();
@@ -5943,11 +5951,8 @@ async fn async_main() -> anyhow::Result<()> {
                 full.insert(i);
                 continue;
             }
-            let host_key = match &op.source_label {
-                Some(d) => d.clone(),
-                None => op.ip.clone(),
-            };
-            if seen.insert((host_key, final_url, title)) {
+            let label = op.source_label.clone().unwrap_or_default();
+            if seen.insert((op.ip.clone(), label, final_url, title)) {
                 full.insert(i);
             }
         }
@@ -6405,24 +6410,13 @@ async fn async_main() -> anyhow::Result<()> {
             // deterministically and grep-friendly.
             unique.sort_by(|a, b| ssl_scan::host_label(a).cmp(&ssl_scan::host_label(b)));
 
-            // v0.17.6: only print the recon stats line when something
-            // user-interesting happened (multiple distinct certs across
-            // the scope). For a 1-cert scan the stats line is pure
-            // clutter — the per-cert detail lives in ssl_findings.txt
-            // and the roots summary below already prints when there
-            // are roots to show.
-            if unique.len() > 1 {
-                println!();
-                println!(
-                    "{} {} · {} target(s) · {} unique cert(s) · {:.2}s",
-                    cfmt("1;36", "───"),
-                    cfmt("1;36", "ssl recon"),
-                    target_count,
-                    unique.len(),
-                    ssl_ms as f64 / 1000.0
-                );
-                println!();
-            }
+            // v0.17.7: drop the per-stage "ssl recon · N target(s) · M
+            // unique cert(s) · Xs" header entirely. It was a stats line
+            // with no actionable content — the SAN detail is on disk in
+            // ssl_findings.txt and the roots summary below already prints
+            // when there are roots worth showing. Keeping the terminal
+            // focused on findings, not phase metadata.
+            let _ = (target_count, ssl_ms); // values still computed; unused on TTY now
 
             // v0.17.1: roots-only summary now ALWAYS, regardless of scan
             // mode. Previously gated on domain-mode (`!domain_origin_map.is_empty()`),
