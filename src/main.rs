@@ -5904,36 +5904,61 @@ async fn async_main() -> anyhow::Result<()> {
         )
     );
 
-    // v0.16.5: choose grouping mode. By-host is the classic nmap-like
-    // layout (one block per host, ports indented). On scans where the
-    // same ports recur across many distinct hosts, that layout repeats
-    // `:80 [http]` and `:443 [https]` per host — exactly the clutter
-    // users report. By-port grouping shows each port once with its
-    // host list.
-    //
-    // Auto rule (matches the documented `host (default for ≤20 hosts),
-    // port (default for >20 hosts)` behaviour): switch to by-port when
-    // EITHER (a) the scan was domain-mode (subdomain list — port
-    // recurrence is expected by design) OR (b) the open results span
-    // more than 20 unique hosts (typical for large CIDR / ASN scans
-    // where the nmap layout becomes a wall of repetition). Manual
-    // override via `--group-by host|port` still works.
+    // v0.17.6: choose grouping mode purely by unique-host count, matching
+    // the documented `host (default for ≤20 hosts), port (default for
+    // >20 hosts)` behaviour. Small scans (a few subdomains, a /29) get
+    // the compact nmap-style by-host layout regardless of input mode;
+    // big scans (large CIDR / ASN, hundreds of subdomains) switch to
+    // by-port to avoid a wall of `:80 [http]` / `:443 [https]` repetition.
+    // Manual override via `--group-by host|port` still works.
+    let unique_hosts: usize = open_records
+        .iter()
+        .map(|op| &op.ip)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let group_by_port = match args.group_by.to_ascii_lowercase().as_str() {
         "port" => true,
         "host" => false,
-        _ => {
-            let unique_hosts = open_records
-                .iter()
-                .map(|op| &op.ip)
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            !domain_origin_map.is_empty() || unique_hosts > 20
+        _ => unique_hosts > 20,
+    };
+
+    // v0.17.6: pre-compute which records get the FULL title+redirect
+    // treatment. For each unique (host_or_label, final_url, title)
+    // triple, only the FIRST record shown gets the title and redirect
+    // suffix; subsequent records on the same host with identical
+    // enrichment data show port + tags + status only. This kills the
+    // duplication that happened when http/:80 and https/:443 of the
+    // same hostname both redirected to the same final URL — the user
+    // saw "· \"Site Title\" → https://canonical.example.com/" twice.
+    // Records with no enrichment data (empty title AND empty final_url)
+    // are always rendered "full" since there's nothing to abbreviate.
+    let full_indices: std::collections::HashSet<usize> = {
+        let mut full: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+        for (i, op) in open_records.iter().enumerate() {
+            let final_url = op.final_url.clone().unwrap_or_default();
+            let title = op.title.clone().unwrap_or_default();
+            if final_url.is_empty() && title.is_empty() {
+                full.insert(i);
+                continue;
+            }
+            let host_key = match &op.source_label {
+                Some(d) => d.clone(),
+                None => op.ip.clone(),
+            };
+            if seen.insert((host_key, final_url, title)) {
+                full.insert(i);
+            }
         }
+        full
     };
 
     // Helper: render the port-tag bundle + title + redirect. Reused by
-    // both grouping modes so output stays consistent.
-    let render_tags_suffix = |op: &OpenPort| -> (String, String, String) {
+    // both grouping modes so output stays consistent. v0.17.6: when
+    // `is_full` is false, title and redirect suffixes are suppressed
+    // (the canonical first occurrence already showed them).
+    let render_tags_suffix = |op: &OpenPort, is_full: bool| -> (String, String, String) {
         let proto = op.protocol.as_deref().unwrap_or("unknown");
         let mut tags: Vec<String> = Vec::with_capacity(3);
         tags.push(color_protocol(proto));
@@ -5944,6 +5969,9 @@ async fn async_main() -> anyhow::Result<()> {
             tags.push(cfmt("35", &format!("cdn:{}", c)));
         }
         let tag_bundle = format!("[{}]", tags.join(cfmt("2", ", ").as_str()));
+        if !is_full {
+            return (tag_bundle, String::new(), String::new());
+        }
         let title_suffix = match &op.title {
             Some(t) if !t.is_empty() => format!("  {}", cfmt("2", &format!("· \"{}\"", t))),
             _ => String::new(),
@@ -5960,7 +5988,7 @@ async fn async_main() -> anyhow::Result<()> {
         // Per-host grouping (v0.12.3): emit the IP once, then list every
         // port on that host indented beneath it — same layout as `nmap`.
         let mut current_ip: Option<String> = None;
-        for op in &open_records {
+        for (i, op) in open_records.iter().enumerate() {
             let host = match op.ip.parse::<IpAddr>() {
                 Ok(IpAddr::V6(v)) => format!("[{}]", v),
                 _ => op.ip.clone(),
@@ -5987,7 +6015,8 @@ async fn async_main() -> anyhow::Result<()> {
                 current_ip = Some(op.ip.clone());
             }
 
-            let (tag_bundle, title_suffix, redirect_suffix) = render_tags_suffix(op);
+            let is_full = full_indices.contains(&i);
+            let (tag_bundle, title_suffix, redirect_suffix) = render_tags_suffix(op, is_full);
             let port_col = cfmt("2", &format!(":{:<5}", op.port));
 
             if banner.is_empty() {
@@ -6010,9 +6039,9 @@ async fn async_main() -> anyhow::Result<()> {
         // host inside each port block. Ports rendered ascending so the
         // common ones (80, 443, 8443) come first.
         use std::collections::BTreeMap;
-        let mut by_port: BTreeMap<u16, Vec<&OpenPort>> = BTreeMap::new();
-        for op in &open_records {
-            by_port.entry(op.port).or_default().push(op);
+        let mut by_port: BTreeMap<u16, Vec<(usize, &OpenPort)>> = BTreeMap::new();
+        for (i, op) in open_records.iter().enumerate() {
+            by_port.entry(op.port).or_default().push((i, op));
         }
 
         let mut first_block = true;
@@ -6029,14 +6058,15 @@ async fn async_main() -> anyhow::Result<()> {
                 cfmt("2", &format!("({} host(s))", ops.len()))
             );
 
-            for op in ops {
+            for (i, op) in ops {
                 let host_label = match (op.ip.parse::<IpAddr>(), &op.source_label) {
                     (Ok(IpAddr::V6(v)), Some(dom)) => format!("{} → [{}]", dom, v),
                     (Ok(IpAddr::V6(v)), None) => format!("[{}]", v),
                     (_, Some(dom)) => format!("{} → {}", dom, op.ip),
                     (_, None) => op.ip.clone(),
                 };
-                let (tag_bundle, title_suffix, redirect_suffix) = render_tags_suffix(op);
+                let is_full = full_indices.contains(i);
+                let (tag_bundle, title_suffix, redirect_suffix) = render_tags_suffix(op, is_full);
                 let banner = op.banner.as_deref().unwrap_or("");
                 if banner.is_empty() {
                     println!(
@@ -6192,6 +6222,15 @@ async fn async_main() -> anyhow::Result<()> {
             let mut c_5xx = 0usize;
             let mut responding = 0usize;
 
+            // v0.17.6: dedup TERMINAL output by content signature so the
+            // common "http+https of same host both redirect to the same
+            // final URL with the same title" case shows once instead of
+            // twice. The FILE output (enrichment_results.txt) still gets
+            // every row — downstream tooling like httpx/nuclei pipelines
+            // expect both http:// and https:// URLs preserved.
+            let mut seen_signature: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+
             for (url, status, cl, title, final_url) in &rows {
                 // File line: plain, httpx-format for grep-friendliness.
                 // v0.14.12: include " → final_url" suffix when a redirect was
@@ -6214,7 +6253,9 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Terminal line: colored, with redirect target if present.
+                // Stats counters — always count every probe (responding /
+                // status-class breakdown reflects probe count, not the
+                // deduped terminal view).
                 let status_str = match status {
                     Some(n) => {
                         responding += 1;
@@ -6236,6 +6277,20 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                     None => cfmt("2", "-"),
                 };
+
+                // Skip terminal print for duplicates (same effective
+                // response). Use final_url when present (post-redirect
+                // destination), else fall back to the URL itself; pair
+                // with title to avoid collapsing distinct responses
+                // that happen to share a final URL but carry different
+                // titles (rare but possible).
+                let dedup_dest = final_url.clone().unwrap_or_else(|| url.clone());
+                let dedup_title = title.clone().unwrap_or_default();
+                if !seen_signature.insert((dedup_dest, dedup_title)) {
+                    continue;
+                }
+
+                // Terminal line: colored, with redirect target if present.
                 let cl_str = match cl {
                     Some(n) => cfmt("35", &n.to_string()),
                     None => cfmt("2", "-"),
@@ -6350,16 +6405,24 @@ async fn async_main() -> anyhow::Result<()> {
             // deterministically and grep-friendly.
             unique.sort_by(|a, b| ssl_scan::host_label(a).cmp(&ssl_scan::host_label(b)));
 
-            println!();
-            println!(
-                "{} {} · {} target(s) · {} unique cert(s) · {:.2}s",
-                cfmt("1;36", "───"),
-                cfmt("1;36", "ssl recon"),
-                target_count,
-                unique.len(),
-                ssl_ms as f64 / 1000.0
-            );
-            println!();
+            // v0.17.6: only print the recon stats line when something
+            // user-interesting happened (multiple distinct certs across
+            // the scope). For a 1-cert scan the stats line is pure
+            // clutter — the per-cert detail lives in ssl_findings.txt
+            // and the roots summary below already prints when there
+            // are roots to show.
+            if unique.len() > 1 {
+                println!();
+                println!(
+                    "{} {} · {} target(s) · {} unique cert(s) · {:.2}s",
+                    cfmt("1;36", "───"),
+                    cfmt("1;36", "ssl recon"),
+                    target_count,
+                    unique.len(),
+                    ssl_ms as f64 / 1000.0
+                );
+                println!();
+            }
 
             // v0.17.1: roots-only summary now ALWAYS, regardless of scan
             // mode. Previously gated on domain-mode (`!domain_origin_map.is_empty()`),
