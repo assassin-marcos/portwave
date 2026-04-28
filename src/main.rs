@@ -5922,48 +5922,15 @@ async fn async_main() -> anyhow::Result<()> {
         _ => unique_hosts > 20,
     };
 
-    // v0.17.6: pre-compute which records get the FULL title+redirect
-    // treatment. For each unique (host_or_label, final_url, title)
-    // triple, only the FIRST record shown gets the title and redirect
-    // suffix; subsequent records on the same host with identical
-    // enrichment data show port + tags + status only. This kills the
-    // duplication that happened when http/:80 and https/:443 of the
-    // same hostname both redirected to the same final URL — the user
-    // saw "· \"Site Title\" → https://canonical.example.com/" twice.
-    // Records with no enrichment data (empty title AND empty final_url)
-    // are always rendered "full" since there's nothing to abbreviate.
-    let full_indices: std::collections::HashSet<usize> = {
-        let mut full: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        // v0.17.7: dedup key now includes the resolved IP, not just the
-        // domain label. Multi-A-record hostnames (e.g. adityasec.com →
-        // 3.33.251.168 AND 15.197.225.128) are listed as separate (IP,
-        // hostname) blocks; each IP needs its own canonical port to
-        // show the full title + redirect. Previously the key was just
-        // source_label, so the second IP's :80 lost its title because
-        // the first IP's :80 already "claimed" the (label, final_url,
-        // title) triple.
-        let mut seen: std::collections::HashSet<(String, String, String, String)> =
-            std::collections::HashSet::new();
-        for (i, op) in open_records.iter().enumerate() {
-            let final_url = op.final_url.clone().unwrap_or_default();
-            let title = op.title.clone().unwrap_or_default();
-            if final_url.is_empty() && title.is_empty() {
-                full.insert(i);
-                continue;
-            }
-            let label = op.source_label.clone().unwrap_or_default();
-            if seen.insert((op.ip.clone(), label, final_url, title)) {
-                full.insert(i);
-            }
-        }
-        full
-    };
-
-    // Helper: render the port-tag bundle + title + redirect. Reused by
-    // both grouping modes so output stays consistent. v0.17.6: when
-    // `is_full` is false, title and redirect suffixes are suppressed
-    // (the canonical first occurrence already showed them).
-    let render_tags_suffix = |op: &OpenPort, is_full: bool| -> (String, String, String) {
+    // Helper: render the port-tag bundle. v0.17.8: title and redirect
+    // suffixes were dropped from the OPEN PORTS section entirely — they
+    // already render in the dedicated enrichment section below, and
+    // showing them in both places was the "dual place" duplication users
+    // reported. The OPEN PORTS view is now strictly "what protocols are
+    // open per host"; URL-level enrichment lives in its own section.
+    // The is_full parameter and full_indices machinery from earlier
+    // versions are gone — the dedup they implemented is moot now.
+    let render_tags_suffix = |op: &OpenPort| -> String {
         let proto = op.protocol.as_deref().unwrap_or("unknown");
         let mut tags: Vec<String> = Vec::with_capacity(3);
         tags.push(color_protocol(proto));
@@ -5973,19 +5940,7 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(c) = &op.cdn {
             tags.push(cfmt("35", &format!("cdn:{}", c)));
         }
-        let tag_bundle = format!("[{}]", tags.join(cfmt("2", ", ").as_str()));
-        if !is_full {
-            return (tag_bundle, String::new(), String::new());
-        }
-        let title_suffix = match &op.title {
-            Some(t) if !t.is_empty() => format!("  {}", cfmt("2", &format!("· \"{}\"", t))),
-            _ => String::new(),
-        };
-        let redirect_suffix = match &op.final_url {
-            Some(u) => format!("  {} {}", cfmt("2", "→"), cfmt("36", u)),
-            None => String::new(),
-        };
-        (tag_bundle, title_suffix, redirect_suffix)
+        format!("[{}]", tags.join(cfmt("2", ", ").as_str()))
     };
 
     if !group_by_port {
@@ -5993,7 +5948,7 @@ async fn async_main() -> anyhow::Result<()> {
         // Per-host grouping (v0.12.3): emit the IP once, then list every
         // port on that host indented beneath it — same layout as `nmap`.
         let mut current_ip: Option<String> = None;
-        for (i, op) in open_records.iter().enumerate() {
+        for op in open_records.iter() {
             let host = match op.ip.parse::<IpAddr>() {
                 Ok(IpAddr::V6(v)) => format!("[{}]", v),
                 _ => op.ip.clone(),
@@ -6020,21 +5975,18 @@ async fn async_main() -> anyhow::Result<()> {
                 current_ip = Some(op.ip.clone());
             }
 
-            let is_full = full_indices.contains(&i);
-            let (tag_bundle, title_suffix, redirect_suffix) = render_tags_suffix(op, is_full);
+            let tag_bundle = render_tags_suffix(op);
             let port_col = cfmt("2", &format!(":{:<5}", op.port));
 
             if banner.is_empty() {
-                println!("      {} {}{}{}", port_col, tag_bundle, title_suffix, redirect_suffix);
+                println!("      {} {}", port_col, tag_bundle);
             } else {
                 let b: String = banner.chars().take(110).collect();
                 println!(
-                    "      {} {}  {}{}{}",
+                    "      {} {}  {}",
                     port_col,
                     tag_bundle,
                     color_banner_status(&b),
-                    title_suffix,
-                    redirect_suffix
                 );
             }
         }
@@ -6044,9 +5996,9 @@ async fn async_main() -> anyhow::Result<()> {
         // host inside each port block. Ports rendered ascending so the
         // common ones (80, 443, 8443) come first.
         use std::collections::BTreeMap;
-        let mut by_port: BTreeMap<u16, Vec<(usize, &OpenPort)>> = BTreeMap::new();
-        for (i, op) in open_records.iter().enumerate() {
-            by_port.entry(op.port).or_default().push((i, op));
+        let mut by_port: BTreeMap<u16, Vec<&OpenPort>> = BTreeMap::new();
+        for op in open_records.iter() {
+            by_port.entry(op.port).or_default().push(op);
         }
 
         let mut first_block = true;
@@ -6063,35 +6015,26 @@ async fn async_main() -> anyhow::Result<()> {
                 cfmt("2", &format!("({} host(s))", ops.len()))
             );
 
-            for (i, op) in ops {
+            for op in ops {
                 let host_label = match (op.ip.parse::<IpAddr>(), &op.source_label) {
                     (Ok(IpAddr::V6(v)), Some(dom)) => format!("{} → [{}]", dom, v),
                     (Ok(IpAddr::V6(v)), None) => format!("[{}]", v),
                     (_, Some(dom)) => format!("{} → {}", dom, op.ip),
                     (_, None) => op.ip.clone(),
                 };
-                let is_full = full_indices.contains(i);
-                let (tag_bundle, title_suffix, redirect_suffix) = render_tags_suffix(op, is_full);
+                let tag_bundle = render_tags_suffix(op);
                 let banner = op.banner.as_deref().unwrap_or("");
                 if banner.is_empty() {
-                    println!(
-                        "      {}  {}{}{}",
-                        cfmt("1", &host_label),
-                        tag_bundle,
-                        title_suffix,
-                        redirect_suffix
-                    );
+                    println!("      {}  {}", cfmt("1", &host_label), tag_bundle);
                 } else {
                     // In by-port mode banners get tighter (80 chars) so
                     // long lists stay readable on a 120-col terminal.
                     let b: String = banner.chars().take(80).collect();
                     println!(
-                        "      {}  {}  {}{}{}",
+                        "      {}  {}  {}",
                         cfmt("1", &host_label),
                         tag_bundle,
                         color_banner_status(&b),
-                        title_suffix,
-                        redirect_suffix
                     );
                 }
             }
