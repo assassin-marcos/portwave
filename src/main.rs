@@ -1088,16 +1088,19 @@ fn cdn_tag_for(ip: IpAddr, table: &CdnTables) -> Option<&'static str> {
     }
 }
 
-fn is_usable_ipv4_host(net: &IpNetwork, ip: IpAddr) -> bool {
-    match (net, ip) {
-        (IpNetwork::V4(n4), IpAddr::V4(v4)) => {
-            if n4.prefix() >= 31 {
-                return true;
-            }
-            v4 != n4.network() && v4 != n4.broadcast()
-        }
-        _ => true,
-    }
+fn is_usable_ipv4_host(_net: &IpNetwork, _ip: IpAddr) -> bool {
+    // v0.17.10: scan every IP the user passed, including the network
+    // and broadcast addresses of any CIDR. Modern hosting providers
+    // (Contabo, Hetzner, AWS EC2 small allocations, etc.) routinely
+    // route the .0 and "broadcast" addresses of /24 and smaller
+    // assignments — verified vs masscan and nmap on a Contabo /29
+    // where 109.123.239.0:80 and 109.123.239.0:443 were both
+    // genuinely open but portwave silently skipped them under the
+    // old "skip network/broadcast for prefix < 31" rule. masscan and
+    // nmap don't filter these either; matching that behaviour means
+    // no real findings get dropped. Users who want the historical
+    // convention can `-e 203.0.113.0,203.0.113.255` to exclude.
+    true
 }
 
 // Ports where nuclei has ~zero useful template coverage — feeding them
