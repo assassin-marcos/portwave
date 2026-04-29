@@ -4391,7 +4391,14 @@ async fn async_main() -> anyhow::Result<()> {
     //
     // Empty-after-skip guard: if every domain gets skipped AND there
     // were no direct IPs, exit cleanly with a clear message.
-    let mut domain_origin_map: std::collections::HashMap<IpAddr, String> =
+    // v0.17.9: was HashMap<IpAddr, String> — kept only the first domain per
+    // IP, so vhost-style shared hosting (e.g. 10 subdomains all → 1 backend
+    // IP, common for university / SaaS infra served via Host-header routing)
+    // silently dropped 9 of 10 domains from the output. Now Vec<String> per
+    // IP keeps the full list, and the post-Phase-A fan-out below creates one
+    // OpenPort record per (IP, port, domain) tuple so each domain gets its
+    // own enrichment probe with its own Host header.
+    let mut domain_origin_map: std::collections::HashMap<IpAddr, Vec<String>> =
         std::collections::HashMap::new();
     // v0.16.7: load CDN table once at this point and share across both
     // call sites (Phase 0 domain resolution + post-Phase-A IP tagging).
@@ -4536,11 +4543,16 @@ async fn async_main() -> anyhow::Result<()> {
                 if let Ok(n) = IpNetwork::new(*ip, prefix) {
                     nets.push(n);
                 }
-                // First domain wins if multiple domains resolve to the
-                // same IP (rare but possible with wildcard DNS setups).
-                domain_origin_map
-                    .entry(*ip)
-                    .or_insert_with(|| r.domain.clone());
+                // v0.17.9: keep ALL domains per IP — vhost-style shared
+                // hosting puts dozens of distinct subdomains on one backend
+                // IP, and the post-Phase-A fan-out turns each into its own
+                // OpenPort record with its own Host-header probe. We dedup
+                // here so a single domain with duplicate-IP A records
+                // doesn't end up listed twice.
+                let labels = domain_origin_map.entry(*ip).or_default();
+                if !labels.iter().any(|l| l == &r.domain) {
+                    labels.push(r.domain.clone());
+                }
             }
         }
 
@@ -5451,7 +5463,15 @@ async fn async_main() -> anyhow::Result<()> {
     // used by the OPEN PORTS renderer to show "example.com → 1.2.3.4"
     // grouping, and lands in the JSONL for downstream tooling.
     // v0.16.7: reuses the Arc<CdnTables> loaded above (no second call).
-    for op in &mut open_records {
+    //
+    // v0.17.9: when an IP carries MULTIPLE domains (vhost / shared
+    // hosting — the common case for university / SaaS / corp infra),
+    // fan out the open-port record into one record per (domain, IP,
+    // port) tuple. Each domain is a distinct enrichment target because
+    // Host / SNI routing serves different content per hostname; the
+    // previous one-record-per-IP behaviour silently dropped the rest.
+    let mut expanded: Vec<OpenPort> = Vec::with_capacity(open_records.len());
+    for mut op in open_records.into_iter() {
         if op.cdn.is_none() {
             if let Ok(ip) = op.ip.parse::<IpAddr>() {
                 if let Some(tag) = cdn_tag_for(ip, &cdn_table) {
@@ -5459,15 +5479,41 @@ async fn async_main() -> anyhow::Result<()> {
                 }
             }
         }
+        let mut fan_out_done = false;
         if op.source_label.is_none() {
             if let Ok(ip) = op.ip.parse::<IpAddr>() {
-                if let Some(label) = domain_origin_map.get(&ip) {
-                    op.source_label = Some(label.clone());
+                if let Some(labels) = domain_origin_map.get(&ip) {
+                    if labels.len() == 1 {
+                        op.source_label = Some(labels[0].clone());
+                    } else if labels.len() > 1 {
+                        for label in labels {
+                            let mut clone = op.clone();
+                            clone.source_label = Some(label.clone());
+                            expanded.push(clone);
+                        }
+                        fan_out_done = true;
+                    }
                 }
             }
         }
+        if !fan_out_done {
+            expanded.push(op);
+        }
     }
-    open_records.dedup_by(|a, b| a.ip == b.ip && a.port == b.port);
+    let mut open_records = expanded;
+    // Dedup keys on (IP, port, source_label) — multiple records on the
+    // same (IP, port) with DIFFERENT domains are intentional vhost
+    // findings; collapse only true duplicates from Phase A retry / probe
+    // paths. Sort by the same composite key so dedup_by sees adjacent
+    // duplicates.
+    open_records.sort_by(|a, b| {
+        a.ip.cmp(&b.ip)
+            .then(a.source_label.cmp(&b.source_label))
+            .then(a.port.cmp(&b.port))
+    });
+    open_records.dedup_by(|a, b| {
+        a.ip == b.ip && a.port == b.port && a.source_label == b.source_label
+    });
 
     // ── Pass-C: native HTTP(S) probe (replaces the old httpx subprocess) ──
     // v0.14.9. For every HTTP-candidate open port we issue a real HTTP(S)
@@ -5947,16 +5993,21 @@ async fn async_main() -> anyhow::Result<()> {
         // ── By-host (classic) ──
         // Per-host grouping (v0.12.3): emit the IP once, then list every
         // port on that host indented beneath it — same layout as `nmap`.
-        let mut current_ip: Option<String> = None;
+        // v0.17.9: group by (ip, source_label) so vhost-style shared
+        // hosting (many domains on one IP) gets a separate block per
+        // domain — otherwise the renderer pins every record under the
+        // first domain seen on each IP and the rest look like ghosts.
+        let mut current_key: Option<(String, Option<String>)> = None;
         for op in open_records.iter() {
             let host = match op.ip.parse::<IpAddr>() {
                 Ok(IpAddr::V6(v)) => format!("[{}]", v),
                 _ => op.ip.clone(),
             };
             let banner = op.banner.as_deref().unwrap_or("");
+            let key = (op.ip.clone(), op.source_label.clone());
 
-            if current_ip.as_ref() != Some(&op.ip) {
-                if current_ip.is_some() {
+            if current_key.as_ref() != Some(&key) {
+                if current_key.is_some() {
                     println!();
                 }
                 match &op.source_label {
@@ -5972,7 +6023,7 @@ async fn async_main() -> anyhow::Result<()> {
                         println!("  {}", cfmt("1", &host));
                     }
                 }
-                current_ip = Some(op.ip.clone());
+                current_key = Some(key);
             }
 
             let tag_bundle = render_tags_suffix(op);
