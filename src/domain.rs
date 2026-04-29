@@ -506,8 +506,10 @@ const PLATFORM_DOMAINS: &[&str] = &[
     "azure.net",
     "b2clogin.com",
     "ccsctp.com",
+    "hotmail.com",
     "live-int.com",
     "live.com",
+    "live.net",
     "microsoft.com",
     "microsoftazuread-sso.com",
     "microsoft-ppe.com",
@@ -517,6 +519,11 @@ const PLATFORM_DOMAINS: &[&str] = &[
     "microsoftonline-p.net",
     "microsoftonline.com",
     "msidentity.com",
+    "office.com",
+    "office.net",
+    "office365.com",
+    "officeppe.net",
+    "outlook.com",
     "passport-int.com",
     "windows-int.net",
     "windows-ppe.net",
@@ -533,7 +540,13 @@ const PLATFORM_DOMAINS: &[&str] = &[
     "oktapreview.com",
     "onelogin.com",
     "pingidentity.com",
-    // PaaS / hosting
+    // IBM cloud / identity (IBM Verify, IBM Cloud, App Connect)
+    "ibm.com",
+    "ibmcloud.com",
+    // Adobe Marketing Cloud / DX (analytics, target, translation)
+    "omtrdc.net",
+    "onelink-translations.com",
+    // PaaS / hosting / control panels
     "fly.dev",
     "github.io",
     "githubusercontent.com",
@@ -541,9 +554,15 @@ const PLATFORM_DOMAINS: &[&str] = &[
     "herokussl.com",
     "netlify.app",
     "netlify.com",
+    "plesk",
+    "plesk.com",
     "render.com",
     "vercel.app",
     "vercel.com",
+    // Email delivery (transactional / marketing — show up in cert SANs
+    // when targets sign up but aren't part of the target's surface)
+    "sendgrid.net",
+    "socketlabs.com",
     // CDN / cloud
     "akamaiedge.net",
     "akamaihd.net",
@@ -781,6 +800,29 @@ mod tests {
         assert!(is_platform_domain("herokuapp.com"));
         assert!(is_platform_domain("netlify.app"));
         assert!(is_platform_domain("vercel.app"));
+        assert!(is_platform_domain("plesk.com"));
+    }
+
+    // v0.18.0 — expanded denylist for noise frequently seen in cert SANs
+    #[test]
+    fn platform_microsoft_consumer() {
+        assert!(is_platform_domain("hotmail.com"));
+        assert!(is_platform_domain("outlook.com"));
+        assert!(is_platform_domain("live.net"));
+        assert!(is_platform_domain("office.com"));
+        assert!(is_platform_domain("office.net"));
+        assert!(is_platform_domain("office365.com"));
+        assert!(is_platform_domain("officeppe.net"));
+    }
+
+    #[test]
+    fn platform_ibm_adobe_email() {
+        assert!(is_platform_domain("ibm.com"));
+        assert!(is_platform_domain("ibmcloud.com"));
+        assert!(is_platform_domain("omtrdc.net"));
+        assert!(is_platform_domain("onelink-translations.com"));
+        assert!(is_platform_domain("sendgrid.net"));
+        assert!(is_platform_domain("socketlabs.com"));
     }
 
     #[test]
@@ -790,6 +832,11 @@ mod tests {
         assert!(!is_platform_domain("tenant-cloud.example"));
         assert!(!is_platform_domain("customer.example"));
         assert!(!is_platform_domain("example.co.uk"));
+        // Hospitality / consumer brands often share the SAN list with their
+        // SaaS providers — make sure the denylist does NOT accidentally
+        // catch them.
+        assert!(!is_platform_domain("hilton.com"));
+        assert!(!is_platform_domain("hiltongrandvacations.com"));
     }
 
     #[test]
