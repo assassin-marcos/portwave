@@ -578,6 +578,29 @@ const PLATFORM_DOMAINS: &[&str] = &[
     "doubleclick.net",
     "google-analytics.com",
     "googletagmanager.com",
+    // Social embed widgets (Like buttons, Login With X, share buttons,
+    // Messenger SDKs) that bake the social network's domain into a
+    // customer site's cert SAN list. These aren't the customer's
+    // attack surface — they're the social platform's.
+    "facebook.com",
+    "facebook.net",
+    "fbcdn.net",
+    "fbsbx.com",
+    "instagram.com",
+    "messenger.com",
+    // RFC 2606 / RFC 6761 reserved documentation domains. These
+    // should never legitimately appear as a scan target — they show
+    // up in cert SANs only via misconfigured templates, default
+    // installs, or copy-pasted example configs.
+    "example.com",
+    "example.net",
+    "example.org",
+    // Default / placeholder SAN entries that mean "no real cert
+    // configured". `localhost` is the OpenSSL default; `traefik.default`
+    // is Traefik's auto-generated self-signed when a real cert isn't
+    // wired up to a service. Both are noise, never findings.
+    "localhost",
+    "traefik.default",
 ];
 
 /// True if a root domain (eTLD+1) is a third-party platform we should
@@ -837,6 +860,31 @@ mod tests {
         // catch them.
         assert!(!is_platform_domain("hilton.com"));
         assert!(!is_platform_domain("hiltongrandvacations.com"));
+        // Real Vietnamese / regional brands that share SANs with social
+        // embed widgets must still come through unfiltered.
+        assert!(!is_platform_domain("airpay.vn"));
+        assert!(!is_platform_domain("garena.vn"));
+        assert!(!is_platform_domain("garenanow.com"));
+    }
+
+    // v0.18.1 — Meta / Facebook ecosystem and reserved / placeholder SANs
+    #[test]
+    fn platform_meta_social() {
+        assert!(is_platform_domain("facebook.com"));
+        assert!(is_platform_domain("facebook.net"));
+        assert!(is_platform_domain("fbcdn.net"));
+        assert!(is_platform_domain("fbsbx.com"));
+        assert!(is_platform_domain("instagram.com"));
+        assert!(is_platform_domain("messenger.com"));
+    }
+
+    #[test]
+    fn platform_reserved_and_placeholders() {
+        assert!(is_platform_domain("example.com"));
+        assert!(is_platform_domain("example.net"));
+        assert!(is_platform_domain("example.org"));
+        assert!(is_platform_domain("localhost"));
+        assert!(is_platform_domain("traefik.default"));
     }
 
     #[test]
