@@ -185,7 +185,7 @@ pub struct DomainResult {
     pub error: Option<String>,
 }
 
-/// Build a hickory resolver pointing at 15 trusted public upstreams
+/// Build a hickory resolver pointing at 30 trusted public upstreams
 /// with the caller's timeout budget. Fresh resolver per call so state
 /// (cache / in-flight) is scoped to the scan.
 ///
@@ -197,6 +197,13 @@ pub struct DomainResult {
 /// capacity to spread bursty queries across — useful for the v0.16.2
 /// wildcard-detection probes which fire 3 queries per zone in parallel,
 /// (c) catches geo-DNS wildcards that vary by resolver location.
+///
+/// v0.18.2: expanded from 15 → 30 upstreams. Each new entry was vetted
+/// the same way (correct google.com answer in Google's anycast space,
+/// RTT < 250 ms, two successive passes from the dev VPS, no cache
+/// poisoning). The bigger pool halves per-resolver query rate on huge
+/// bug-bounty scopes and adds genuine geographic / AS diversity (Asia,
+/// Russia, Canada, EU non-profits) that catches more geo-DNS variants.
 pub fn build_resolver(timeout: Duration) -> TokioAsyncResolver {
     let mut opts = ResolverOpts::default();
     opts.timeout = timeout;
@@ -204,11 +211,12 @@ pub fn build_resolver(timeout: Duration) -> TokioAsyncResolver {
     opts.num_concurrent_reqs = 2; // A and AAAA in parallel per domain
     opts.cache_size = 0; // scan-scoped; no reason to persist across domains
 
-    // 15 trusted public upstreams. Latencies measured 2026-04-25
-    // (all under 250 ms). Hickory round-robins, so any blocked /
-    // throttled provider still leaves 14 others reachable.
+    // 30 trusted public upstreams. Latencies measured 2026-04-30 (all
+    // under 250 ms). Hickory round-robins, so any blocked / throttled
+    // provider still leaves 29 others reachable.
     let nameservers = NameServerConfigGroup::from_ips_clear(
         &[
+            // ── original v0.16.2 set (15) ──
             IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),         // Cloudflare
             IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),         // Cloudflare
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),         // Google
@@ -224,6 +232,22 @@ pub fn build_resolver(timeout: Duration) -> TokioAsyncResolver {
             IpAddr::V4(Ipv4Addr::new(134, 195, 4, 2)),     // Mullvad
             IpAddr::V4(Ipv4Addr::new(84, 200, 69, 80)),    // DNS.WATCH
             IpAddr::V4(Ipv4Addr::new(84, 200, 70, 40)),    // DNS.WATCH
+            // ── v0.18.2 additions (15) ──
+            IpAddr::V4(Ipv4Addr::new(94, 140, 14, 14)),    // AdGuard
+            IpAddr::V4(Ipv4Addr::new(94, 140, 15, 15)),    // AdGuard
+            IpAddr::V4(Ipv4Addr::new(149, 112, 121, 10)),  // CIRA Canadian Shield
+            IpAddr::V4(Ipv4Addr::new(149, 112, 122, 10)),  // CIRA Canadian Shield
+            IpAddr::V4(Ipv4Addr::new(185, 43, 135, 1)),    // CZ.NIC ODVR
+            IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)),       // Yandex
+            IpAddr::V4(Ipv4Addr::new(77, 88, 8, 1)),       // Yandex
+            IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5)),       // Aliyun
+            IpAddr::V4(Ipv4Addr::new(223, 6, 6, 6)),       // Aliyun
+            IpAddr::V4(Ipv4Addr::new(4, 2, 2, 1)),         // Level3
+            IpAddr::V4(Ipv4Addr::new(4, 2, 2, 2)),         // Level3
+            IpAddr::V4(Ipv4Addr::new(9, 9, 9, 10)),        // Quad9 (no-DNSSEC variant — different infra than 9.9.9.9)
+            IpAddr::V4(Ipv4Addr::new(119, 29, 29, 29)),    // DNSPod (Tencent, Asia coverage)
+            IpAddr::V4(Ipv4Addr::new(45, 11, 45, 11)),     // DNS.SB
+            IpAddr::V4(Ipv4Addr::new(45, 90, 28, 0)),      // NextDNS public anycast
         ],
         53,
         true, // trust_negative_responses — NXDOMAIN is fatal per query
