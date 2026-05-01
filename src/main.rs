@@ -127,6 +127,15 @@ struct Args {
     #[arg(short = 'r', long, default_value_t = 1)]
     retries: u8,
 
+    /// Retry-timeout multiplier (v0.18.3). The first probe uses --timeout-ms;
+    /// each retry uses --timeout-ms × this value. Default 1.0 (matches
+    /// pre-v0.18.3 behaviour exactly — zero regression in time or results).
+    /// Bump to 2.0 or 3.0 on slow / firewalled networks to catch genuinely
+    /// slow hosts the tight first-pass timeout drops; trade-off is 1.5–2×
+    /// wall time on retry-heavy scopes.
+    #[arg(long, default_value_t = 1.0)]
+    retry_timeout_mult: f64,
+
     /// Global packets-per-second cap
     #[arg(long)]
     max_pps: Option<u32>,
@@ -2078,7 +2087,16 @@ async fn phase_a(
     pb: ProgressBar,
     timeout: Duration,
     retries: u8,
+    retry_timeout_mult: f64,
 ) {
+    // v0.18.3: pre-compute the per-retry timeout so the inner loop stays
+    // tight. Defaults to timeout × 3 so a genuinely-slow host that blew
+    // through the 800 ms first-pass timeout can still be caught on retry
+    // without burning extra wall time on the 99 %+ of probes that
+    // already responded or were filtered cleanly.
+    let retry_timeout = Duration::from_millis(
+        ((timeout.as_millis() as f64) * retry_timeout_mult.max(0.1)).round() as u64
+    );
     // Batched progress-bar update. indicatif's ProgressBar.inc() takes an
     // internal Mutex on every call — at 10–15 K probes/sec × 1500 workers
     // the contention shows up on profiles. Instead, keep a per-worker
@@ -2120,7 +2138,13 @@ async fn phase_a(
         let mut opened = false;
         let mut final_timeout = false;
         for attempt in 0..=retries {
-            match tokio::time::timeout(timeout, tcp_probe(sa)).await {
+            // v0.18.3: first attempt uses the tight default timeout;
+            // retries get the longer retry_timeout so genuinely-slow
+            // hosts (high-latency satellite, congested transit, slow
+            // backend behind a LB) survive instead of being silently
+            // dropped after the 800 ms first pass.
+            let attempt_timeout = if attempt == 0 { timeout } else { retry_timeout };
+            match tokio::time::timeout(attempt_timeout, tcp_probe(sa)).await {
                 Ok(Ok(_)) => {
                     opened = true;
                     break;
@@ -5266,7 +5290,7 @@ async fn async_main() -> anyhow::Result<()> {
         let sm = sem.clone();
         let st = stats.clone();
         let pb = pb.clone();
-        workers.spawn(async move { phase_a(rx, ht, sm, st, pb, timeout_a, args.retries).await });
+        workers.spawn(async move { phase_a(rx, ht, sm, st, pb, timeout_a, args.retries, args.retry_timeout_mult).await });
     }
     drop(work_rx);
     drop(hit_tx);
