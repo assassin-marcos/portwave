@@ -149,8 +149,11 @@ struct Args {
     dry_run: bool,
 
     // ── Enrichment (HTTP / nuclei) ─────────────────────────
-    /// Concurrent HTTP probes (raised from 100 in v0.16.1)
-    #[arg(short = 'C', long, default_value_t = 150)]
+    /// Concurrent HTTP probes (raised from 100 in v0.16.1, then 150 → 300
+    /// in v0.18.4 — small-list benchmarks showed no result regression at
+    /// 300 / 500, and large lists (e.g. 5k+ URLs) get a ~50 % wall cut
+    /// because batches shrink linearly with concurrency).
+    #[arg(short = 'C', long, default_value_t = 300)]
     probe_concurrency: usize,
 
     /// Don't follow redirects (default: follow up to 3 hops)
@@ -1492,9 +1495,12 @@ fn http_probe_blocking(url: &str, follow: bool) -> Option<HttpProbeResult> {
     // v0.14.11 — retry once on transient failure. Servers applying SYN / TLS
     // rate-limits against parallel probes (BIG-IP, F5, CloudFront origin
     // shields) drop a subset of the first wave's handshakes; a simple second
-    // attempt ~200 ms later usually succeeds. No backoff — reqwest's own
-    // 5 s connect timeout already sets the pacing ceiling.
-    std::thread::sleep(Duration::from_millis(200));
+    // attempt usually succeeds. No backoff — reqwest's own 5 s connect
+    // timeout already sets the pacing ceiling.
+    // v0.18.4 — sleep dropped 200 ms → 50 ms. Most rate-limit refresh
+    // windows are sub-100 ms; the 200 ms version blocked spawn_blocking
+    // workers for ~75 % more time than necessary on the retry path.
+    std::thread::sleep(Duration::from_millis(50));
     if let Some(r) = http_probe_single(url, follow) {
         return Some(r);
     }
