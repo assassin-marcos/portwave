@@ -1432,18 +1432,35 @@ fn http_probe_single(url: &str, follow: bool) -> Option<HttpProbeResult> {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        // Read body (streaming, capped at 64 KiB). We use `.bytes()` and
-        // then truncate rather than chunked streaming — title is usually
-        // in the first few KiB anyway, and reqwest's top-level timeout
-        // (5 s) prevents runaway downloads.
-        let body_bytes = resp.bytes().ok().unwrap_or_default();
+        // v0.18.6: cap the body download via a streaming Read::take.
+        // The old code called `.bytes()`, which buffered the ENTIRE
+        // response into memory first — a multi-hundred-MB file on an
+        // open HTTP port was fully downloaded (bounded only by the 5 s
+        // timeout) and held in RAM, multiplied by probe-concurrency.
+        // The 2 MiB cap bounds memory + bandwidth, yet is generous
+        // enough that virtually every real HTML page is read in full —
+        // so the Content-Length fallback (body length when the wire
+        // header is absent, common on HTTP/2) stays accurate instead of
+        // collapsing to "unknown". <title> lives in the first few KiB.
+        use std::io::Read as _;
+        const BODY_CAP: u64 = 2 * 1024 * 1024;
+        let mut body_bytes: Vec<u8> = Vec::with_capacity(16 * 1024);
+        let _ = resp.take(BODY_CAP).read_to_end(&mut body_bytes);
         let body_len = body_bytes.len();
-        let body_trunc = &body_bytes[..body_len.min(65536)];
-        let body_str = String::from_utf8_lossy(body_trunc);
+        // Hit the cap → the real body is larger, we just stopped reading.
+        let body_capped = body_len as u64 >= BODY_CAP;
+        let body_str = String::from_utf8_lossy(&body_bytes);
         let title = extract_title(&body_str);
 
+        // Content-Length: the wire header is authoritative when present.
+        // Without it, fall back to the body length we actually read —
+        // but ONLY when we did not hit the cap. A capped read cannot
+        // know the true size, so report unknown (None) rather than a
+        // misleading 64 KiB.
         let content_length: Option<u64> = header_cl.or_else(|| {
-            if body_len > 0 {
+            if body_capped {
+                None
+            } else if body_len > 0 {
                 Some(body_len as u64)
             } else {
                 None
@@ -4564,14 +4581,30 @@ async fn async_main() -> anyhow::Result<()> {
                 ));
                 continue;
             }
-            if let Some(tag) = r.cdn {
-                if !args.allow_cdn {
+            // v0.18.6: partition resolved IPs — skip ONLY the CDN-fronted
+            // ones, keep + scan the origin IPs. A domain that resolves to
+            // a mix (a stale or leaked origin A record sitting alongside
+            // CDN edges) used to be skipped wholesale, dropping the origin
+            // IP — exactly the un-WAF'd backend a recon scan most wants.
+            // A domain lands in cdn_skipped only when EVERY IP is CDN.
+            let scannable_ips: Vec<IpAddr> = if args.allow_cdn {
+                r.ips.clone()
+            } else {
+                r.ips
+                    .iter()
+                    .copied()
+                    .filter(|ip| cdn_tag_for(*ip, &cdn_table).is_none())
+                    .collect()
+            };
+            if scannable_ips.is_empty() {
+                // Every resolved IP is a CDN edge → skip the whole domain.
+                if let Some(tag) = r.cdn {
                     cdn_skipped.push((r.domain.clone(), tag));
-                    continue;
                 }
+                continue;
             }
             origin_domains += 1;
-            for ip in &r.ips {
+            for ip in &scannable_ips {
                 let prefix: u8 = if ip.is_ipv4() { 32 } else { 128 };
                 if let Ok(n) = IpNetwork::new(*ip, prefix) {
                     nets.push(n);
@@ -6698,9 +6731,14 @@ async fn async_main() -> anyhow::Result<()> {
                 if let Ok(diff_val) = serde_json::from_str::<serde_json::Value>(&diff_str) {
                     // Count additions/removals: if both arrays are empty
                     // (or missing), there's nothing new since the last scan.
-                    let opened = diff_val.get("opened").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                    // v0.18.6: read the "new" key — scan_diff.json writes
+                    // new opens under "new", not "opened". The old key
+                    // never matched, so a scan that found new open ports
+                    // but closed nothing reported zero changes and the
+                    // --webhook-on-diff-only gate wrongly skipped the POST.
+                    let new_opens = diff_val.get("new").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
                     let closed = diff_val.get("closed").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-                    if opened > 0 || closed > 0 {
+                    if new_opens > 0 || closed > 0 {
                         diff_has_changes = true;
                     }
                     if let Some(obj) = payload.as_object_mut() {
