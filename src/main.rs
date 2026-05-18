@@ -5534,6 +5534,57 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
     let mut open_records = expanded;
+
+    // v0.18.5: resume-coverage pass. On a resumed scan (same output
+    // folder, no -n) the prior open_ports.jsonl is loaded as `preserved`
+    // records that already carry their OLD source_label, and Phase A
+    // skips their (IP, port) sockets via skip_set. The fan-out above
+    // only labels records whose source_label is None, so a NEW domain
+    // in this run's input that resolves to an already-scanned socket
+    // would never get its own record — losing its SNI-correct HTTP
+    // probe and cert. Here we ensure every domain in THIS run's
+    // domain_origin_map has a record for each (IP, port) already
+    // present. Cloned records get stale enrichment cleared so Pass-C
+    // re-probes them with the right Host/SNI; dedup_by below collapses
+    // any exact duplicates. No-op on fresh scans (the fan-out above
+    // already covered every domain) and on same-input resumes.
+    if !domain_origin_map.is_empty() {
+        use std::collections::HashSet;
+        let have: HashSet<(String, u16, Option<String>)> = open_records
+            .iter()
+            .map(|op| (op.ip.clone(), op.port, op.source_label.clone()))
+            .collect();
+        let mut sockets: Vec<(String, u16)> =
+            open_records.iter().map(|op| (op.ip.clone(), op.port)).collect();
+        sockets.sort();
+        sockets.dedup();
+        let mut additions: Vec<OpenPort> = Vec::new();
+        for (ip_s, port) in &sockets {
+            let Ok(ip) = ip_s.parse::<IpAddr>() else { continue };
+            let Some(labels) = domain_origin_map.get(&ip) else { continue };
+            for label in labels {
+                if have.contains(&(ip_s.clone(), *port, Some(label.clone()))) {
+                    continue; // this domain already has a record for the socket
+                }
+                if let Some(template) =
+                    open_records.iter().find(|op| &op.ip == ip_s && op.port == *port)
+                {
+                    let mut clone = template.clone();
+                    clone.source_label = Some(label.clone());
+                    // Drop the preserved sibling's stale enrichment —
+                    // Pass-C will re-probe with this domain's own SNI.
+                    clone.banner = None;
+                    clone.title = None;
+                    clone.final_url = None;
+                    clone.content_length = None;
+                    clone.redirect_chain = None;
+                    additions.push(clone);
+                }
+            }
+        }
+        open_records.extend(additions);
+    }
+
     // Dedup keys on (IP, port, source_label) — multiple records on the
     // same (IP, port) with DIFFERENT domains are intentional vhost
     // findings; collapse only true duplicates from Phase A retry / probe
@@ -5567,10 +5618,18 @@ async fn async_main() -> anyhow::Result<()> {
              redirect chains, and final URLs will NOT be populated in output."
         );
     }
-    // STAGING (v0.17.0 candidate): collect leaf certs from Pass-C's TLS
-    // handshakes (via reqwest TlsInfo). Reused by the SSL recon phase
-    // below to skip a redundant TLS handshake on the same port.
-    let mut precaptured_certs: std::collections::HashMap<SocketAddr, Vec<u8>> =
+    // Collect leaf certs from Pass-C's TLS handshakes (via reqwest
+    // TlsInfo). Reused by the SSL recon phase below to skip a redundant
+    // TLS handshake on the same port.
+    //
+    // v0.18.5: keyed by (SocketAddr, SNI) — NOT SocketAddr alone. A vhost
+    // server at one IP:443 hands a different cert per SNI; keying by the
+    // socket only meant the last domain probed for that socket overwrote
+    // every sibling, and SSL recon then mislabelled each domain with the
+    // last-writer's cert (wrong ssl_findings.txt / ssl_root_domains.txt).
+    // The SNI is the hostname the probe sent — i.e. the record's
+    // source_label (or the IP literal for label-less IP scans).
+    let mut precaptured_certs: std::collections::HashMap<(SocketAddr, String), Vec<u8>> =
         std::collections::HashMap::new();
     let http_probe_ms: u128 = if args.no_enrich || args.no_banner || open_records.is_empty() {
         0
@@ -5720,15 +5779,22 @@ async fn async_main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        // Cert is per (IP, port), so insert one entry per
-                        // index. Same DER for all — they're the same
-                        // hostname's TLS chain regardless of which backend
-                        // IP the probe happened to land on.
+                        // v0.18.5: key by (socket, SNI). The probe sent
+                        // SNI = the record's source_label (the URL host
+                        // format_for_nuclei built); store the captured
+                        // cert under that exact pair so SSL recon can
+                        // reuse it ONLY for the matching domain, never a
+                        // sibling vhost on the same socket.
                         if let Some(der) = cert_der_taken {
                             for &idx in &indices {
                                 if let Ok(ip) = open_records[idx].ip.parse::<IpAddr>() {
                                     let addr = SocketAddr::new(ip, open_records[idx].port);
-                                    precaptured_certs.insert(addr, der.clone());
+                                    let sni = open_records[idx]
+                                        .source_label
+                                        .clone()
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| ip.to_string());
+                                    precaptured_certs.insert((addr, sni), der.clone());
                                 }
                             }
                         }
@@ -6389,9 +6455,12 @@ async fn async_main() -> anyhow::Result<()> {
                 _ => ip.to_string(),
             };
             let addr = SocketAddr::new(ip, op.port);
-            // STAGING: if Pass-C already captured a cert for this addr,
-            // parse it directly instead of queueing a fresh handshake.
-            if let Some(der) = precaptured_certs.get(&addr) {
+            // v0.18.5: reuse the Pass-C cert ONLY when it was captured
+            // for this exact (socket, SNI) pair. A miss — different SNI,
+            // or Pass-C never probed this domain — falls through to a
+            // fresh handshake, which sends the correct SNI and gets the
+            // correct cert. No more cross-vhost cert mislabelling.
+            if let Some(der) = precaptured_certs.get(&(addr, sni.clone())) {
                 if let Some(rec) = ssl_scan::from_der(addr, sni.clone(), der) {
                     precaptured_records.push(rec);
                     continue;
