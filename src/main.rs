@@ -319,6 +319,21 @@ struct OpenPort {
     /// pages; large 3xxs carry the redirect body).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_length: Option<u64>,
+    /// v0.18.7 — output-only triage hint for high-signal services
+    /// (exposed datastores, database servers, management APIs, remote
+    /// access). Pure metadata derived from `protocol`/`port` — NO probe
+    /// traffic, NO speed cost. Worded "high-signal … verify", never as a
+    /// confirmed vulnerability. Populated just before the JSONL is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    risk_hint: Option<String>,
+    /// v0.18.7 — whether this record's HTTP(S) enrichment probed a
+    /// hostname (vhost-aware: SNI + Host = the resolved domain) or the
+    /// bare IP. `"hostname"` records carry vhost-specific titles/banners;
+    /// `"ip"` records reflect the socket's default vhost. Only set on
+    /// HTTP-candidate records when enrichment actually ran — documents
+    /// probe scope so downstream consumers don't conflate the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enrichment_scope: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -1993,6 +2008,50 @@ fn service_for_port(port: u16) -> Option<&'static str> {
     })
 }
 
+// Output-only triage hint (v0.18.7). Pure metadata: flags high-signal
+// services a recon operator usually wants to review first — exposed
+// datastores, database servers, container/cluster control planes, and
+// interactive remote-access endpoints. NEVER asserts a vulnerability —
+// only that the service is worth a manual "is this meant to be public,
+// and is it authenticated?" check. No network traffic, no speed cost;
+// called once per open port just before the JSONL is written.
+//
+// Single source of truth: it resolves the record to a protocol name
+// (banner-classified value first, else service_for_port()), so the port
+// set never drifts out of sync with the service table above.
+fn risk_hint_for(protocol: Option<&str>, port: u16) -> Option<&'static str> {
+    // Datastores that historically ship with no auth (or trivially
+    // disabled auth) in their default config — the highest-signal find.
+    const UNAUTH_DATASTORE: &str =
+        "high-signal: datastore — verify it requires authentication";
+    // Database servers: auth is normally enabled, but an internet-facing
+    // DB port still warrants review (credential attacks / data exposure).
+    const DATABASE: &str =
+        "high-signal: database server — verify it should be internet-facing";
+    // Container / cluster control planes: an unauthenticated one is
+    // effectively remote code execution on the host.
+    const MGMT_API: &str =
+        "high-signal: management API — verify it requires authentication";
+    // Interactive remote access reachable from the internet.
+    const REMOTE_ACCESS: &str =
+        "high-signal: remote-access service — verify it should be exposed";
+
+    // Prefer the banner-classified protocol; fall back to the port table.
+    let resolved: Option<&str> = protocol.or_else(|| service_for_port(port));
+    match resolved? {
+        "redis" | "memcached" | "mongodb" | "mongodb-web" | "elasticsearch"
+        | "couchdb" | "cassandra" | "cassandra-thrift" | "influxdb" | "etcd"
+        | "zookeeper" | "riak" => Some(UNAUTH_DATASTORE),
+        "mysql" | "postgres" | "mssql" | "oracle" | "db2" | "firebird" => {
+            Some(DATABASE)
+        }
+        "docker" | "docker-tls" | "docker-swarm" | "kubernetes-api"
+        | "kubelet" | "kubelet-ro" => Some(MGMT_API),
+        "telnet" | "rdp" | "vnc" | "vnc-http" => Some(REMOTE_ACCESS),
+        _ => None,
+    }
+}
+
 fn classify(data: &[u8]) -> Option<String> {
     if data.is_empty() {
         return None;
@@ -2232,6 +2291,8 @@ async fn enrich(sa: SocketAddr, timeout: Duration, tls_sniff: bool, want_banner:
         final_url: None,
         redirect_chain: None,
         content_length: None,
+        risk_hint: None,        // populated pre-JSONL from protocol/port
+        enrichment_scope: None, // populated pre-JSONL from source_label
     };
 
     let start = Instant::now();
@@ -3396,6 +3457,8 @@ async fn run_udp_phase(
                     final_url: None,
                     redirect_chain: None,
                     content_length: None,
+                    risk_hint: None,
+                    enrichment_scope: None,
                 })
             });
         }
@@ -5286,6 +5349,8 @@ async fn async_main() -> anyhow::Result<()> {
                         final_url: None,
                         redirect_chain: None,
                         content_length: None,
+                        risk_hint: None,
+                        enrichment_scope: None,
                     });
                     continue;
                 }
@@ -5468,6 +5533,8 @@ async fn async_main() -> anyhow::Result<()> {
                     final_url: None,
                     redirect_chain: None,
                     content_length: None,
+                    risk_hint: None,
+                    enrichment_scope: None,
                 });
                 backfilled += 1;
             }
@@ -5849,6 +5916,31 @@ async fn async_main() -> anyhow::Result<()> {
             started.elapsed().as_millis()
         }
     };
+
+    // ── v0.18.7: output-only metadata — no probe traffic, no speed cost ──
+    // Populated once here, after Pass-C enrichment / resume coverage /
+    // dedup have all settled, so `protocol` and `source_label` are final.
+    //   • risk_hint        — high-signal-service triage flag, on any record
+    //     whose protocol/port matches a datastore / DB / mgmt-API / remote-
+    //     access service.
+    //   • enrichment_scope — "hostname" vs "ip" HTTP(S) probe scope, set
+    //     only on HTTP-candidate records and only when Pass-C enrichment
+    //     actually ran (skipped under --no-enrich / --no-banner).
+    let enrichment_ran = !args.no_enrich && !args.no_banner;
+    for op in open_records.iter_mut() {
+        op.risk_hint =
+            risk_hint_for(op.protocol.as_deref(), op.port).map(|s| s.to_string());
+        if enrichment_ran && is_http_candidate(op.port, op.protocol.as_deref(), op.tls)
+        {
+            let hostname_scoped = op
+                .source_label
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            op.enrichment_scope =
+                Some(if hostname_scoped { "hostname" } else { "ip" }.to_string());
+        }
+    }
 
     // ── Write artifacts ──
     let mut jsonl = BufWriter::new(
